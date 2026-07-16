@@ -176,7 +176,7 @@ describe('useThrottledRoomMount', () => {
     expect(result.current).toBe(false)
   })
 
-  test('triggers new effect when roomId changes', async () => {
+  test('disables mounting until the backoff expires when roomId changes', () => {
     const baseTime = 1000000
 
     vi.setSystemTime(baseTime)
@@ -190,10 +190,17 @@ describe('useThrottledRoomMount', () => {
 
     rerender({ roomId: 'room2' })
 
+    expect(result.current).toBe(false)
     expect(mockSessionStorage.setItem).toHaveBeenCalledWith(
       LAST_MOUNT_TIME_KEY,
       expect.any(String)
     )
+
+    act(() => {
+      vi.advanceTimersByTime(baseBackoff)
+    })
+
+    expect(result.current).toBe(true)
   })
 
   test('schedules backoff reset after successful mount', async () => {

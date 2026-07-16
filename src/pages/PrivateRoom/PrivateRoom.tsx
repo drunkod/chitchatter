@@ -1,5 +1,5 @@
 import { Room } from 'components/Room'
-import { useContext, useEffect, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 
 import { WholePageLoading } from 'components/Loading'
@@ -19,14 +19,42 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
   const { setTitle } = useContext(ShellContext)
   const canMount = useThrottledRoomMount(roomId)
 
-  const urlParams = new URLSearchParams(window.location.hash.substring(1))
+  const fragment = window.location.hash.substring(1)
+  const [secret, setSecret] = useState('')
+  const activeRoomIdRef = useRef(roomId)
 
-  if (allowAdvancedRoomLinkSharing && window.location.hash.length > 0) {
-    // Clear secret from address bar
-    window.history.replaceState(window.history.state, '', '#')
-  }
+  useEffect(() => {
+    activeRoomIdRef.current = roomId
 
-  const [secret, setSecret] = useState(urlParams.get('secret') ?? '')
+    const urlParams = new URLSearchParams(fragment)
+    let isCancelled = false
+
+    setSecret('')
+
+    if (allowAdvancedRoomLinkSharing && fragment.length > 0) {
+      // Clear secret from address bar
+      window.history.replaceState(window.history.state, '', '#')
+    }
+
+    const secretParam = urlParams.get('secret')
+
+    if (secretParam) {
+      setSecret(secretParam)
+      return
+    }
+
+    const legacyPassword = urlParams.get('pwd')
+
+    if (!legacyPassword) return
+
+    encryption.encodePassword(roomId, legacyPassword).then(encodedPassword => {
+      if (!isCancelled) setSecret(encodedPassword)
+    })
+
+    return () => {
+      isCancelled = true
+    }
+  }, [fragment, roomId])
 
   useEffect(() => {
     notification.requestPermission()
@@ -37,12 +65,14 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
   }, [roomId, setTitle])
 
   const handlePasswordEntered = async (password: string) => {
-    if (password.length !== 0)
-      setSecret(await encryption.encodePassword(roomId, password))
-  }
+    if (password.length === 0) return
 
-  if (urlParams.has('pwd') && !urlParams.has('secret'))
-    handlePasswordEntered(urlParams.get('pwd') ?? '')
+    const encodedPassword = await encryption.encodePassword(roomId, password)
+
+    if (activeRoomIdRef.current === roomId) {
+      setSecret(encodedPassword)
+    }
+  }
 
   const awaitingSecret = secret.length === 0
 

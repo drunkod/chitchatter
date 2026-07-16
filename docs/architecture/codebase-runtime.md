@@ -102,7 +102,7 @@ On group-room unmount, `useRoom` leaves the room, flushes handlers, clears the p
 
 ## 4. Peer action abstraction
 
-Features communicate through named actions. `usePeerAction` connects a React lifecycle to a cached `PeerRoom.makeAction` result, but the current receiver cleanup is not subscriber-specific.
+Features communicate through named actions. `usePeerAction` connects a React lifecycle to a cached `PeerRoom.makeAction` result, while each receiver registration gets its own unsubscribe closure.
 
 ```mermaid
 flowchart TD
@@ -111,20 +111,18 @@ flowchart TD
     UseA --> Cached[Cached PeerRoom action tuple]
     UseB --> Cached
     Cached --> Event[Shared EventTarget]
-    UseA --> ConnectA[connectReceiver creates listener A]
-    ConnectA --> HandlerA[Mutable handler variable becomes A]
-    UseB --> ConnectB[connectReceiver creates listener B]
-    ConnectB --> HandlerB[Same mutable handler variable becomes B]
-    Event --> ListenerA[Listener A may remain registered]
-    Event --> ListenerB[Listener B registered]
-    UseA --> CleanupA[Unmount A calls shared detach function]
-    CleanupA --> RemoveLatest[Removes current handler B, not necessarily A]
-    RemoveLatest --> Risk[Stale listener or wrong active listener removed]
+    UseA --> ConnectA[connectReceiver registers listener A]
+    UseB --> ConnectB[connectReceiver registers listener B]
+    ConnectA --> UnsubscribeA[Closure captures listener A]
+    ConnectB --> UnsubscribeB[Closure captures listener B]
+    Event --> ListenerA[Dispatch to listener A]
+    Event --> ListenerB[Dispatch to listener B]
+    UseA --> CleanupA[Unmount A invokes unsubscribe A]
+    CleanupA --> RemoveA[Remove listener A only]
+    ListenerB --> Active[Listener B remains active]
 ```
 
-Group actions use the `g` namespace. Direct-message actions use `dm` and are sent with a target peer ID. `PeerRoom.makeAction` caches one tuple per namespace/action, and that tuple's `connectReceiver` overwrites a single mutable `handler`. The shared detach function removes whichever handler was assigned most recently, rather than a closure capturing the caller's listener. Therefore `usePeerAction` cleanup only *intends* to disconnect its own receiver; with multiple subscribers it may leave a stale listener or remove another subscriber's listener.
-
-This is reachable in the current UI: each peer item contains a `keepMounted` dialog with a targeted direct-message `Room`, so multiple direct-message room instances can subscribe to the same cached `dm` action. A robust implementation would have `connectReceiver` return an unsubscribe closure that captures the exact handler it registered. This document describes the current behavior and does not claim subscriber-specific cleanup.
+Group actions use the `g` namespace. Direct-message actions use `dm` and are sent with a target peer ID. Incoming direct-message text and inline-media handlers also reject payloads whose sender does not match the room's `targetPeerId`. `PeerRoom.makeAction` still caches the transport action, but `connectReceiver` returns a closure over the exact listener it registered, so multiple `keepMounted` direct-message rooms can subscribe and clean up independently.
 
 ## 5. Text-message flow
 
@@ -153,7 +151,7 @@ sequenceDiagram
     Shell-->>UI: Render updated transcript
 ```
 
-The shell stores separate group and per-peer direct-message logs. Transcript size is bounded; evicted inline-media offers are rescinded when still active.
+The shell stores separate group and per-peer direct-message logs. Transcript updates use functional state updates so messages arriving while a send is awaiting network completion are preserved. Optimistic local entries are replaced by ID when their send completes rather than rebuilding the transcript from a captured array. Transcript size is bounded; evicted inline-media offers are rescinded when still active.
 
 The receive handler currently clears only `isTypingGroupMessage`, even for the direct-message namespace. It does not clear `isTypingDirectMessage`. This diagram documents that current behavior; it should not be interpreted as namespace-aware typing cleanup.
 
@@ -229,7 +227,9 @@ sequenceDiagram
     end
 ```
 
-After the general offer resolves, `useRoomFileShare` starts `handleInlineMediaUpload` first and does not await its promise. It then broadcasts the general `FILE_OFFER`, so the inline subset offer may overlap the metadata broadcast. When that second offer eventually resolves, `MEDIA_MESSAGE` advertises its magnet URI in the chat transcript. On the receiving side, mounting `InlineMedia` automatically invokes `fileTransfer.download`; no explicit user retrieval step is required for the inline delivery, although unsupported extensions display a fallback instead of a preview. `FileTransferService` configures `secure-file-transfer` with the same tracker list and current RTC configuration used by the room's connectivity layer.
+After the general offer resolves, `useRoomFileShare` starts `handleInlineMediaUpload` first and does not await its promise. It then broadcasts the general `FILE_OFFER`, so the inline subset offer may overlap the metadata broadcast. When that second offer eventually resolves, `MEDIA_MESSAGE` advertises its magnet URI in the chat transcript. On the receiving side, mounting `InlineMedia` automatically invokes `fileTransfer.download`; no explicit user retrieval step is required for the inline delivery, although unsupported extensions display a fallback instead of a preview.
+
+Received general-offer metadata is merged into the peer-keyed record rather than replacing other peers' entries. Rescinding an offer removes only that peer's entry and safely handles an already-absent entry. `FileTransferService` configures `secure-file-transfer` with the same tracker list and current RTC configuration used by the room's connectivity layer.
 
 ## 8. Private-room security flow
 
@@ -258,7 +258,7 @@ flowchart TD
 
 The user's key pair is created in the browser. Each peer supplies an asserted user ID, its public key, and a signature produced by the corresponding private key over the room/user string. A successful check proves possession of that private key and detects inconsistency or tampering in the signed metadata. It does **not** authenticate a real-world identity or prove that the asserted user ID belongs to a previously known person: this flow has no certificate authority, pinned key, trust-on-first-use record, or out-of-band fingerprint comparison. The implementation's `VERIFIED` and `UNVERIFIED` labels should therefore be understood as cryptographic consistency states, not identity trust decisions.
 
-Fragment parameters are parsed before clearing. If advanced sharing is enabled for `BrowserRouter`, every non-empty fragment is then removed from the visible address bar before the parsed `secret` or legacy `pwd` branch is processed. A legacy `pwd` value is encoded with the room ID automatically.
+Fragment parameters are parsed before clearing. If advanced sharing is enabled for `BrowserRouter`, every non-empty fragment is then removed from the visible address bar before the parsed `secret` or legacy `pwd` branch is processed. Secret derivation runs in an effect keyed by the room ID and parsed fragment; changing rooms clears the previous secret immediately, and stale asynchronous derivations cannot update the new room. A legacy `pwd` value is encoded with the room ID automatically.
 
 ## 9. Embedded SDK configuration
 

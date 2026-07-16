@@ -101,7 +101,7 @@ flowchart TD
     Derive --> RoomB
 ```
 
-Private-room parameters are parsed from the URL fragment first. If the fragment is non-empty and `allowAdvancedRoomLinkSharing` is enabled—which occurs only with `BrowserRouter`—the entire fragment is cleared before either `secret` or legacy `pwd` is processed. Hash-routed builds do not use that clearing behavior. A legacy `pwd` value is encoded with the room ID automatically. If neither parameter supplies a usable secret, the UI prompts for a password and derives the room secret locally.
+Private-room parameters are parsed from the URL fragment first. If the fragment is non-empty and `allowAdvancedRoomLinkSharing` is enabled—which occurs only with `BrowserRouter`—the entire fragment is cleared before either `secret` or legacy `pwd` is processed. Hash-routed builds do not use that clearing behavior. Secret state is reset whenever the room ID or parsed fragment changes, preventing a previous room's secret from carrying into the next route. A legacy `pwd` value is encoded with the room ID automatically. If neither parameter supplies a usable secret, the UI prompts for a password and derives the room secret locally.
 
 ## 4. Room UI composition
 
@@ -134,7 +134,7 @@ flowchart TD
     TypingSetting -- Yes --> Typing[TypingStatusBar]
 ```
 
-Direct-message rooms suppress the group-room media control strip. Webcam and screen-share streams are stored in `RoomContext` and determine whether `RoomVideoDisplay` appears. Microphone audio follows a separate path: incoming streams become autoplaying `HTMLAudioElement` instances stored in `ShellContext.peerAudioChannels`, where the peer and volume UI can manage them. Direct-message actions use a separate namespace and target a specific peer.
+Direct-message rooms suppress the group-room media control strip. Webcam and screen-share streams are stored in `RoomContext` and determine whether `RoomVideoDisplay` appears. Microphone audio follows a separate path: incoming streams become autoplaying `HTMLAudioElement` instances stored in `ShellContext.peerAudioChannels`, where the peer and volume UI can manage them. Direct-message text and inline-media actions use a separate namespace, target a specific peer when sending, and reject incoming payloads from other peers.
 
 ## 5. Responsive room layout
 

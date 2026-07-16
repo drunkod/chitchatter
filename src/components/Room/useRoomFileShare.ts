@@ -43,24 +43,28 @@ export function useRoomFileShare({
     peerRoom,
     onReceive: (fileOfferMetadata, { peerId }: MessageContext) => {
       if (fileOfferMetadata) {
-        setPeerOfferedFileMetadata({ [peerId]: fileOfferMetadata })
+        setPeerOfferedFileMetadata(previousMetadata => ({
+          ...previousMetadata,
+          [peerId]: fileOfferMetadata,
+        }))
       } else {
-        fileOfferMetadata = peerOfferedFileMetadata[peerId]
-        const { magnetURI, isAllInlineMedia } = fileOfferMetadata
+        setPeerOfferedFileMetadata(previousMetadata => {
+          const peerMetadata = previousMetadata[peerId]
 
-        if (
-          fileOfferMetadata &&
-          fileTransfer.isOffering(magnetURI) &&
-          !isAllInlineMedia
-        ) {
-          fileTransfer.rescind(magnetURI)
-        }
+          if (
+            peerMetadata &&
+            fileTransfer.isOffering(peerMetadata.magnetURI) &&
+            !peerMetadata.isAllInlineMedia
+          ) {
+            fileTransfer.rescind(peerMetadata.magnetURI)
+          }
 
-        const newFileOfferMetadata = { ...peerOfferedFileMetadata }
+          const newFileOfferMetadata = { ...previousMetadata }
 
-        delete newFileOfferMetadata[peerId]
+          delete newFileOfferMetadata[peerId]
 
-        setPeerOfferedFileMetadata(newFileOfferMetadata)
+          return newFileOfferMetadata
+        })
       }
 
       setPeerList(prev => {

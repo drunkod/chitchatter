@@ -1,11 +1,17 @@
 import { useDebounce } from '@react-hook/debounce'
-import { useContext, useEffect, useMemo, useState } from 'react'
+import {
+  SetStateAction,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
 import { v4 as uuid } from 'uuid'
 
 import { getPeerName, usePeerNameDisplay } from 'components/PeerNameDisplay'
 import { RoomContextProps } from 'contexts/RoomContext'
 import { SettingsContext } from 'contexts/SettingsContext'
-import { ShellContext } from 'contexts/ShellContext'
+import { MessageLog, ShellContext } from 'contexts/ShellContext'
 import { usePeerAction } from 'hooks/usePeerAction'
 import { MessageContext } from 'trystero'
 import { Audio } from 'lib/Audio'
@@ -127,27 +133,31 @@ export function useRoom(
     [roomConfig.rtcConfig]
   )
 
-  const setMessageLog = (messages: Array<Message | InlineMedia>) => {
-    if (messages.length > messageTranscriptSizeLimit) {
-      const evictedMessages = messages.slice(
-        0,
-        messages.length - messageTranscriptSizeLimit
-      )
+  const setMessageLog = (messageLogUpdate: SetStateAction<MessageLog>) => {
+    shellSetMessageLog(previousMessageLog => {
+      const messages =
+        typeof messageLogUpdate === 'function'
+          ? messageLogUpdate(previousMessageLog)
+          : messageLogUpdate
 
-      for (const message of evictedMessages) {
-        if (
-          isInlineMedia(message) &&
-          fileTransferService.fileTransfer.isOffering(message.magnetURI)
-        ) {
-          fileTransferService.fileTransfer.rescind(message.magnetURI)
+      if (messages.length > messageTranscriptSizeLimit) {
+        const evictedMessages = messages.slice(
+          0,
+          messages.length - messageTranscriptSizeLimit
+        )
+
+        for (const message of evictedMessages) {
+          if (
+            isInlineMedia(message) &&
+            fileTransferService.fileTransfer.isOffering(message.magnetURI)
+          ) {
+            fileTransferService.fileTransfer.rescind(message.magnetURI)
+          }
         }
       }
-    }
 
-    shellSetMessageLog(
-      messages.slice(-messageTranscriptSizeLimit),
-      targetPeerId
-    )
+      return messages.slice(-messageTranscriptSizeLimit)
+    }, targetPeerId)
   }
 
   const [isShowingMessages, setIsShowingMessages] = useState(true)
@@ -418,8 +428,8 @@ export function useRoom(
         }
       }
 
-      setMessageLog([
-        ...messageLog,
+      setMessageLog(previousMessageLog => [
+        ...previousMessageLog,
         { ...message, timeReceived: timeService.now() },
       ])
       updatePeer(peerId, { isTypingGroupMessage: false })
@@ -430,7 +440,11 @@ export function useRoom(
     namespace,
     peerAction: PeerAction.MEDIA_MESSAGE,
     peerRoom,
-    onReceive: inlineMedia => {
+    onReceive: (inlineMedia, { peerId }: MessageContext) => {
+      if (isDirectMessageRoom && peerId !== targetPeerId) {
+        return
+      }
+
       const userSettings = settingsContext.getUserSettings()
 
       if (!tabHasFocus) {
@@ -445,8 +459,8 @@ export function useRoom(
         }
       }
 
-      setMessageLog([
-        ...messageLog,
+      setMessageLog(previousMessageLog => [
+        ...previousMessageLog,
         { ...inlineMedia, timeReceived: timeService.now() },
       ])
     },
@@ -466,17 +480,23 @@ export function useRoom(
 
     setIsTyping(false)
     setIsMessageSending(true)
-    setMessageLog([...messageLog, unsentMessage])
+    setMessageLog(previousMessageLog => [
+      ...previousMessageLog,
+      unsentMessage,
+    ])
 
     await sendPeerMessage(
       unsentMessage,
       targetPeerId ? { target: targetPeerId } : undefined
     )
 
-    setMessageLog([
-      ...messageLog,
-      { ...unsentMessage, timeReceived: timeService.now() },
-    ])
+    setMessageLog(previousMessageLog =>
+      previousMessageLog.map(messageLogEntry =>
+        messageLogEntry.id === unsentMessage.id
+          ? { ...unsentMessage, timeReceived: timeService.now() }
+          : messageLogEntry
+      )
+    )
     setIsMessageSending(false)
   }
 
@@ -572,14 +592,23 @@ export function useRoom(
     }
 
     setIsMessageSending(true)
-    setMessageLog([...messageLog, unsentInlineMedia])
-
-    await sendPeerInlineMedia(unsentInlineMedia)
-
-    setMessageLog([
-      ...messageLog,
-      { ...unsentInlineMedia, timeReceived: timeService.now() },
+    setMessageLog(previousMessageLog => [
+      ...previousMessageLog,
+      unsentInlineMedia,
     ])
+
+    await sendPeerInlineMedia(
+      unsentInlineMedia,
+      targetPeerId ? { target: targetPeerId } : undefined
+    )
+
+    setMessageLog(previousMessageLog =>
+      previousMessageLog.map(messageLogEntry =>
+        messageLogEntry.id === unsentInlineMedia.id
+          ? { ...unsentInlineMedia, timeReceived: timeService.now() }
+          : messageLogEntry
+      )
+    )
     setIsMessageSending(false)
   }
 

@@ -41,7 +41,7 @@ export type ActionSender<T extends DataPayload> = MessageAction<T>['send']
 
 export type ActionReceiver<T extends DataPayload> = (
   callback: NonNullable<MessageAction<T>['onMessage']>
-) => void
+) => () => void
 
 export type ActionProgress = (fn: ActionProgressHandler) => void
 
@@ -49,7 +49,6 @@ export type PeerRoomAction<T extends DataPayload> = [
   ActionSender<T>,
   ActionReceiver<T>,
   ActionProgress,
-  () => void,
 ]
 
 export type RoomConfig = Parameters<typeof baseJoinRoom>[0]
@@ -223,11 +222,9 @@ export class PeerRoom {
     const eventTarget = new EventTarget()
 
     type ActionParameters = [T, MessageContext]
-    let handler: ((event: CustomEventInit<ActionParameters>) => void) | null =
-      null
 
     const connectReceiver: ActionReceiver<T> = callback => {
-      handler = (event: CustomEventInit<ActionParameters>) => {
+      const handler = (event: CustomEventInit<ActionParameters>) => {
         const { detail: receiverArguments } = event
 
         if (typeof receiverArguments === 'undefined') {
@@ -238,6 +235,10 @@ export class PeerRoom {
       }
 
       eventTarget.addEventListener(eventName, handler)
+
+      return () => {
+        eventTarget.removeEventListener(eventName, handler)
+      }
     }
 
     actionObj.onMessage = (data, context) => {
@@ -248,16 +249,7 @@ export class PeerRoom {
       eventTarget.dispatchEvent(customEvent)
     }
 
-    const detatchDispatchReceiver = () => {
-      eventTarget.removeEventListener(eventName, handler)
-    }
-
-    const action: PeerRoomAction<T> = [
-      sender,
-      connectReceiver,
-      progress,
-      detatchDispatchReceiver,
-    ]
+    const action: PeerRoomAction<T> = [sender, connectReceiver, progress]
 
     this.actions[actionName] = action
 

@@ -63,7 +63,10 @@ export interface ShellContextProps {
   updatePeer: (peerId: string, updatedProperties: Partial<Peer>) => void
   peerRoomRef: MutableRefObject<PeerRoom | null>
   messageLog: ShellMessageLog
-  setMessageLog: (messageLog: MessageLog, targetPeerId: string | null) => void
+  setMessageLog: (
+    messageLog: SetStateAction<MessageLog>,
+    targetPeerId: string | null
+  ) => void
 }
 
 export const ShellContext = createContext<ShellContextProps>({

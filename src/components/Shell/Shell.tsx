@@ -8,6 +8,7 @@ import Typography from '@mui/material/Typography'
 import { useWindowSize } from '@react-hook/window-size'
 import {
   PropsWithChildren,
+  SetStateAction,
   SyntheticEvent,
   useCallback,
   useContext,
@@ -116,9 +117,16 @@ export const Shell = ({ appNeedsUpdate, children, userPeerId }: ShellProps) => {
   const messageLog = shellMessageLog
 
   const setMessageLog = useCallback(
-    (newMessageLog: MessageLog, targetPeerId: string | null) => {
+    (messageLogUpdate: SetStateAction<MessageLog>, targetPeerId: string | null) => {
       setShellMessageLog(prev => {
         const isDirectMessageLog = typeof targetPeerId === 'string'
+        const previousMessageLog = isDirectMessageLog
+          ? (prev.directMessageLog[targetPeerId] ?? [])
+          : prev.groupMessageLog
+        const newMessageLog =
+          typeof messageLogUpdate === 'function'
+            ? messageLogUpdate(previousMessageLog)
+            : messageLogUpdate
 
         const newShellMessageLog: ShellMessageLog = {
           groupMessageLog: isDirectMessageLog

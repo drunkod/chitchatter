@@ -33,6 +33,8 @@ export function useThrottledRoomMount(roomId: string) {
   }, resetDelay)
 
   useEffect(() => {
+    setCanMount(false)
+
     const now = Date.now()
 
     const lastMountTime =
