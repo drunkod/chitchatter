@@ -1,8 +1,8 @@
 # 01 — Models, limits, and runtime validation
 
-> **Revision 2 changes:** payload/envelope/state interfaces extend `Record<string, any>` (not `unknown`) so they satisfy Trystero's `DataPayload` constraint in `usePeerAction<T>` — this matches `UnsentMessage`, `TypingStatus`, and `UserMetadata` in the repository. Snapshot limits are now internally consistent: snapshots carry truncated history (`maxSnapshotHistoryEntries`), variable string values are bounded, and the byte limits are derived from worst-case field limits. A reserved bootstrap scope allows `STATE_REQUEST` before any state exists.
+> **Revision 3 changes:** deep validation of history entries and variable maps (count, key format, value types — everywhere variables appear, including `CHOICE_RESOLVED`); accepted states are **normalized into fresh objects**, never returned as casts of the untrusted input; envelope↔payload cross-checks for snapshot-class actions; `utf8Bytes` cannot throw (cyclic or non-serializable input becomes a validation failure); new action types `ELECTION_ADVERTISE` and `SESSION_ENDED`; `STATE_SNAPSHOT` carries an optional `requestActionId` so bootstrap responses are distinguishable from unsolicited data.
 
-This phase creates the trust boundary. TypeScript types help authors, but every story file, checkpoint, and remote payload must still be validated at runtime.
+This phase creates the trust boundary. TypeScript types help authors, but every story file, checkpoint, and remote payload must still be validated at runtime — deeply, not shallowly.
 
 ## `src/config/visualNovel.ts`
 
@@ -28,6 +28,8 @@ export const visualNovelLimits = {
   maxTextLength: 8 * 1024,
   maxSeenActionIds: 2048,
   requestTimeoutMs: 10_000,
+  electionWindowMs: 2_000,
+  canonicalSendRetries: 1,
 } as const
 
 // Reserved scope for STATE_REQUEST sent by a peer that has no session state
@@ -157,6 +159,8 @@ export type VisualNovelActionType =
   | 'CHOICE_REQUEST'
   | 'CHOICE_RESOLVED'
   | 'SESSION_STARTED'
+  | 'SESSION_ENDED'
+  | 'ELECTION_ADVERTISE'
   | 'CONTROL_REQUEST'
   | 'CONTROL_PASSED'
   | 'CONTROLLER_CHANGED'
@@ -181,7 +185,9 @@ export interface VisualNovelActionEnvelope<T = any>
 
 export type VisualNovelPayloadByAction = {
   STATE_REQUEST: { knownRevision: number }
-  STATE_SNAPSHOT: { state: VisualNovelSessionState }
+  // requestActionId echoes the STATE_REQUEST being answered so a null-state
+  // peer can tell a solicited response from unsolicited data.
+  STATE_SNAPSHOT: { state: VisualNovelSessionState; requestActionId?: string }
   ADVANCE_REQUEST: { expectedRevision: number }
   ADVANCED: { sceneId: string; dialogueEntryId: string }
   CHOICE_REQUEST: { choiceId: string; expectedRevision: number }
@@ -192,6 +198,11 @@ export type VisualNovelPayloadByAction = {
     variables: Record<string, VisualNovelValue>
   }
   SESSION_STARTED: { state: VisualNovelSessionState }
+  SESSION_ENDED: Record<string, never>
+  // Sent targeted to the locally computed election winner after a controller
+  // departure. Carries the advertiser's truncated state so the winner can
+  // adopt the highest revision before announcing.
+  ELECTION_ADVERTISE: { state: VisualNovelSessionState }
   CONTROL_REQUEST: Record<string, never>
   CONTROL_PASSED: { controllerPeerId: string }
   CONTROLLER_CHANGED: { controllerPeerId: string }
@@ -208,7 +219,7 @@ export type EnvelopeFor<T extends VisualNovelActionType> =
 
 ## Snapshot truncation helper
 
-Add to `src/services/visualNovel/VisualNovelValidator.ts` (or a sibling module) and use it for **every** outgoing `STATE_SNAPSHOT`, `SESSION_STARTED`, and `RESTARTED` payload:
+Use for **every** outgoing `STATE_SNAPSHOT`, `SESSION_STARTED`, `RESTARTED`, and `ELECTION_ADVERTISE` payload:
 
 ```ts
 export const toSnapshotState = (
@@ -219,11 +230,11 @@ export const toSnapshotState = (
 })
 ```
 
-Without this, a state that is legal by every field limit (256 history entries with long IDs) exceeds the snapshot byte limit and late joiners can never sync.
+Without this, a state that is legal by every field limit exceeds the snapshot byte limit and late joiners can never sync.
 
 ## `src/services/visualNovel/VisualNovelValidator.ts`
 
-The following is a full dependency-free validation skeleton. Keep the public API stable even if the implementation later moves to a schema library.
+Skeleton of the deep validators. Key properties: nothing the validator returns aliases the untrusted input (normalization builds fresh objects field by field), size measurement never throws, and every collection is validated per element.
 
 ```ts
 import {
@@ -234,6 +245,7 @@ import {
 import type {
   VisualNovelActionEnvelope,
   VisualNovelActionType,
+  VisualNovelHistoryEntry,
   VisualNovelManifest,
   VisualNovelSessionState,
   VisualNovelValue,
@@ -245,9 +257,9 @@ export type ValidationResult<T> =
 
 const actionTypes = new Set<VisualNovelActionType>([
   'STATE_REQUEST', 'STATE_SNAPSHOT', 'ADVANCE_REQUEST', 'ADVANCED',
-  'CHOICE_REQUEST', 'CHOICE_RESOLVED', 'SESSION_STARTED',
-  'CONTROL_REQUEST', 'CONTROL_PASSED', 'CONTROLLER_CHANGED',
-  'RESTART_REQUEST', 'RESTARTED', 'ERROR',
+  'CHOICE_REQUEST', 'CHOICE_RESOLVED', 'SESSION_STARTED', 'SESSION_ENDED',
+  'ELECTION_ADVERTISE', 'CONTROL_REQUEST', 'CONTROL_PASSED',
+  'CONTROLLER_CHANGED', 'RESTART_REQUEST', 'RESTARTED', 'ERROR',
 ])
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -269,8 +281,56 @@ const isValue = (value: unknown): value is VisualNovelValue =>
   typeof value === 'boolean' ||
   (typeof value === 'number' && Number.isFinite(value))
 
-const utf8Bytes = (value: unknown) =>
-  new TextEncoder().encode(JSON.stringify(value)).byteLength
+// Never throws: cyclic or non-serializable input is reported as oversized.
+const utf8Bytes = (value: unknown): number => {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
+// Shared by state.variables and CHOICE_RESOLVED.variables — same bounds
+// everywhere variables appear.
+export const validateVariables = (
+  input: unknown
+): ValidationResult<Record<string, VisualNovelValue>> => {
+  if (!isRecord(input)) return { ok: false, errors: ['Variables must be an object'] }
+  const entries = Object.entries(input)
+  if (entries.length > visualNovelLimits.maxVariables) {
+    return { ok: false, errors: ['Too many variables'] }
+  }
+  const fresh: Record<string, VisualNovelValue> = {}
+  for (const [key, value] of entries) {
+    if (!isId(key) || !isValue(value)) {
+      return { ok: false, errors: [`Invalid variable: ${String(key).slice(0, 32)}`] }
+    }
+    fresh[key] = value as VisualNovelValue
+  }
+  return { ok: true, value: fresh }
+}
+
+const validateHistoryEntry = (
+  input: unknown
+): ValidationResult<VisualNovelHistoryEntry> => {
+  if (!isRecord(input)) return { ok: false, errors: ['History entry must be an object'] }
+  if (!isRevision(input.revision) || !isId(input.sceneId) ||
+      !isId(input.dialogueEntryId) ||
+      (input.choiceId !== undefined && !isId(input.choiceId))) {
+    return { ok: false, errors: ['Invalid history entry'] }
+  }
+  return {
+    ok: true,
+    value: {
+      revision: input.revision as number,
+      sceneId: input.sceneId as string,
+      dialogueEntryId: input.dialogueEntryId as string,
+      ...(input.choiceId !== undefined
+        ? { choiceId: input.choiceId as string }
+        : {}),
+    },
+  }
+}
 
 export const validateAssetPath = (
   path: unknown,
@@ -296,11 +356,16 @@ export const validateAssetPath = (
   }
 }
 
+// Deep-validates AND normalizes: the returned state is a freshly constructed
+// object graph — no property of the untrusted input is aliased.
 export const validateSessionState = (
   input: unknown
 ): ValidationResult<VisualNovelSessionState> => {
   const errors: string[] = []
   if (!isRecord(input)) return { ok: false, errors: ['State must be an object'] }
+  if (utf8Bytes(input) > visualNovelLimits.maxSnapshotBytes) {
+    return { ok: false, errors: ['Snapshot is too large'] }
+  }
   if (input.protocolVersion !== visualNovelProtocolVersion) errors.push('Unsupported state protocol')
   for (const key of ['storyId', 'storyVersion', 'sessionId', 'sceneId',
     'dialogueEntryId', 'controllerPeerId'] as const) {
@@ -310,26 +375,44 @@ export const validateSessionState = (
   if (typeof input.updatedAt !== 'number' || !Number.isFinite(input.updatedAt)) {
     errors.push('Invalid state.updatedAt')
   }
-  if (!isRecord(input.variables)) errors.push('Invalid state.variables')
-  else {
-    const entries = Object.entries(input.variables)
-    if (entries.length > visualNovelLimits.maxVariables) errors.push('Too many variables')
-    if (entries.some(([key, value]) => !isId(key) || !isValue(value))) {
-      errors.push('Invalid variable')
-    }
-  }
-  // Incoming (snapshot) states must satisfy the snapshot history bound.
+
+  const variables = validateVariables(input.variables)
+  if (!variables.ok) errors.push(...variables.errors)
+
+  const history: VisualNovelHistoryEntry[] = []
   if (!Array.isArray(input.history) ||
       input.history.length > visualNovelLimits.maxSnapshotHistoryEntries) {
     errors.push('Invalid state.history')
+  } else {
+    for (const entry of input.history) {
+      const validated = validateHistoryEntry(entry)
+      if (!validated.ok) { errors.push(...validated.errors); break }
+      history.push(validated.value)
+    }
   }
-  if (utf8Bytes(input) > visualNovelLimits.maxSnapshotBytes) {
-    errors.push('Snapshot is too large')
+
+  if (errors.length) return { ok: false, errors }
+  return {
+    ok: true,
+    value: {
+      protocolVersion: visualNovelProtocolVersion,
+      storyId: input.storyId as string,
+      storyVersion: input.storyVersion as string,
+      sessionId: input.sessionId as string,
+      sceneId: input.sceneId as string,
+      dialogueEntryId: input.dialogueEntryId as string,
+      variables: (variables as { ok: true; value: Record<string, VisualNovelValue> }).value,
+      history,
+      controllerPeerId: input.controllerPeerId as string,
+      revision: input.revision as number,
+      updatedAt: input.updatedAt as number,
+    },
   }
-  return errors.length
-    ? { ok: false, errors }
-    : { ok: true, value: input as VisualNovelSessionState }
 }
+
+const stateCarryingActions = new Set<VisualNovelActionType>([
+  'STATE_SNAPSHOT', 'SESSION_STARTED', 'RESTARTED', 'ELECTION_ADVERTISE',
+])
 
 const validatePayload = (
   actionType: VisualNovelActionType,
@@ -339,9 +422,16 @@ const validatePayload = (
   switch (actionType) {
     case 'STATE_REQUEST':
       return isRevision(payload.knownRevision) ? [] : ['Invalid knownRevision']
-    case 'STATE_SNAPSHOT':
+    case 'STATE_SNAPSHOT': {
+      if (payload.requestActionId !== undefined && !isId(payload.requestActionId)) {
+        return ['Invalid requestActionId']
+      }
+      const result = validateSessionState(payload.state)
+      return result.ok ? [] : result.errors
+    }
     case 'SESSION_STARTED':
-    case 'RESTARTED': {
+    case 'RESTARTED':
+    case 'ELECTION_ADVERTISE': {
       const result = validateSessionState(payload.state)
       return result.ok ? [] : result.errors
     }
@@ -354,18 +444,38 @@ const validatePayload = (
     case 'CHOICE_REQUEST':
       return isId(payload.choiceId) && isRevision(payload.expectedRevision)
         ? [] : ['Invalid choice request']
-    case 'CHOICE_RESOLVED':
-      return isId(payload.choiceId) && isId(payload.sceneId) &&
-        isId(payload.dialogueEntryId) && isRecord(payload.variables)
-        ? [] : ['Invalid choice result']
+    case 'CHOICE_RESOLVED': {
+      if (!isId(payload.choiceId) || !isId(payload.sceneId) ||
+          !isId(payload.dialogueEntryId)) return ['Invalid choice result']
+      const variables = validateVariables(payload.variables)
+      return variables.ok ? [] : variables.errors
+    }
+    case 'SESSION_ENDED':
     case 'CONTROL_REQUEST':
-      return Object.keys(payload).length === 0 ? [] : ['Control request must be empty']
+      return Object.keys(payload).length === 0 ? [] : ['Payload must be empty']
     case 'CONTROL_PASSED':
     case 'CONTROLLER_CHANGED':
       return isId(payload.controllerPeerId) ? [] : ['Invalid controller peer']
     case 'ERROR':
-      return isId(payload.code) ? [] : ['Invalid error code']
+      return isId(payload.code) &&
+        (payload.requestActionId === undefined || isId(payload.requestActionId))
+        ? [] : ['Invalid error payload']
   }
+}
+
+// Cross-check: envelopes carrying a full state must agree with it. Without
+// this, routing/authorization decisions made on envelope fields can diverge
+// from the state actually applied.
+const crossCheckStatePayload = (
+  envelope: Record<string, unknown>,
+  state: Record<string, unknown>
+): string[] => {
+  const errors: string[] = []
+  if (envelope.sessionId !== state.sessionId) errors.push('Envelope/state sessionId mismatch')
+  if (envelope.storyId !== state.storyId) errors.push('Envelope/state storyId mismatch')
+  if (envelope.storyVersion !== state.storyVersion) errors.push('Envelope/state storyVersion mismatch')
+  if (envelope.revision !== state.revision) errors.push('Envelope/state revision mismatch')
+  return errors
 }
 
 export const validateEnvelope = (
@@ -388,8 +498,22 @@ export const validateEnvelope = (
   if (typeof input.timestamp !== 'number' || !Number.isFinite(input.timestamp)) {
     errors.push('Invalid timestamp')
   }
-  if (typeof input.actionType === 'string' && actionTypes.has(input.actionType as VisualNovelActionType)) {
-    errors.push(...validatePayload(input.actionType as VisualNovelActionType, input.payload))
+  const actionType = input.actionType as VisualNovelActionType
+  if (typeof input.actionType === 'string' && actionTypes.has(actionType)) {
+    errors.push(...validatePayload(actionType, input.payload))
+    if (stateCarryingActions.has(actionType) && isRecord(input.payload) &&
+        isRecord(input.payload.state)) {
+      errors.push(...crossCheckStatePayload(input, input.payload.state))
+    }
+    // SESSION_STARTED extra invariants: fresh sessions begin at revision 0
+    // and announce their own sender as controller.
+    if (actionType === 'SESSION_STARTED' && isRecord(input.payload) &&
+        isRecord(input.payload.state)) {
+      if (input.payload.state.revision !== 0) errors.push('SESSION_STARTED must be revision 0')
+      if (input.payload.state.controllerPeerId !== input.senderPeerId) {
+        errors.push('SESSION_STARTED controller must be the sender')
+      }
+    }
   }
   return errors.length
     ? { ok: false, errors }
@@ -397,11 +521,13 @@ export const validateEnvelope = (
 }
 ```
 
+Note: `validateEnvelope` gates shape and internal consistency. **Authorization** (who may send which action given current state) is a separate per-action matrix in the sync service — see 03. Both must pass before any state mutation.
+
 ### Complete story-validation rules
 
 Implement `validateStory(input, applicationOrigin)` in the same file with these checks:
 
-1. Bound serialized story size before walking it.
+1. Bound serialized story size (via the non-throwing `utf8Bytes`) before walking it.
 2. Validate manifest `id`, semantic-looking `version`, title, description, and `startSceneId`.
 3. Bound the asset and scene maps.
 4. Validate each asset path with `validateAssetPath`.
@@ -413,7 +539,7 @@ Implement `validateStory(input, applicationOrigin)` in the same file with these 
 10. Ensure `next.dialogueEntryId` exists in the effective target scene.
 11. Accept only declared condition operators and effect types.
 12. Warn (build-time) about entries whose choices can *all* be condition-gated off with no `next` fallback — that is an authoring dead end (see 02).
-13. Normalize into a fresh object rather than returning the untrusted reference.
+13. Normalize into a fresh object graph rather than returning the untrusted reference (same rule as `validateSessionState`).
 
 ## Message-context identity check
 
@@ -436,6 +562,11 @@ Do not log the room password, private URL, encryption key, full snapshot, or rej
 - Accept a complete valid story and envelope of every action type.
 - Reject arrays/null/primitives where objects are required.
 - Reject missing/duplicate IDs, nonexistent transitions, bad asset keys, path traversal, cross-origin assets, unsupported extensions, NaN/infinity, oversized histories/variables/variable values/envelopes, unknown actions/effects/operators, and unsupported versions.
-- Assert `toSnapshotState` truncates to `maxSnapshotHistoryEntries` and that a maximal truncated state passes `validateSessionState` (byte limits are consistent by construction).
-- Assert the transport peer ID mismatch is rejected before state changes.
+- Reject malformed history entries (bad revision, bad IDs, wrong types) and malformed `CHOICE_RESOLVED` variables (count, key format, value type) — not just non-object shapes.
+- Reject envelope↔payload mismatches on `sessionId`, `storyId`, `storyVersion`, and `revision` for every state-carrying action.
+- Reject `SESSION_STARTED` with non-zero revision or a controller other than the sender.
+- Assert cyclic input to `validateSessionState`/`validateEnvelope` fails cleanly instead of throwing.
+- Assert normalization: mutating the input object after validation does not affect the returned value; the returned value contains no properties beyond the schema.
+- Assert `toSnapshotState` truncates to `maxSnapshotHistoryEntries` and that a maximal truncated state passes `validateSessionState`.
 - Assert a bootstrap-scoped `STATE_REQUEST` envelope passes `validateEnvelope`.
+- Assert the transport peer ID mismatch is rejected before state changes.

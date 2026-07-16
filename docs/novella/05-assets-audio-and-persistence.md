@@ -1,6 +1,6 @@
 # 05 — Assets, local story audio, and provisional persistence
 
-> **Revision 2 changes:** the asset-loading effect now collects failures locally instead of reading stale `failedUrls` state; the checkpoint adapter is explicitly `StorageContext.getPersistedStorage()` (localforage — verified in the repo, and its async API matches the adapter shape exactly).
+> **Revision 3 changes:** the checkpoint store gains a room-scoped **latest-session pointer** so a cold-started browser can discover which checkpoint to load (previously `load(sessionId)` required an ID the browser could not know); the adapter type matches localforage honestly (`setItem` resolves to the stored value, so the adapter uses `Promise<unknown>`); all storage operations handle rejections (quota, IndexedDB failures) instead of producing unhandled promises. Asset-loading fixes from Revision 2 stand.
 
 Story assets are bundled or statically hosted by the same application. Only state identifiers travel through the novella protocol.
 
@@ -221,21 +221,31 @@ These controls are separate from voice communication volume.
 
 ## `src/hooks/useVisualNovelCheckpoint.ts`
 
-Use the repository's existing storage abstraction: `StorageContext.getPersistedStorage()` returns a localforage instance whose async `getItem`/`setItem`/`removeItem` API matches this adapter shape directly.
+Use the repository's existing storage abstraction: `StorageContext.getPersistedStorage()` returns a localforage instance. Note localforage's `setItem` resolves to the **stored value**, not `void` — the adapter type reflects that. Two keys per room scope:
+
+```text
+visual-novel:v1:<roomScope>:latest        → sessionId (pointer)
+visual-novel:v1:<roomScope>:<sessionId>   → checkpoint state
+```
+
+Without the pointer, a cold-started browser cannot know which session ID to load, and the checkpoint provides no continuity until canonical state has already arrived.
 
 ```ts
 import { useEffect, useState } from 'react'
 import type { VisualNovelSessionState } from 'models/visualNovel'
 import { validateSessionState, toSnapshotState } from 'services/visualNovel'
 
+// Matches localforage structurally: setItem resolves to the stored value.
 interface StorageAdapter {
   getItem: (key: string) => Promise<unknown>
-  setItem: (key: string, value: unknown) => Promise<void>
+  setItem: (key: string, value: unknown) => Promise<unknown>
   removeItem: (key: string) => Promise<void>
 }
 
 const checkpointKey = (roomScope: string, sessionId: string) =>
   `visual-novel:v1:${roomScope}:${sessionId}`
+const latestKey = (roomScope: string) =>
+  `visual-novel:v1:${roomScope}:latest`
 
 export const useVisualNovelCheckpoint = ({
   storage,
@@ -252,39 +262,52 @@ export const useVisualNovelCheckpoint = ({
     if (!state) return
     // Store the truncated form so a loaded checkpoint always passes
     // validateSessionState (which enforces the snapshot history bound).
-    void storage.setItem(
-      checkpointKey(roomScope, state.sessionId),
-      toSnapshotState(state)
-    )
+    // Quota/IndexedDB failures degrade to "no checkpoint", never throw up
+    // the render path.
+    void Promise.all([
+      storage.setItem(checkpointKey(roomScope, state.sessionId), toSnapshotState(state)),
+      storage.setItem(latestKey(roomScope), state.sessionId),
+    ]).catch(() => console.warn('Novella checkpoint write failed'))
   }, [roomScope, state, storage])
 
-  const load = async (sessionId: string) => {
-    const raw = await storage.getItem(checkpointKey(roomScope, sessionId))
-    const result = validateSessionState(raw)
-    const value = result.ok ? result.value : null
-    setProvisional(value)
-    return value
+  // Cold start: discover the last session via the pointer, then load it.
+  const loadLatest = async (): Promise<VisualNovelSessionState | null> => {
+    try {
+      const sessionId = await storage.getItem(latestKey(roomScope))
+      if (typeof sessionId !== 'string') return null
+      const raw = await storage.getItem(checkpointKey(roomScope, sessionId))
+      const result = validateSessionState(raw)
+      const value = result.ok ? result.value : null
+      setProvisional(value)
+      return value
+    } catch {
+      return null
+    }
   }
 
   const acceptCanonical = (canonical: VisualNovelSessionState) => {
-    if (!provisional || canonical.revision >= provisional.revision) {
-      setProvisional(null)
-      return canonical
-    }
-    // A local checkpoint never overrides canonical peer state. Request another
-    // snapshot if this surprising case occurs and keep canonical state.
+    // A local checkpoint never overrides canonical peer state, regardless of
+    // its revision. It is provisional UI continuity only.
     setProvisional(null)
     return canonical
   }
 
   const clear = async (sessionId: string) => {
-    await storage.removeItem(checkpointKey(roomScope, sessionId))
+    try {
+      await storage.removeItem(checkpointKey(roomScope, sessionId))
+      const latest = await storage.getItem(latestKey(roomScope))
+      if (latest === sessionId) await storage.removeItem(latestKey(roomScope))
+    } catch {
+      console.warn('Novella checkpoint clear failed')
+    }
     setProvisional(null)
   }
 
-  return { provisional, load, acceptCanonical, clear }
+  return { provisional, loadLatest, acceptCanonical, clear }
 }
 ```
+
+The provisional state renders read-only continuity while a bootstrap `STATE_REQUEST` is outstanding; the first authorized snapshot or `SESSION_STARTED` replaces it via `acceptCanonical`. If the room has moved to a different session, `clear` the stale checkpoint.
 
 ## Room scope and privacy
 

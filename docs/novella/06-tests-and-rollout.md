@@ -1,128 +1,123 @@
 # 06 — Tests, manual validation, and rollout
 
-> **Revision 2 changes:** `TestPeerRoom.makeAction` now matches the real `PeerRoomAction` 3-tuple (`[sender, connectReceiver, progress]`, where `connectReceiver` returns the unsubscribe function — verified against `usePeerAction.ts`); E2E specs live at `e2e/tests/visual-novel.test.ts` matching the repository layout; new test cases cover the revision-2 protocol fixes (migration acceptance, bootstrap requests, post-apply duplicate commit, story switch, restart revision check, dead-end choices, request timeout).
+> **Revision 3 changes:** the test mesh implements the narrow `VisualNovelTransport` interface (the concrete `PeerRoom` has private members and is not structurally substitutable) with **multiple receivers per action, real join/leave handlers, and a `disconnect()` operation** — the previous fake could not run the promised late-join and controller-departure tests at all. New test cases cover the Revision 3 protocol: election handshake, winner-only `CONTROLLER_CHANGED` with supersession, snapshot-class authorization (forged snapshots, unsolicited bootstrap data), simultaneous-start arbitration, engine-replay mismatch recovery, exhaustive dispatch of unimplemented actions, session lifecycle, and send-failure repair.
 
 ## Unit-test matrix
 
 ### Validator
 
-- Valid complete story and every action payload.
+- Valid complete story and envelope of every action type.
 - Missing start scene, empty dialogue, duplicate IDs, nonexistent transitions.
 - Unknown asset keys, path traversal, external origins, unsupported extensions.
 - Unknown action/effect/operator, unsupported protocol, invalid numbers.
-- Oversized envelope, snapshot, history, variables, variable values, text, and identifiers.
-- `toSnapshotState` truncation and byte-limit consistency (maximal legal truncated state passes).
-- Bootstrap-scoped `STATE_REQUEST` envelope is valid.
+- Oversized envelope, snapshot, history, variables, variable values, text, identifiers.
+- **Deep collection checks:** malformed history entries (bad revision/IDs/types) and malformed `CHOICE_RESOLVED` variables (count, key format, value type).
+- **Cross-field checks:** envelope↔payload mismatch on sessionId/storyId/storyVersion/revision for every state-carrying action; `SESSION_STARTED` with non-zero revision or controller ≠ sender.
+- **Normalization:** mutating input after validation does not affect the returned value; no extra properties survive; cyclic input fails cleanly instead of throwing.
+- `toSnapshotState` truncation; maximal truncated state passes; bootstrap-scoped `STATE_REQUEST` is valid.
 - Envelope sender ID different from Trystero `MessageContext.peerId`.
 
 ### Engine
 
 - Start, sequential advance, explicit transition, both choices and endings.
 - Conditions, set/increment effects, unavailable choice, choice-required error.
-- **Dead-end choice set: entry declares choices, all condition-gated off → `canAdvance` false, `advance` throws `CHOICE_DEAD_END`, branch is never skipped.**
+- Dead-end choice set: `canAdvance` false, `advance` throws `CHOICE_DEAD_END`.
 - End-of-branch, restart, controller change, history bound, story mismatch.
-- Immutability: input state and manifest are not mutated.
+- Immutability and determinism (same inputs → identical output) — load-bearing for replica replay.
 
 ### Sync service
 
-- Apply exact next revision, ignore duplicate/stale, recover on gap.
-- Reject story/version/session/controller/sender mismatch.
-- **`inspect*` methods are pure: an inspected-but-uncommitted envelope is not treated as duplicate on retransmit; only `commit()` records it.**
-- **Snapshot for a different session/story reaches `apply` (story switching); non-snapshot cross-story events still reject.**
-- **`STATE_REQUEST` with bootstrap scope passes `inspectRequest` at the controller; other request types still require session match.**
-- **`isAcceptableControllerChange`: accepted when sender == announced controller, old controller absent, revision exactly next; rejected when the old controller is still connected or the revision is wrong.**
-- Target late-join snapshot and accept only valid snapshots.
-- Deterministic election and highest-revision state choice.
-- Concurrent same-revision requests yield one canonical transition (promise-queue serialization).
-- **Stale `RESTART_REQUEST` (wrong `expectedRevision`) produces a snapshot reply, not a restart.**
+- `inspectProgression`: apply exact next revision; ignore duplicate/stale; recover on gap; **reject progression events from any peer that is not the current controller**.
+- `inspect*` purity: an inspected-but-uncommitted envelope is not a duplicate on retransmit; only `commit()` records it.
+- `authorizeSnapshot`:
+  - **forged `STATE_SNAPSHOT` from a non-controller participant with same session is rejected** (the Revision 2 hole);
+  - solicited bootstrap response (matching `requestActionId`) accepted at null state; **unsolicited snapshot at null state rejected**;
+  - cross-session snapshot accepted only from the current controller;
+  - `RESTARTED` only from controller at exactly `revision + 1`; stale/forged restarts rejected.
+- `SESSION_STARTED` arbitration: on revision-0 collision every inspector keeps the lexicographically smaller controller, including at the losing starter.
+- `authorizeControllerChange`:
+  - accepted only when sender == announced controller == **locally computed winner** and the old controller is absent;
+  - **self-nominated non-winner rejected**;
+  - rejected while the old controller is still connected;
+  - supersession: equal-revision announcement with lower peer ID replaces an applied one; higher revision always wins; replicas converge on one controller from conflicting orders of delivery.
+- `electController` order-independence; `chooseElectionState` picks highest revision then lowest controller ID.
+- Stale `RESTART_REQUEST`/`ADVANCE_REQUEST`/`CHOICE_REQUEST` (wrong `expectedRevision`) produce a snapshot reply, not a transition.
+- Concurrent same-revision requests yield one canonical transition (queue serialization).
 
-## `VisualNovelEngine.test.ts`
+### Dispatcher (hook-level)
 
-```ts
-describe('VisualNovelEngine', () => {
-  const makeEngine = () => new VisualNovelEngine(exampleStory, { now: () => 1234 })
+- **Exhaustive dispatch:** `ERROR` and `CONTROL_PASSED` never mutate revision/timestamp/state; `CONTROL_REQUEST` is rejected and **not committed**; a synthetic unknown action type is rejected.
+- **Engine replay:** an `ADVANCED`/`CHOICE_RESOLVED` whose payload disagrees with local replay (wrong scene, wrong variables) is not applied and triggers recovery.
+- Recovery targeting: gap during migration requests a snapshot from the event sender, not the departed controller.
 
-  it.each([
-    ['light-beacon', 'beacon-ending', { usedBeacon: true, courage: 1 }],
-    ['wait-for-dawn', 'dawn-ending', { usedBeacon: false, patience: 1 }],
-  ])('resolves %s canonically', (choiceId, sceneId, variables) => {
-    const engine = makeEngine()
-    const atChoice = engine.advance(engine.start('session-1', 'peer-a'))
-    const result = engine.choose(atChoice, choiceId)
-    expect(result).toMatchObject({ sceneId, variables, revision: 2 })
-    expect(atChoice.sceneId).toBe('pier')
-  })
-
-  it('requires a choice instead of advancing past it', () => {
-    const engine = makeEngine()
-    const atChoice = engine.advance(engine.start('session-1', 'peer-a'))
-    expect(() => engine.advance(atChoice)).toThrow('Resolve a choice')
-  })
-})
-```
-
-## `VisualNovelSyncService.test.ts`
+## Key sync-service cases (sketch)
 
 ```ts
-it('requests recovery for an event gap', () => {
+it('rejects a forged snapshot from a participant', () => {
   const service = new VisualNovelSyncService()
-  const result = service.inspectCanonical(
-    makeEnvelope({ revision: 4, senderPeerId: 'peer-a', actionType: 'ADVANCED' }),
-    makeState({ revision: 2, controllerPeerId: 'peer-a' }),
-    'peer-a'
-  )
-  expect(result).toEqual({ kind: 'recover', reason: 'revision-gap' })
+  const state = makeState({ revision: 5, controllerPeerId: 'peer-ctl' })
+  const forged = makeSnapshot({ ...state, revision: 9 })
+  expect(service.authorizeSnapshot(
+    makeEnvelope({ actionType: 'STATE_SNAPSHOT', senderPeerId: 'peer-evil' }),
+    forged, state, 'peer-evil', null
+  )).toBe(false)
 })
 
-it('treats an uncommitted envelope as fresh on retransmit', () => {
-  const service = new VisualNovelSyncService()
-  const envelope = makeEnvelope({ actionId: 'same', revision: 2, actionType: 'ADVANCED' })
-  // First inspection did not lead to apply (e.g. payload failed validation
-  // downstream) — commit() was never called.
-  service.inspectCanonical(envelope, makeState({ revision: 1 }), 'peer-a')
-  expect(service.inspectCanonical(envelope, makeState({ revision: 1 }), 'peer-a'))
-    .toEqual({ kind: 'apply' })
-})
-
-it('ignores a committed duplicate', () => {
-  const service = new VisualNovelSyncService()
-  const envelope = makeEnvelope({ actionId: 'same', revision: 2, actionType: 'ADVANCED' })
-  service.commit(envelope)
-  expect(service.inspectCanonical(envelope, makeState({ revision: 1 }), 'peer-a'))
-    .toEqual({ kind: 'ignore', reason: 'duplicate' })
-})
-
-it('elects the same peer regardless of input order', () => {
-  const service = new VisualNovelSyncService()
-  expect(service.electController(['peer-z', 'peer-a', 'peer-b'])).toBe('peer-a')
-  expect(service.electController(['peer-b', 'peer-z', 'peer-a'])).toBe('peer-a')
-})
-
-it('accepts CONTROLLER_CHANGED from the elected successor', () => {
+it('accepts CONTROLLER_CHANGED only from the locally computed winner', () => {
   const service = new VisualNovelSyncService()
   const state = makeState({ revision: 5, controllerPeerId: 'peer-gone' })
-  const envelope = makeEnvelope({
-    actionType: 'CONTROLLER_CHANGED',
-    senderPeerId: 'peer-a',
-    revision: 6,
-    payload: { controllerPeerId: 'peer-a' },
+  const envelope = (sender: string) => makeEnvelope({
+    actionType: 'CONTROLLER_CHANGED', senderPeerId: sender, revision: 6,
+    payload: { controllerPeerId: sender },
   })
-  expect(service.isAcceptableControllerChange(envelope, state, 'peer-a', ['peer-b']))
-    .toBe(true)
-  // Old controller still connected → refuse the coup.
-  expect(service.isAcceptableControllerChange(envelope, state, 'peer-a', ['peer-gone']))
-    .toBe(false)
+  // self is peer-b; remaining peers are peer-c → winner is peer-b
+  expect(service.authorizeControllerChange(
+    envelope('peer-c'), state, 'peer-c', 'peer-b', ['peer-c'], null
+  )).toBe(false) // self-nomination by non-winner
+  expect(service.authorizeControllerChange(
+    envelope('peer-a'), state, 'peer-a', 'peer-b', ['peer-a', 'peer-c'], null
+  )).toBe(true) // peer-a is the computed winner
+})
+
+it('supersedes an equal-revision announcement with a lower peer ID', () => {
+  const service = new VisualNovelSyncService()
+  const state = makeState({ revision: 5, controllerPeerId: 'peer-gone' })
+  const applied = { revision: 6, controllerPeerId: 'peer-b' }
+  expect(service.authorizeControllerChange(
+    makeEnvelope({ actionType: 'CONTROLLER_CHANGED', senderPeerId: 'peer-a',
+      revision: 6, payload: { controllerPeerId: 'peer-a' } }),
+    state, 'peer-a', 'peer-z', ['peer-a'], applied
+  )).toBe(true)
+})
+
+it('arbitrates simultaneous revision-0 sessions deterministically', () => {
+  const service = new VisualNovelSyncService()
+  const mine = makeState({ revision: 0, controllerPeerId: 'peer-b', sessionId: 's-b' })
+  const theirs = makeSnapshot({ revision: 0, controllerPeerId: 'peer-a', sessionId: 's-a' })
+  expect(service.authorizeSnapshot(
+    makeEnvelope({ actionType: 'SESSION_STARTED', senderPeerId: 'peer-a' }),
+    theirs, mine, 'peer-a', null
+  )).toBe(true) // peer-a < peer-b: adopt theirs, discard own
 })
 ```
 
 ## In-memory transport for hook tests
 
-Matches the real `PeerRoomAction` shape: a 3-tuple whose receiver-connector returns its own unsubscribe function (see `PeerRoom.makeAction` / `usePeerAction`).
+Implements `VisualNovelTransport` (03) — not a fake `PeerRoom`. Receiver **sets** per action key (matching the real `EventTarget` semantics where multiple receivers coexist and each `connectReceiver` returns its own unsubscribe), keyed join/leave handler maps, and a real `disconnect()` that removes the peer from the mesh and fires every remaining peer's leave handlers.
 
 ```ts
-class TestPeerRoom {
-  private receivers = new Map<string, (data: unknown, context: MessageContext) => void>()
-  constructor(readonly peerId: string, private readonly mesh: Map<string, TestPeerRoom>) {
+class TestTransport implements VisualNovelTransport {
+  private receivers = new Map<string, Set<(data: unknown, context: MessageContext) => void>>()
+  private joinHandlers = new Map<PeerHookType, (peerId: string) => void>()
+  private leaveHandlers = new Map<PeerHookType, (peerId: string) => void>()
+
+  constructor(
+    readonly peerId: string,
+    private readonly mesh: Map<string, TestTransport>
+  ) {
+    for (const other of mesh.values()) {
+      for (const handler of other.joinHandlers.values()) handler(peerId)
+    }
     mesh.set(peerId, this)
   }
 
@@ -130,71 +125,71 @@ class TestPeerRoom {
 
   getPeers = () => [...this.mesh.keys()].filter(id => id !== this.peerId)
 
-  makeAction<T>(peerAction: PeerAction, namespace: string) {
+  makeAction<T extends DataPayload>(peerAction: PeerAction, namespace: string) {
     const key = `${namespace}.${peerAction}`
+    if (!this.receivers.has(key)) this.receivers.set(key, new Set())
     const send = async (data: T, options?: { target?: string | string[] }) => {
       const targets = options?.target
         ? (Array.isArray(options.target) ? options.target : [options.target])
         : this.getPeers()
       for (const target of targets) {
-        this.mesh.get(target)?.receivers.get(key)?.(
-          structuredClone(data),
-          { peerId: this.peerId } as MessageContext
-        )
+        for (const receiver of this.mesh.get(target)?.receivers.get(key) ?? []) {
+          receiver(structuredClone(data), { peerId: this.peerId } as MessageContext)
+        }
       }
     }
     const connectReceiver = (receiver: (data: T, context: MessageContext) => void) => {
-      this.receivers.set(key, receiver as never)
-      return () => this.receivers.delete(key)
+      this.receivers.get(key)!.add(receiver as never)
+      return () => this.receivers.get(key)!.delete(receiver as never)
     }
     const progress = (_fn: unknown) => {}
     return [send, connectReceiver, progress] as const
   }
 
-  onPeerJoin = (_type: PeerHookType, _fn: unknown) => {}
-  onPeerLeave = (_type: PeerHookType, _fn: unknown) => {}
-  removePeerJoinHandler = (_type: PeerHookType) => {}
-  removePeerLeaveHandler = (_type: PeerHookType) => {}
+  onPeerJoin = (type: PeerHookType, handler: (peerId: string) => void) => {
+    this.joinHandlers.set(type, handler)
+  }
+  onPeerLeave = (type: PeerHookType, handler: (peerId: string) => void) => {
+    this.leaveHandlers.set(type, handler)
+  }
+  removePeerJoinHandler = (type: PeerHookType) => this.joinHandlers.delete(type)
+  removePeerLeaveHandler = (type: PeerHookType) => this.leaveHandlers.delete(type)
+
+  // Simulates a transport departure: removes this peer and fires leave
+  // handlers on every remaining peer — the trigger for election tests.
+  disconnect = () => {
+    this.mesh.delete(this.peerId)
+    for (const other of this.mesh.values()) {
+      for (const handler of other.leaveHandlers.values()) handler(this.peerId)
+    }
+  }
 }
 ```
 
-Use it to mount controller and participant hooks and assert:
+Mount controller and participant hooks on a shared mesh (use fake timers for the election window and request timeout) and assert:
 
 - targeted requests, one broadcast, equal states;
 - duplicate suppression only after commit;
-- revision-gap recovery;
-- **bootstrap late join: participant mounts with null state, sends bootstrap `STATE_REQUEST`, receives a truncated snapshot, converges;**
-- **`SESSION_STARTED` reaches peers already present at story start;**
-- **controller leave: survivor elects itself from transport peers, broadcasts `CONTROLLER_CHANGED`, and the other replica applies it;**
-- **participant request timeout: no controller response re-enables the UI after `requestTimeoutMs`.**
+- revision-gap recovery, with the request targeted correctly during migration;
+- bootstrap late join: participant mounts with null state, sends bootstrap `STATE_REQUEST`, accepts only the snapshot echoing its `requestActionId`, converges;
+- an unsolicited snapshot pushed to a null-state peer by a non-controller is ignored;
+- `SESSION_STARTED` reaches peers already present; simultaneous starts converge on the lower controller ID;
+- **election handshake:** `controller.disconnect()` → non-winners advertise to the computed winner; the winner adopts the highest advertised revision, announces once, and all replicas converge on the same controller and state — including when the winner was a revision behind;
+- a non-winner broadcasting `CONTROLLER_CHANGED` is rejected by every replica;
+- participant request timeout re-enables the UI after `requestTimeoutMs`;
+- send failure on a canonical event triggers retry then snapshot repair (make `send` reject once).
 
 ## Component tests
 
-```tsx
-it('renders dialogue and submits a participant choice request', async () => {
-  const choose = vi.fn().mockResolvedValue(undefined)
-  render(
-    <VisualNovelContext.Provider value={makeContext({
-      entry: { id: 'pier-2', speaker: 'Sol', text: 'What should we do?' },
-      availableChoices: [{ id: 'beacon', label: 'Light the beacon', nextSceneId: 'end' }],
-      isController: false,
-      choose,
-    })}>
-      <DialogueBox />
-      <ChoiceList />
-    </VisualNovelContext.Provider>
-  )
-  expect(screen.getByText('What should we do?')).toBeVisible()
-  await userEvent.click(screen.getByRole('button', { name: /Light the beacon/ }))
-  expect(choose).toHaveBeenCalledWith('beacon')
-})
-```
+Unchanged cases from Revision 2 (dialogue render, choice request, lobby, asset fallback, status states, controller badge, pending controls, restart dialog, keyboard focus order, mobile view switching), plus:
 
-Also test lobby, asset fallback, loading/sync/error/waiting states, controller badge, pending controls, restart dialog, keyboard focus order, and mobile Story/Chat switching.
+- start buttons disabled for non-controllers when a session exists (`canStartStory`);
+- controller sees "pass control"/"end story", not bare "leave story", while participants remain;
+- `SESSION_ENDED` returns every peer to the lobby.
 
 ## `e2e/tests/visual-novel.test.ts`
 
-E2E specs live under `e2e/tests/` with a `.test.ts` suffix, matching the existing suite (`room.test.ts`, `home.test.ts`, …). Use the room-URL helpers from `e2e/helpers` rather than the illustrative literal below.
+E2E specs live under `e2e/tests/` with a `.test.ts` suffix, matching the existing suite. Use the room-URL helpers from `e2e/helpers`.
 
 ```ts
 import { expect, test } from '@playwright/test'
@@ -225,7 +220,7 @@ test('two peers share a branch and survive controller departure', async ({ brows
 test('late join and refresh recover the current snapshot', async ({ browser }) => {
   // Start and progress in A, join with B (null state → bootstrap request),
   // compare scene/dialogue/revision, reload B, then assert the same
-  // canonical state returns.
+  // canonical state returns (checkpoint pointer + snapshot convergence).
 })
 ```
 
@@ -233,10 +228,11 @@ test('late join and refresh recover the current snapshot', async ({ browser }) =
 
 - Send chat before/during/after story transitions.
 - Start/stop microphone while choices are visible.
-- Verify video remains optional and can start without remounting the story.
-- Verify file sharing and direct-message navigation remain functional.
+- Video and screen share **display** (`RoomVideoDisplay`) remains rendered and functional alongside an active story.
+- **Open a DM dialog during an active story: the DM room mounts no novella receiver, sends no bootstrap request, and does not disturb the group-room replica or lifecycle handlers.**
+- File sharing and direct-message navigation remain functional.
 - Exercise public and password-protected rooms without logging secrets.
-- Confirm removing the novella handlers does not flush audio/video/chat lifecycle handlers (keyed removal, not `flush()`).
+- Removing the novella handlers does not flush audio/video/chat lifecycle handlers (keyed removal, not `flush()`).
 
 ## Manual matrix
 
@@ -246,9 +242,11 @@ test('late join and refresh recover the current snapshot', async ({ browser }) =
 2. Join the same room in isolated profiles.
 3. Confirm voice and text chat.
 4. Start the example story and request actions from both peers.
-5. Confirm identical scene/dialogue/revision after every action.
-6. Refresh the participant and verify bootstrap snapshot recovery.
-7. Close the controller and verify migration without restart — the survivor must actually apply `CONTROLLER_CHANGED`, not just broadcast it.
+5. Attempt to start a different story from the participant — must be refused locally and have no effect on the controller.
+6. Confirm identical scene/dialogue/revision after every action.
+7. Refresh the participant and verify checkpoint continuity plus bootstrap snapshot recovery.
+8. Close the controller and verify the election handshake converges without restart.
+9. End the story from the controller and verify both peers return to the lobby.
 
 ### Same-network devices
 
@@ -262,19 +260,19 @@ Test with configured TURN. Record direct/relay status and latency. A failed peer
 
 - Normal local startup and two-profile test setup.
 - Starting a story using the existing room URL.
-- Controller/request/revision/snapshot/election semantics, including the new-controller acceptance rule.
+- Controller/request/revision/snapshot/election semantics: the authorization matrix and the election handshake.
 - Story schema, safe asset rules, catalog registration, and example.
-- Late join (bootstrap request), refresh, and checkpoint behavior.
+- Late join (bootstrap request), refresh, checkpoint pointer behavior.
 - Browser autoplay and independent story volume controls.
 - Tracker/STUN/TURN/ad-blocker/cross-domain limitations.
 - Privacy statement: no central progress storage, accounts, or analytics.
 
 ## Rollout sequence
 
-1. Merge pure models/validator/engine/story behind no visible UI.
+1. Merge pure models/deep validators/engine/story behind no visible UI.
 2. Add local-only UI behind a development feature flag.
-3. Add two-peer sync, `SESSION_STARTED` bootstrap, snapshots, and recovery tests.
-4. Add controller migration and concurrency hardening.
+3. Add two-peer sync with the authorization matrix, exhaustive dispatch, `SESSION_STARTED` bootstrap/arbitration, snapshots, and recovery tests.
+4. Add the election handshake, session lifecycle, and concurrency hardening.
 5. Enable bundled example story by default after full regression pass.
 
 ## Command gate

@@ -1,15 +1,14 @@
 # 03 — P2P protocol, synchronization, and controller migration
 
-> **Revision 2 changes:**
+> **Revision 3 changes:**
 >
-> 1. `CONTROLLER_CHANGED` is now applicable — replicas previously required the sender to equal the *old* controller, which made migration impossible. New acceptance rule below.
-> 2. Bootstrap `STATE_REQUEST`: the envelope factory takes an explicit scope, so a peer with **null** state can request a snapshot (the old design required a full state object, making missing-state recovery dead code).
-> 3. Duplicate suppression is commit-based: action IDs are recorded only after successful apply/handling, so retransmits of messages that failed validation or triggered recovery are not swallowed.
-> 4. The story-mismatch check moved after the snapshot exception so story switching (new `SESSION_STARTED`) can be applied.
-> 5. Election reads transport truth (`peerRoom.getPeers()` + `selfId`), not React state.
-> 6. `RESTART_REQUEST` now checks `expectedRevision` like the other requests.
-> 7. Controller request handling is serialized through a promise queue.
-> 8. `SESSION_STARTED` broadcast is wired (`startSession`), and outgoing snapshots pass through `toSnapshotState`.
+> 1. **Election handshake.** Migration is no longer self-nomination: every peer computes the same winner from transport truth; non-winners advertise their state to the winner (`ELECTION_ADVERTISE`); the winner adopts the highest revision (`chooseElectionState`) inside a bounded window, then announces. Replicas accept `CONTROLLER_CHANGED` **only from their locally computed winner**, and a competing announcement with higher revision (or equal revision and lower peer ID) supersedes an already-applied one — no split-brain, no stale-rejection deadlock.
+> 2. **Migration-aware recovery targeting.** Gap recovery requests go to the event's sender when the recorded controller is no longer connected, never to the departed controller.
+> 3. **Per-action authorization matrix.** Snapshot-class events no longer bypass authorization: `STATE_SNAPSHOT` is controller-only (or a solicited bootstrap response echoing `requestActionId`), `RESTARTED` is controller-only at exactly `revision + 1`, `SESSION_STARTED` must be revision 0 with controller == sender, and story switching on an existing session is controller-only.
+> 4. **Exhaustive dispatch.** Both handlers are `switch` statements over the full action union. `ERROR`, `CONTROL_PASSED`, `CONTROL_REQUEST`, and any future action cannot fall through into state mutation; unimplemented actions are rejected and never committed.
+> 5. **Engine replay.** Replicas re-derive `ADVANCED`/`CHOICE_RESOLVED` through their own engine and compare; mismatch triggers recovery instead of trusting cast payload fields.
+> 6. **Session lifecycle.** Simultaneous revision-0 starts arbitrate deterministically; only the controller may switch stories or end the session (`SESSION_ENDED`); canonical send failures are retried then repaired with a snapshot broadcast.
+> 7. **Narrow transport interface.** The sync hook depends on `VisualNovelTransport`, not the concrete `PeerRoom` class (which has private members and is not structurally substitutable in tests).
 
 Novella uses the room's existing `PeerRoom`. It does not call `joinRoom` again. One short Trystero action carries all semantic novella messages in a versioned envelope.
 
@@ -35,8 +34,6 @@ The resulting action name is `gvn.9` (5 chars) — safely under the limit. Do no
 
 ## Extend `src/lib/PeerRoom/PeerRoom.ts`
 
-Novella needs its own join/leave subscription without removing chat/media handlers, plus access to the local transport peer ID (verified: nothing in `src/` currently exposes it — Trystero exports `selfId`).
-
 ```ts
 import { joinRoom, selfId /* … existing imports … */ } from '@trystero-p2p/torrent'
 
@@ -61,11 +58,58 @@ removePeerLeaveHandler = (peerHookType: PeerHookType) => {
 }
 ```
 
-Keep the global flush methods for room teardown. Feature-hook cleanup should use keyed removal.
+Keep the global flush methods for room teardown. Feature-hook cleanup uses keyed removal. Note `PeerRoom` stores **one** handler per `PeerHookType` — which is exactly why only one novella provider may exist per browser (see 04).
+
+## `src/services/visualNovel/VisualNovelTransport.ts`
+
+The sync hook depends on this interface, not on the `PeerRoom` class. `PeerRoom` satisfies it structurally; tests implement it directly (06).
+
+```ts
+import type { DataPayload } from 'trystero'
+import type { PeerHookType, PeerRoomAction } from 'lib/PeerRoom'
+import type { PeerAction } from 'models/network'
+
+export interface VisualNovelTransport {
+  getSelfId: () => string
+  getPeers: () => string[]
+  makeAction: <T extends DataPayload>(
+    peerAction: PeerAction,
+    namespace: string
+  ) => PeerRoomAction<T>
+  onPeerJoin: (type: PeerHookType, handler: (peerId: string) => void) => void
+  onPeerLeave: (type: PeerHookType, handler: (peerId: string) => void) => void
+  removePeerJoinHandler: (type: PeerHookType) => void
+  removePeerLeaveHandler: (type: PeerHookType) => void
+}
+```
+
+(`usePeerAction` takes a `PeerRoom`; either widen its prop to this interface or call `transport.makeAction` directly in the sync hook — both are acceptable; pick one and keep it consistent.)
+
+## Authorization matrix
+
+`validateEnvelope` (01) proves shape and internal consistency. This matrix is the second gate, evaluated against **current local state** before any mutation. `sender` below always means the transport-verified `context.peerId` (already cross-checked against `senderPeerId`).
+
+| Action | Authorized sender | Preconditions | Effect |
+| --- | --- | --- | --- |
+| `STATE_REQUEST` | any peer | handled only if self is controller; exempt from session match (bootstrap scope allowed) | targeted `STATE_SNAPSHOT` echoing `requestActionId` |
+| `ADVANCE_REQUEST` / `CHOICE_REQUEST` / `RESTART_REQUEST` | any peer | self is controller; session/story match; `expectedRevision === revision` (else snapshot reply) | one engine transition + canonical broadcast |
+| `CONTROL_REQUEST` | any peer | self is controller; session match | M3: explicit `CONTROL_PASSED`; until implemented: reject, do not commit |
+| `STATE_SNAPSHOT` | current controller; **or** any peer iff local state is null **and** `payload.requestActionId` matches our outstanding bootstrap request | same session: `state.revision >= current.revision`; cross-session: controller only | replace replica |
+| `SESSION_STARTED` | with local state: current controller only (story switch). With null state: any peer | `revision === 0`; `state.controllerPeerId === sender` (enforced in validator); collision arbitration below | adopt session |
+| `RESTARTED` | current controller only | same session; `revision === current.revision + 1` | replace replica |
+| `ADVANCED` / `CHOICE_RESOLVED` | current controller only | same session/story; `revision === current.revision + 1`; **engine replay matches** | apply derived state |
+| `SESSION_ENDED` | current controller only | same session | clear replica, return to lobby |
+| `CONTROLLER_CHANGED` | locally computed election winner only | previous controller absent from transport; `revision > current.revision`, or equal revision with lower controller ID than a previously applied announcement (supersession) | set controller |
+| `CONTROL_PASSED` | current controller only | `revision === current.revision + 1` (M3) | set controller |
+| `ELECTION_ADVERTISE` | any remaining peer, targeted | self is the locally computed winner; migration window open | candidate state for `chooseElectionState` |
+| `ERROR` | any peer | never mutates session state | surface targeted error to UI |
+| anything else / future | — | — | **reject; do not commit** |
+
+**Simultaneous-start arbitration:** two valid revision-0 `SESSION_STARTED` envelopes with different sessions and no prior state can race. Deterministic rule for every peer including both starters: keep the session whose `controllerPeerId` is lexicographically smaller; the losing starter discards its own session and adopts the winner. This is the one case where an existing revision-0 self-started session may be replaced by a non-controller sender.
 
 ## `src/services/visualNovel/VisualNovelSyncService.ts`
 
-This service decides whether an envelope is safe to apply. **The `inspect*` methods are pure — they never mutate the seen-set.** Callers invoke `commit(envelope)` only after the action is successfully applied or handled. This prevents a snapshot that fails payload validation (or an event that triggers recovery) from poisoning the duplicate set against a legitimate retransmit.
+`inspect*` methods stay pure (no seen-set mutation); `commit(envelope)` records an action ID only after successful application/handling.
 
 ```ts
 import { visualNovelLimits } from 'config/visualNovel'
@@ -80,12 +124,13 @@ export type CanonicalDecision =
   | { kind: 'recover'; reason: 'missing-state' | 'session-mismatch' | 'revision-gap' }
   | { kind: 'reject'; reason: string }
 
-const snapshotActions = new Set(['STATE_SNAPSHOT', 'SESSION_STARTED', 'RESTARTED'])
-
 export class VisualNovelSyncService {
   private readonly seen = new Map<string, number>()
 
-  inspectCanonical(
+  // Progression events only (ADVANCED / CHOICE_RESOLVED / RESTARTED /
+  // CONTROL_PASSED). Snapshot-class and election actions have their own
+  // authorization paths in the dispatcher.
+  inspectProgression(
     envelope: VisualNovelActionEnvelope,
     state: VisualNovelSessionState | null,
     transportPeerId: string
@@ -96,17 +141,9 @@ export class VisualNovelSyncService {
     if (this.seen.has(envelope.actionId)) {
       return { kind: 'ignore', reason: 'duplicate' }
     }
-
-    // Snapshot-class actions may establish or replace a session — including
-    // one for a *different* story (story switching). Their payload is fully
-    // validated by validateSessionState before application, and applyCanonical
-    // enforces the sender rules for snapshots (see below).
-    if (snapshotActions.has(envelope.actionType)) {
-      return { kind: 'apply' }
-    }
-
-    if (!state) {
-      return { kind: 'recover', reason: 'missing-state' }
+    if (!state) return { kind: 'recover', reason: 'missing-state' }
+    if (transportPeerId !== state.controllerPeerId) {
+      return { kind: 'reject', reason: 'not-controller' }
     }
     if (envelope.storyId !== state.storyId ||
         envelope.storyVersion !== state.storyVersion) {
@@ -136,8 +173,6 @@ export class VisualNovelSyncService {
     if (state.controllerPeerId !== selfPeerId) {
       return { kind: 'reject', reason: 'not-controller' }
     }
-    // STATE_REQUEST is exempt from session matching: a late joiner with no
-    // state sends the reserved bootstrap scope and cannot know real IDs.
     if (envelope.actionType !== 'STATE_REQUEST' &&
         (envelope.storyId !== state.storyId ||
          envelope.storyVersion !== state.storyVersion ||
@@ -150,7 +185,44 @@ export class VisualNovelSyncService {
     return { kind: 'apply' }
   }
 
-  // Record an action ID only after it was successfully applied or handled.
+  // Snapshot-class authorization per the matrix. outstandingRequestId is the
+  // actionId of our unanswered bootstrap/gap STATE_REQUEST, or null.
+  authorizeSnapshot(
+    envelope: VisualNovelActionEnvelope,
+    snapshot: VisualNovelSessionState,
+    current: VisualNovelSessionState | null,
+    transportPeerId: string,
+    outstandingRequestId: string | null
+  ): boolean {
+    if (envelope.actionType === 'STATE_SNAPSHOT') {
+      const solicited = outstandingRequestId !== null &&
+        (envelope.payload as { requestActionId?: string }).requestActionId ===
+          outstandingRequestId
+      if (!current) return solicited
+      const fromController = transportPeerId === current.controllerPeerId
+      if (snapshot.sessionId === current.sessionId) {
+        return (fromController || solicited) &&
+          snapshot.revision >= current.revision
+      }
+      return fromController // cross-session replacement: controller only
+    }
+    if (envelope.actionType === 'RESTARTED') {
+      return current !== null &&
+        transportPeerId === current.controllerPeerId &&
+        snapshot.sessionId === current.sessionId &&
+        snapshot.revision === current.revision + 1
+    }
+    if (envelope.actionType === 'SESSION_STARTED') {
+      // Validator already enforced revision 0 and controller === sender.
+      if (!current) return true
+      if (transportPeerId === current.controllerPeerId) return true // switch
+      // Simultaneous-start arbitration: both sides at revision 0.
+      return current.revision === 0 &&
+        snapshot.controllerPeerId < current.controllerPeerId
+    }
+    return false
+  }
+
   commit(envelope: VisualNovelActionEnvelope) {
     this.seen.set(envelope.actionId, envelope.timestamp)
     while (this.seen.size > visualNovelLimits.maxSeenActionIds) {
@@ -174,439 +246,147 @@ export class VisualNovelSyncService {
     return candidates[0]
   }
 
-  // Migration acceptance: replicas accept CONTROLLER_CHANGED from the NEW
-  // controller when the sender matches the announced controller, the old
-  // controller is gone from the transport, and the revision is exactly next.
-  isAcceptableControllerChange(
+  // CONTROLLER_CHANGED acceptance: only the locally computed winner, with the
+  // old controller gone. Supersession (not stale-rejection) resolves races:
+  // a better announcement replaces an already-applied one.
+  authorizeControllerChange(
     envelope: VisualNovelActionEnvelope,
     state: VisualNovelSessionState,
     transportPeerId: string,
-    connectedTransportPeerIds: string[]
+    selfPeerId: string,
+    connectedTransportPeerIds: string[],
+    lastAppliedChange: { revision: number; controllerPeerId: string } | null
   ): boolean {
     const announced = (envelope.payload as { controllerPeerId?: unknown })
       .controllerPeerId
-    return (
-      envelope.actionType === 'CONTROLLER_CHANGED' &&
-      typeof announced === 'string' &&
-      announced === envelope.senderPeerId &&
-      envelope.senderPeerId === transportPeerId &&
-      !connectedTransportPeerIds.includes(state.controllerPeerId) &&
-      envelope.revision === state.revision + 1
-    )
+    if (typeof announced !== 'string') return false
+    if (announced !== envelope.senderPeerId ||
+        envelope.senderPeerId !== transportPeerId) return false
+    if (connectedTransportPeerIds.includes(state.controllerPeerId)) return false
+    const expectedWinner = this.electController([
+      selfPeerId,
+      ...connectedTransportPeerIds,
+    ])
+    if (announced !== expectedWinner) return false
+    if (lastAppliedChange) {
+      // Supersession ordering: higher revision wins; equal revision → lower
+      // peer ID wins.
+      return envelope.revision > lastAppliedChange.revision ||
+        (envelope.revision === lastAppliedChange.revision &&
+          announced < lastAppliedChange.controllerPeerId)
+    }
+    return envelope.revision > state.revision
   }
 }
 ```
-
-Competing `CONTROLLER_CHANGED` announcements resolve by highest revision, then lowest peer ID (`chooseElectionState` ordering).
 
 ## Envelope factory
 
-Create `src/services/visualNovel/createVisualNovelEnvelope.ts`. It takes an explicit **scope** (not a full state) so bootstrap requests are possible with null local state:
+Unchanged from Revision 2 — takes an explicit `VisualNovelScope` (a session state satisfies it structurally; bootstrap callers pass `visualNovelBootstrapScope`). See `createVisualNovelEnvelope.ts` in the file tree.
+
+## `src/hooks/useVisualNovelSync.ts` — structure and rules
+
+The Revision 2 skeleton grew past the point where inline code is clearer than rules. Implement the hook as **two exhaustive `switch` dispatchers** plus lifecycle effects, against `VisualNovelTransport`:
 
 ```ts
-import { visualNovelProtocolVersion } from 'config/visualNovel'
-import type {
-  EnvelopeFor,
-  VisualNovelActionType,
-  VisualNovelPayloadByAction,
-  VisualNovelScope,
-} from 'models/visualNovel'
-
-export interface EnvelopeDependencies {
-  actionId: () => string
-  now: () => number
-}
-
-export const createVisualNovelEnvelope = <T extends VisualNovelActionType>(
-  actionType: T,
-  payload: VisualNovelPayloadByAction[T],
-  scope: VisualNovelScope,
-  senderPeerId: string,
-  revision: number,
-  dependencies: EnvelopeDependencies
-): EnvelopeFor<T> => ({
-  protocol: 'visual-novel',
-  protocolVersion: visualNovelProtocolVersion,
-  actionId: dependencies.actionId(),
-  actionType,
-  sessionId: scope.sessionId,
-  storyId: scope.storyId,
-  storyVersion: scope.storyVersion,
-  senderPeerId,
-  revision,
-  timestamp: dependencies.now(),
-  payload,
-})
-```
-
-A session state satisfies `VisualNovelScope` structurally, so existing call sites can pass `state` directly; bootstrap callers pass `visualNovelBootstrapScope`.
-
-## `src/hooks/useVisualNovelSync.ts`
-
-This full skeleton shows transport binding, bootstrap and targeted requests, canonical broadcasts, late join, recovery, and migration. Factor handlers further as tests grow.
-
-```ts
-import { useCallback, useEffect, useMemo, useRef } from 'react'
-import { v4 as uuid } from 'uuid'
-import type { MessageContext } from 'trystero'
-
-import { usePeerAction } from 'hooks/usePeerAction'
-import { ActionNamespace, PeerHookType, PeerRoom } from 'lib/PeerRoom'
-import { PeerAction } from 'models/network'
-import { visualNovelBootstrapScope } from 'config/visualNovel'
-import type {
-  VisualNovelActionEnvelope,
-  VisualNovelManifest,
-  VisualNovelSessionState,
-} from 'models/visualNovel'
-import {
-  VisualNovelEngine,
-  VisualNovelSyncService,
-  toSnapshotState,
-  validateEnvelope,
-  validateSessionState,
-  createVisualNovelEnvelope,
-} from 'services/visualNovel'
-
 interface Options {
-  peerRoom: PeerRoom
-  selfPeerId: string // peerRoom.getSelfId()
+  transport: VisualNovelTransport
   story: VisualNovelManifest | null
   state: VisualNovelSessionState | null
-  setState: (state: VisualNovelSessionState) => void
+  setState: (state: VisualNovelSessionState | null) => void
   onProtocolError: (message: string) => void
 }
+// Returned API:
+// { startSession, endSession, requestAdvance, requestChoice, requestRestart }
+```
 
-const namespace = `${ActionNamespace.GROUP}vn`
-const dependencies = { actionId: uuid, now: Date.now }
+### Receive path
 
-export const useVisualNovelSync = ({
-  peerRoom,
-  selfPeerId,
-  story,
-  state,
-  setState,
-  onProtocolError,
-}: Options) => {
-  const stateRef = useRef(state)
-  stateRef.current = state
-  const storyRef = useRef(story)
-  storyRef.current = story
-  const sync = useMemo(() => new VisualNovelSyncService(), [])
+```ts
+const onReceive = async (input: unknown, context: MessageContext) => {
+  const validated = validateEnvelope(input)
+  if (!validated.ok) return warn(validated.errors)
+  const envelope = validated.value
+  if (envelope.senderPeerId !== context.peerId) return
 
-  // Serialize controller-side request handling so two concurrent requests
-  // cannot both apply against the same revision.
-  const requestQueueRef = useRef<Promise<void>>(Promise.resolve())
-  const enqueue = (work: () => Promise<void>) => {
-    requestQueueRef.current = requestQueueRef.current.then(work, work)
-    return requestQueueRef.current
+  switch (envelope.actionType) {
+    case 'STATE_REQUEST':
+    case 'ADVANCE_REQUEST':
+    case 'CHOICE_REQUEST':
+    case 'RESTART_REQUEST':
+      return enqueue(() => handleRequest(envelope, context)) // controller only
+    case 'STATE_SNAPSHOT':
+    case 'SESSION_STARTED':
+    case 'RESTARTED':
+      return applySnapshotClass(envelope, context)
+    case 'ADVANCED':
+    case 'CHOICE_RESOLVED':
+      return applyProgression(envelope, context)
+    case 'CONTROLLER_CHANGED':
+      return applyControllerChange(envelope, context)
+    case 'SESSION_ENDED':
+      return applySessionEnded(envelope, context)
+    case 'ELECTION_ADVERTISE':
+      return collectElectionAdvertisement(envelope, context)
+    case 'ERROR':
+      return surfaceError(envelope) // never mutates state, never committed
+    case 'CONTROL_REQUEST':
+    case 'CONTROL_PASSED':
+      return rejectUnimplemented(envelope) // M3; reject, do NOT commit
   }
-
-  const engine = useMemo(
-    () => story ? new VisualNovelEngine(story, { now: Date.now }) : null,
-    [story]
-  )
-  const engineRef = useRef(engine)
-  engineRef.current = engine
-
-  const sendRef = useRef<((
-    envelope: VisualNovelActionEnvelope,
-    options?: { target?: string | string[] }
-  ) => Promise<unknown>) | null>(null)
-
-  const sendSnapshot = useCallback(async (
-    current: VisualNovelSessionState,
-    target: string
-  ) => {
-    const snapshot = toSnapshotState(current)
-    const envelope = createVisualNovelEnvelope(
-      'STATE_SNAPSHOT',
-      { state: snapshot },
-      current,
-      selfPeerId,
-      current.revision,
-      dependencies
-    )
-    await sendRef.current?.(envelope, { target })
-  }, [selfPeerId])
-
-  // Works with null local state via the bootstrap scope. Without a known
-  // controller it broadcasts; the (sole) controller answers, others ignore
-  // it via inspectRequest's not-controller rejection.
-  const requestSnapshot = useCallback(async (
-    current: VisualNovelSessionState | null,
-    target?: string
-  ) => {
-    const envelope = createVisualNovelEnvelope(
-      'STATE_REQUEST',
-      { knownRevision: current?.revision ?? 0 },
-      current ?? visualNovelBootstrapScope,
-      selfPeerId,
-      current?.revision ?? 0,
-      dependencies
-    )
-    await sendRef.current?.(envelope, target ? { target } : undefined)
-  }, [selfPeerId])
-
-  const broadcastCanonical = useCallback(async (
-    actionType: 'ADVANCED' | 'CHOICE_RESOLVED' | 'RESTARTED' |
-      'CONTROLLER_CHANGED' | 'SESSION_STARTED',
-    payload: Record<string, unknown>,
-    next: VisualNovelSessionState
-  ) => {
-    const envelope = createVisualNovelEnvelope(
-      actionType,
-      payload as never,
-      next,
-      selfPeerId,
-      next.revision,
-      dependencies
-    )
-    setState(next)
-    await sendRef.current?.(envelope)
-  }, [selfPeerId, setState])
-
-  const startSession = useCallback(async (initial: VisualNovelSessionState) => {
-    await broadcastCanonical('SESSION_STARTED',
-      { state: toSnapshotState(initial) }, initial)
-  }, [broadcastCanonical])
-
-  const handleRequest = useCallback((
-    envelope: VisualNovelActionEnvelope,
-    context: MessageContext
-  ) => enqueue(async () => {
-    const current = stateRef.current
-    const currentEngine = engineRef.current
-    if (!current || !currentEngine) return
-    const decision = sync.inspectRequest(envelope, current, context.peerId, selfPeerId)
-    if (decision.kind !== 'apply') return
-
-    try {
-      if (envelope.actionType === 'STATE_REQUEST') {
-        await sendSnapshot(current, context.peerId)
-      } else if (envelope.actionType === 'ADVANCE_REQUEST') {
-        if ((envelope.payload as { expectedRevision: number }).expectedRevision !== current.revision) {
-          await sendSnapshot(current, context.peerId)
-          return
-        }
-        const next = currentEngine.advance(current)
-        await broadcastCanonical('ADVANCED', {
-          sceneId: next.sceneId,
-          dialogueEntryId: next.dialogueEntryId,
-        }, next)
-      } else if (envelope.actionType === 'CHOICE_REQUEST') {
-        const payload = envelope.payload as { choiceId: string; expectedRevision: number }
-        if (payload.expectedRevision !== current.revision) {
-          await sendSnapshot(current, context.peerId)
-          return
-        }
-        const next = currentEngine.choose(current, payload.choiceId)
-        await broadcastCanonical('CHOICE_RESOLVED', {
-          choiceId: payload.choiceId,
-          sceneId: next.sceneId,
-          dialogueEntryId: next.dialogueEntryId,
-          variables: next.variables,
-        }, next)
-      } else if (envelope.actionType === 'RESTART_REQUEST') {
-        // Same stale-request guard as advance/choice: a restart computed
-        // against an old revision must not wipe newer progress.
-        if ((envelope.payload as { expectedRevision: number }).expectedRevision !== current.revision) {
-          await sendSnapshot(current, context.peerId)
-          return
-        }
-        const next = currentEngine.restart(current)
-        await broadcastCanonical('RESTARTED', { state: toSnapshotState(next) }, next)
-      }
-      sync.commit(envelope) // only after successful handling
-    } catch (error) {
-      onProtocolError(error instanceof Error ? error.message : 'Transition failed')
-    }
-  }), [broadcastCanonical, onProtocolError, selfPeerId, sendSnapshot, sync])
-
-  const applyCanonical = useCallback(async (
-    envelope: VisualNovelActionEnvelope,
-    context: MessageContext
-  ) => {
-    const current = stateRef.current
-    const decision = sync.inspectCanonical(envelope, current, context.peerId)
-    if (decision.kind === 'ignore' || decision.kind === 'reject') return
-    if (decision.kind === 'recover') {
-      await requestSnapshot(current, current?.controllerPeerId)
-      return
-    }
-
-    if (['STATE_SNAPSHOT', 'SESSION_STARTED', 'RESTARTED'].includes(envelope.actionType)) {
-      const candidate = (envelope.payload as { state: unknown }).state
-      const validated = validateSessionState(candidate)
-      if (!validated.ok) return // NOT committed — a valid retransmit may follow
-
-      const next = validated.value
-      const sameSession = current && next.sessionId === current.sessionId
-      // Same session: accept only monotonically newer snapshots. Different
-      // session (story switch / fresh start): accept only from the current
-      // controller — or from anyone if we have no state at all.
-      const acceptable = !current ||
-        (sameSession
-          ? next.revision >= current.revision
-          : context.peerId === current.controllerPeerId)
-      if (!acceptable) return
-      setState(next)
-      sync.commit(envelope)
-      return
-    }
-
-    if (!current) return
-
-    if (envelope.actionType === 'CONTROLLER_CHANGED') {
-      const connected = peerRoom.getPeers()
-      if (!sync.isAcceptableControllerChange(envelope, current, context.peerId, connected)) {
-        return
-      }
-      setState({
-        ...current,
-        controllerPeerId: envelope.senderPeerId,
-        revision: envelope.revision,
-        updatedAt: envelope.timestamp,
-      })
-      sync.commit(envelope)
-      return
-    }
-
-    // ADVANCED / CHOICE_RESOLVED: only the current controller may progress
-    // the story.
-    if (context.peerId !== current.controllerPeerId) return
-    const payload = envelope.payload as Record<string, unknown>
-    const next: VisualNovelSessionState = {
-      ...current,
-      sceneId: String(payload.sceneId ?? current.sceneId),
-      dialogueEntryId: String(payload.dialogueEntryId ?? current.dialogueEntryId),
-      variables: (payload.variables as VisualNovelSessionState['variables']) ?? current.variables,
-      revision: envelope.revision,
-      updatedAt: envelope.timestamp,
-    }
-    setState(next)
-    sync.commit(envelope)
-  }, [peerRoom, requestSnapshot, setState, sync])
-
-  const onReceive = useCallback(async (input: unknown, context: MessageContext) => {
-    const validated = validateEnvelope(input)
-    if (!validated.ok) {
-      console.warn('Rejected visual-novel envelope', validated.errors)
-      return
-    }
-    const envelope = validated.value
-    if (envelope.senderPeerId !== context.peerId) return
-    if (envelope.actionType.endsWith('_REQUEST')) {
-      await handleRequest(envelope, context)
-    } else {
-      await applyCanonical(envelope, context)
-    }
-  }, [applyCanonical, handleRequest])
-
-  const [sendEnvelope] = usePeerAction<VisualNovelActionEnvelope>({
-    namespace,
-    peerAction: PeerAction.VISUAL_NOVEL,
-    peerRoom,
-    onReceive,
-  })
-  sendRef.current = sendEnvelope
-
-  const requestAdvance = useCallback(async () => {
-    const current = stateRef.current
-    if (!current) return
-    if (current.controllerPeerId === selfPeerId) {
-      const next = engineRef.current?.advance(current)
-      if (next) await broadcastCanonical('ADVANCED', {
-        sceneId: next.sceneId,
-        dialogueEntryId: next.dialogueEntryId,
-      }, next)
-      return
-    }
-    const envelope = createVisualNovelEnvelope('ADVANCE_REQUEST',
-      { expectedRevision: current.revision }, current, selfPeerId,
-      current.revision, dependencies)
-    await sendEnvelope(envelope, { target: current.controllerPeerId })
-  }, [broadcastCanonical, selfPeerId, sendEnvelope])
-
-  const requestChoice = useCallback(async (choiceId: string) => {
-    const current = stateRef.current
-    if (!current) return
-    if (current.controllerPeerId === selfPeerId) {
-      const next = engineRef.current?.choose(current, choiceId)
-      if (next) await broadcastCanonical('CHOICE_RESOLVED', {
-        choiceId,
-        sceneId: next.sceneId,
-        dialogueEntryId: next.dialogueEntryId,
-        variables: next.variables,
-      }, next)
-      return
-    }
-    const envelope = createVisualNovelEnvelope('CHOICE_REQUEST',
-      { choiceId, expectedRevision: current.revision }, current, selfPeerId,
-      current.revision, dependencies)
-    await sendEnvelope(envelope, { target: current.controllerPeerId })
-  }, [broadcastCanonical, selfPeerId, sendEnvelope])
-
-  const requestRestart = useCallback(async () => {
-    const current = stateRef.current
-    if (!current) return
-    if (current.controllerPeerId === selfPeerId) {
-      const next = engineRef.current?.restart(current)
-      if (next) await broadcastCanonical('RESTARTED',
-        { state: toSnapshotState(next) }, next)
-      return
-    }
-    const envelope = createVisualNovelEnvelope('RESTART_REQUEST',
-      { expectedRevision: current.revision }, current, selfPeerId,
-      current.revision, dependencies)
-    await sendEnvelope(envelope, { target: current.controllerPeerId })
-  }, [broadcastCanonical, selfPeerId, sendEnvelope])
-
-  useEffect(() => {
-    peerRoom.onPeerJoin(PeerHookType.VISUAL_NOVEL, peerId => {
-      const current = stateRef.current
-      if (!current) return
-      if (current.controllerPeerId === selfPeerId) void sendSnapshot(current, peerId)
-    })
-
-    peerRoom.onPeerLeave(PeerHookType.VISUAL_NOVEL, peerId => {
-      const current = stateRef.current
-      if (!current || peerId !== current.controllerPeerId) return
-      // Transport truth, not React state: peerRoom.getPeers() already
-      // excludes the departed peer, and selfId is not in getPeers().
-      const nextController = sync.electController([
-        selfPeerId,
-        ...peerRoom.getPeers().filter(id => id !== peerId),
-      ])
-      if (nextController === selfPeerId) {
-        const next = engineRef.current?.changeController(current, nextController)
-        if (next) void broadcastCanonical('CONTROLLER_CHANGED',
-          { controllerPeerId: nextController }, next)
-      }
-    })
-
-    return () => {
-      peerRoom.removePeerJoinHandler(PeerHookType.VISUAL_NOVEL)
-      peerRoom.removePeerLeaveHandler(PeerHookType.VISUAL_NOVEL)
-    }
-  }, [broadcastCanonical, peerRoom, selfPeerId, sendSnapshot, sync])
-
-  // Late join with no state: ask the room for the current session once the
-  // action is bound. Harmless if no story is running (no controller answers).
-  useEffect(() => {
-    if (stateRef.current) return
-    void requestSnapshot(null)
-  }, [requestSnapshot])
-
-  return { requestAdvance, requestChoice, requestRestart, startSession }
+  // No default: the switch is exhaustive over VisualNovelActionType, so a
+  // new action type fails check:types until a handler and matrix row exist.
 }
 ```
 
-## Required refinements before merge
+Handler rules (each ends with `sync.commit(envelope)` **only** on success):
 
-- Make canonical event application derive/validate the exact next state with the engine (replay `ADVANCED`/`CHOICE_RESOLVED` through `engine.advance`/`engine.choose` and compare) rather than trusting cast payload fields; the skeleton above still trusts the controller for scene/dialogue/variables.
-- Implement `CONTROL_REQUEST`, explicit `CONTROL_PASSED`, restart confirmation UI (04), and targeted `ERROR` responses.
-- During election, exchange revision advertisements/snapshots before finalizing when peers may hold different revisions; `chooseElectionState` picks the winner.
+- `handleRequest` — serialized through a promise queue; `inspectRequest`; `expectedRevision` checked for advance/choice/restart (stale → targeted snapshot reply); `STATE_REQUEST` replies with a snapshot echoing `requestActionId: envelope.actionId`.
+- `applySnapshotClass` — `validateSessionState` (deep, normalizing); `sync.authorizeSnapshot(envelope, snapshot, current, context.peerId, outstandingRequestId)`; on success `setState(snapshot)`, clear `outstandingRequestId`.
+- `applyProgression` — `inspectProgression`; then **engine replay**: derive `next` via `engine.advance(current)` or `engine.choose(current, payload.choiceId)` and require `next.sceneId === payload.sceneId && next.dialogueEntryId === payload.dialogueEntryId` (and variables deep-equal for `CHOICE_RESOLVED`); apply the **derived** state (with `revision`/`updatedAt` from the envelope); replay mismatch → recovery, not application.
+- `applyControllerChange` — `sync.authorizeControllerChange(...)` with `transport.getPeers()`; on success set controller, record `lastAppliedChange` for supersession.
+- `applySessionEnded` — current controller only, same session; `setState(null)`, return to lobby.
+- `collectElectionAdvertisement` — only while self is the computed winner during an open election window; buffer validated states for `chooseElectionState`.
+- `rejectUnimplemented` — log, optionally reply with targeted `ERROR('UNSUPPORTED_ACTION')`; **never** commit.
+
+### Recovery targeting
+
+```ts
+const recoveryTarget = (current: VisualNovelSessionState | null,
+  envelope: VisualNovelActionEnvelope): string => {
+  if (!current) return envelope.senderPeerId
+  return transport.getPeers().includes(current.controllerPeerId)
+    ? current.controllerPeerId
+    : envelope.senderPeerId // controller departed (e.g. migration in flight)
+}
+```
+
+Every `recover` decision sends `STATE_REQUEST` to `recoveryTarget(...)` and records the request's `actionId` as `outstandingRequestId` so the snapshot reply is accepted as solicited.
+
+### Send path (controller)
+
+`broadcastCanonical(actionType, payload, next)`:
+
+1. Apply `next` locally (the controller is the authority — its state may not regress).
+2. `await send(envelope)`; on rejection retry `canonicalSendRetries` times.
+3. If still failing, broadcast a full `STATE_SNAPSHOT` of current state (retried on the next canonical event if that also fails) and surface a sync warning to the UI. Canonical state is never silently ahead of the room without a pending repair.
+
+### Session lifecycle
+
+- `startSession(initial)` — allowed only when local state is null; broadcasts `SESSION_STARTED` (revision 0). Collisions arbitrate per the matrix.
+- Story switch — allowed only when self is the current controller; broadcasts a new `SESSION_STARTED`.
+- `endSession()` — controller only; broadcasts `SESSION_ENDED`, then clears local state.
+- Controller pressing "leave story" while participants remain must choose: pass control (M3 `CONTROL_PASSED`) or end the session. A participant's leave is purely local (clear replica, stop rendering); no envelope is sent.
+
+### Peer lifecycle effects
+
+- `onPeerJoin(VISUAL_NOVEL)`: controller pushes a snapshot to the joiner (echoing no request — the joiner also sends a bootstrap `STATE_REQUEST`; whichever validated, authorized path lands first wins; the other is stale/duplicate).
+- `onPeerLeave(VISUAL_NOVEL)`: if the departed peer is the current controller, open an election window (`electionWindowMs`):
+  - compute `winner = electController([selfId, ...transport.getPeers()])`;
+  - if self is **not** the winner: send targeted `ELECTION_ADVERTISE { state: toSnapshotState(current) }` to the winner;
+  - if self **is** the winner: collect advertisements until the window closes, adopt `chooseElectionState([own, ...advertised])`, apply `engine.changeController(adopted, selfId)`, broadcast `CONTROLLER_CHANGED` at `adopted.revision + 1`, then push snapshots to any peer that advertised a lower revision.
+- Cleanup uses `removePeerJoinHandler`/`removePeerLeaveHandler` with `PeerHookType.VISUAL_NOVEL` — never `flush()`.
+- On mount with null state: send one bootstrap `STATE_REQUEST` (broadcast; only the controller handles it) and record `outstandingRequestId`.
 
 ## Protocol flows
 
@@ -614,44 +394,48 @@ export const useVisualNovelSync = ({
 
 ```text
 participant → controller: CHOICE_REQUEST(expectedRevision, choiceId)
-controller: validate identity/session/revision/choice; engine.choose (serialized queue)
-controller → all: CHOICE_RESOLVED(revision + 1, canonical delta)
-all peers: validate controller and exact next revision; apply; commit actionId
+controller: authorize; engine.choose (serialized queue)
+controller: apply locally → all: CHOICE_RESOLVED(revision + 1, delta)
+replicas: authorize controller + exact revision; ENGINE REPLAY; apply derived
+          state; commit actionId
 ```
 
 ### Late join (bootstrap)
 
 ```text
-new peer (state = null) → all: STATE_REQUEST(bootstrap scope, knownRevision 0)
-controller (only peer that passes inspectRequest) → new peer: STATE_SNAPSHOT(truncated state)
-new peer: validate full snapshot; apply; commit
-(controller additionally pushes a snapshot on onPeerJoin — both paths converge)
+new peer (state = null) → all: STATE_REQUEST(bootstrap scope), remembers actionId
+controller → new peer: STATE_SNAPSHOT(truncated state, requestActionId = that actionId)
+new peer: deep-validate; authorize (solicited response); apply; commit
+(controller additionally pushes on onPeerJoin — both paths converge)
 ```
 
-### Session start with peers already present
+### Simultaneous starts
 
 ```text
-controller: engine.start → local state revision 0
-controller → all: SESSION_STARTED(truncated state)
-peers with null state: validate; apply; commit
+A and B both start from null state → both broadcast SESSION_STARTED (rev 0)
+every peer: keep session with lexicographically smaller controllerPeerId
+loser (say B): discards own session, adopts A's; its stray SESSION_STARTED is
+  rejected everywhere by the same rule
 ```
 
 ### Revision gap
 
 ```text
-replica has n; receives n + 2
-replica ignores event (actionId NOT committed)
-replica → controller: STATE_REQUEST(n)
-controller → replica: STATE_SNAPSHOT(current)
+replica has n; receives n + 2 (actionId NOT committed)
+replica → recoveryTarget: STATE_REQUEST(n), remembers actionId
+target → replica: STATE_SNAPSHOT(current, requestActionId echoed)
 ```
 
-### Controller disconnect
+### Controller disconnect (election handshake)
 
 ```text
-all remaining peers detect the same leave
-each computes smallest peer ID from transport truth (getPeers() + selfId)
-winner broadcasts CONTROLLER_CHANGED(revision + 1)
-replicas accept because: sender == announced controller, old controller
-  absent from transport, revision exactly next
-competing announcements resolve by revision, then peer ID
+all remaining peers detect the same transport leave
+each computes winner W = electController([selfId, ...getPeers()])
+non-winners → W: ELECTION_ADVERTISE(own truncated state)
+W: waits electionWindowMs; adopts chooseElectionState([own, ...advertised])
+W → all: CONTROLLER_CHANGED(adopted.revision + 1)
+replicas: accept only from their computed winner; supersession by
+  (higher revision, then lower peer ID) resolves races; gap recovery targets
+  the announcer, not the departed controller
+W: pushes snapshots to peers that advertised lower revisions
 ```

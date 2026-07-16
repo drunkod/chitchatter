@@ -1,6 +1,6 @@
 # 02 — Pure engine and bundled example story
 
-> **Revision 2 changes:** explicit dead-end semantics — an entry that *declares* choices but has none available (all condition-gated off) is now a `CHOICE_DEAD_END` error instead of silently falling through to the next entry and erasing a designed branch. `restart` and snapshot emission use `toSnapshotState` history truncation at the sync layer (engine keeps full in-memory history).
+> **Revision 3 changes:** the engine is unchanged from Revision 2 except for its expanded role: replicas now use it to **replay** canonical `ADVANCED`/`CHOICE_RESOLVED` deltas and compare the result before applying (see 03), so determinism and immutability are load-bearing protocol properties, not just hygiene. Dead-end semantics from Revision 2 stand: an entry that *declares* choices but has none available is a `CHOICE_DEAD_END` error, never a silent skip. Snapshot emission uses `toSnapshotState` truncation at the sync layer (the engine keeps full in-memory history).
 
 The engine owns legal story transitions. It receives a validated manifest, explicit dependencies, and an immutable session. It never imports React, storage, WebRTC, DOM APIs, or global time/randomness.
 

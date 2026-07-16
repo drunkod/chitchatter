@@ -1,6 +1,6 @@
 # 04 — React state, UI components, and room integration
 
-> **Revision 2 changes:** `startStory` now actually broadcasts `SESSION_STARTED` via `sync.startSession`; `restart` is implemented (with confirmation left to the dialog component); `pendingAction` has a timeout so a dropped request cannot permanently disable the UI; `selfPeerId` comes from `peerRoom.getSelfId()` (verified: `useRoom` returns `peerRoom`, and `Peer.peerId` in the shell peer list is the transport ID).
+> **Revision 3 changes:** the provider mounts **only in the group room** (`!isDirectMessageRoom`) — the previous unconditional wrap put a novella receiver, replica, bootstrap request, and `PeerHookType.VISUAL_NOVEL` registration inside every `keepMounted` DM dialog, and `PeerRoom` keeps only one handler per hook type, so providers overwrote and deleted each other's handlers. Session lifecycle is authoritative: `startStory` is guarded (null state or controller-only switch), `leaveStory` distinguishes controller from participant, and `endStory` exists. The integration layout retains `RoomVideoDisplay`. The provider takes a `VisualNovelTransport`.
 
 React owns rendering and user intent. It does not decide whether a remote transition is valid; that belongs to validators, the engine, and the sync service.
 
@@ -35,13 +35,15 @@ export interface VisualNovelContextValue {
   error: string | null
   isController: boolean
   pendingAction: boolean
+  canStartStory: boolean // null state, or self is controller (story switch)
   startStory: (storyId: string) => Promise<void>
   advance: () => Promise<void>
   choose: (choiceId: string) => Promise<void>
   restart: () => Promise<void>
+  endStory: () => Promise<void> // controller only
   requestControl: () => Promise<void>
   passControl: (peerId: string) => Promise<void>
-  leaveStory: () => void
+  leaveStory: () => void // participant-local; controller must pass/end first
 }
 
 export const VisualNovelContext = createContext<VisualNovelContextValue | null>(null)
@@ -55,25 +57,23 @@ export const useVisualNovelContext = () => {
 
 ## `src/hooks/useVisualNovel.ts`
 
-This composition hook is the only stateful API the provider needs. `CONTROL_REQUEST`/`CONTROL_PASSED` wiring follows the same request pattern (M3/M4).
-
 ```ts
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { v4 as uuid } from 'uuid'
 
 import { visualNovelLimits } from 'config/visualNovel'
-import type { PeerRoom } from 'lib/PeerRoom'
+import type { VisualNovelTransport } from 'services/visualNovel/VisualNovelTransport'
 import type { VisualNovelSessionState } from 'models/visualNovel'
 import { VisualNovelEngine } from 'services/visualNovel'
 import { bundledStories, getBundledStory } from 'stories/catalog'
 import { useVisualNovelSync } from './useVisualNovelSync'
 
 interface Options {
-  peerRoom: PeerRoom
-  selfPeerId: string
+  transport: VisualNovelTransport
 }
 
-export const useVisualNovel = (options: Options) => {
+export const useVisualNovel = ({ transport }: Options) => {
+  const selfPeerId = transport.getSelfId()
   const [state, setState] = useState<VisualNovelSessionState | null>(null)
   const [status, setStatus] = useState<'lobby' | 'loading' | 'syncing' |
     'ready' | 'waiting' | 'error'>('lobby')
@@ -95,12 +95,12 @@ export const useVisualNovel = (options: Options) => {
     : null, [story])
 
   const sync = useVisualNovelSync({
-    ...options,
+    transport,
     story,
     state,
     setState: next => {
       setState(next)
-      setStatus('ready')
+      setStatus(next ? 'ready' : 'lobby') // SESSION_ENDED returns to lobby
       clearPending() // any canonical update resolves the pending request
     },
     onProtocolError: message => {
@@ -110,26 +110,34 @@ export const useVisualNovel = (options: Options) => {
     },
   })
 
+  const isController = state?.controllerPeerId === selfPeerId
+  // Lifecycle rule: start from null state, or switch as the controller.
+  const canStartStory = state === null || isController
+
   const startStory = useCallback(async (storyId: string) => {
+    if (!canStartStory) {
+      setError('Only the story controller can switch stories')
+      return
+    }
     const selected = getBundledStory(storyId)
     if (!selected) throw new Error('Story is unavailable')
     setStatus('loading')
     setError(null)
     try {
       const next = new VisualNovelEngine(selected, { now: Date.now })
-        .start(uuid(), options.selfPeerId)
-      // Broadcasts SESSION_STARTED and sets local state — peers already in
-      // the room bootstrap from this envelope.
+        .start(uuid(), selfPeerId)
+      // Broadcasts SESSION_STARTED (revision 0). Simultaneous starts from two
+      // peers arbitrate deterministically in the sync layer (03) — this call
+      // may be superseded and state may adopt the other session.
       await sync.startSession(next)
       setStatus('ready')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Unable to start story')
       setStatus('error')
     }
-  }, [options.selfPeerId, sync])
+  }, [canStartStory, selfPeerId, sync])
 
-  // A request that never receives a canonical response (controller left,
-  // request silently dropped as duplicate/mismatch) must not wedge the UI.
+  // A request that never receives a canonical response must not wedge the UI.
   const runPending = useCallback(async (work: () => Promise<void>) => {
     if (pendingAction) return
     setPendingAction(true)
@@ -161,14 +169,23 @@ export const useVisualNovel = (options: Options) => {
     status,
     error,
     pendingAction,
-    isController: state?.controllerPeerId === options.selfPeerId,
+    isController,
+    canStartStory,
     startStory,
     advance: () => runPending(sync.requestAdvance),
     choose: (choiceId: string) => runPending(() => sync.requestChoice(choiceId)),
     restart: () => runPending(sync.requestRestart), // confirm in dialog first
-    requestControl: async () => {}, // M3: CONTROL_REQUEST via same pattern
+    endStory: async () => {
+      if (!isController) return
+      await sync.endSession() // broadcasts SESSION_ENDED, clears state
+    },
+    requestControl: async () => {}, // M3: CONTROL_REQUEST
     passControl: async (_peerId: string) => {}, // M3: CONTROL_PASSED
     leaveStory: () => {
+      // Participant-local only. The UI must not offer this to the controller
+      // while participants remain — the controller passes control or ends the
+      // session instead (no transport leave occurs, so no election would run).
+      if (isController) return
       setState(null)
       setStatus('lobby')
       setError(null)
@@ -185,16 +202,15 @@ Create `src/components/VisualNovel/VisualNovelProvider.tsx`:
 ```tsx
 import type { PropsWithChildren } from 'react'
 import { VisualNovelContext } from 'contexts/VisualNovelContext'
-import type { PeerRoom } from 'lib/PeerRoom'
+import type { VisualNovelTransport } from 'services/visualNovel/VisualNovelTransport'
 import { useVisualNovel } from 'hooks/useVisualNovel'
 
 interface Props extends PropsWithChildren {
-  peerRoom: PeerRoom
-  selfPeerId: string
+  transport: VisualNovelTransport
 }
 
-export const VisualNovelProvider = ({ children, ...options }: Props) => {
-  const value = useVisualNovel(options)
+export const VisualNovelProvider = ({ children, transport }: Props) => {
+  const value = useVisualNovel({ transport })
   return (
     <VisualNovelContext.Provider value={value}>
       {children}
@@ -217,7 +233,8 @@ import Typography from '@mui/material/Typography'
 import { useVisualNovelContext } from 'contexts/VisualNovelContext'
 
 export const VisualNovelLobby = () => {
-  const { stories, startStory, pendingAction } = useVisualNovelContext()
+  const { stories, startStory, pendingAction, canStartStory } =
+    useVisualNovelContext()
   return (
     <Box aria-labelledby="novella-lobby-title" sx={{ overflow: 'auto', p: 2 }}>
       <Typography id="novella-lobby-title" variant="h5">Choose a story</Typography>
@@ -229,7 +246,10 @@ export const VisualNovelLobby = () => {
               {story.description && <Typography>{story.description}</Typography>}
             </CardContent>
             <CardActions>
-              <Button disabled={pendingAction} onClick={() => void startStory(story.id)}>
+              <Button
+                disabled={pendingAction || !canStartStory}
+                onClick={() => void startStory(story.id)}
+              >
                 Start {story.title}
               </Button>
             </CardActions>
@@ -243,93 +263,7 @@ export const VisualNovelLobby = () => {
 
 ## Stage, dialogue, and choices
 
-`src/components/VisualNovel/DialogueBox.tsx`:
-
-```tsx
-import Paper from '@mui/material/Paper'
-import Typography from '@mui/material/Typography'
-import { useVisualNovelContext } from 'contexts/VisualNovelContext'
-
-export const DialogueBox = () => {
-  const { entry } = useVisualNovelContext()
-  if (!entry) return null
-  return (
-    <Paper aria-live="polite" sx={{ bgcolor: 'rgba(0,0,0,.82)', color: 'white', p: 2 }}>
-      {entry.speaker && <Typography fontWeight="bold">{entry.speaker}</Typography>}
-      <Typography component="p">{entry.text}</Typography>
-    </Paper>
-  )
-}
-```
-
-`src/components/VisualNovel/ChoiceList.tsx`:
-
-```tsx
-import Button from '@mui/material/Button'
-import Stack from '@mui/material/Stack'
-import { useVisualNovelContext } from 'contexts/VisualNovelContext'
-
-export const ChoiceList = () => {
-  const { availableChoices, choose, pendingAction, isController } = useVisualNovelContext()
-  if (!availableChoices.length) return null
-  return (
-    <Stack aria-label="Story choices" spacing={1}>
-      {availableChoices.map(choice => (
-        <Button
-          key={choice.id}
-          variant="contained"
-          disabled={pendingAction}
-          onClick={() => void choose(choice.id)}
-        >
-          {choice.label}{isController ? '' : ' (request)'}
-        </Button>
-      ))}
-    </Stack>
-  )
-}
-```
-
-`src/components/VisualNovel/VisualNovelStage.tsx`:
-
-```tsx
-import Box from '@mui/material/Box'
-import Button from '@mui/material/Button'
-import { useVisualNovelContext } from 'contexts/VisualNovelContext'
-import { ChoiceList } from './ChoiceList'
-import { DialogueBox } from './DialogueBox'
-
-export const VisualNovelStage = () => {
-  const { scene, entry, advance, availableChoices, pendingAction } = useVisualNovelContext()
-  if (!scene || !entry) return null
-  return (
-    <Box sx={{ display: 'grid', gridTemplateRows: '1fr auto', minHeight: 0 }}>
-      <Box sx={{ position: 'relative', overflow: 'hidden', bgcolor: 'grey.900' }}>
-        {/* Resolve validated asset keys through useVisualNovelAssets. */}
-        {(entry.characterChanges ?? scene.characters ?? []).map(character => (
-          <Box
-            component="img"
-            key={character.characterId}
-            alt=""
-            src={character.sprite}
-            sx={{ bottom: 0, height: '90%', objectFit: 'contain', position: 'absolute',
-              [character.position]: character.position === 'center' ? '50%' : 0,
-              transform: character.position === 'center' ? 'translateX(-50%)' : undefined }}
-          />
-        ))}
-      </Box>
-      <Box sx={{ display: 'grid', gap: 1, p: 1 }}>
-        <DialogueBox />
-        <ChoiceList />
-        {!availableChoices.length && (
-          <Button disabled={pendingAction} onClick={() => void advance()}>Continue</Button>
-        )}
-      </Box>
-    </Box>
-  )
-}
-```
-
-Use resolved safe asset URLs in production, not raw asset keys as shown by the placeholder `src`.
+`DialogueBox.tsx`, `ChoiceList.tsx`, and `VisualNovelStage.tsx` are unchanged from Revision 2 (polite live region; native buttons; empty alt text for decorative sprites; asset keys resolved through `useVisualNovelAssets`, never raw). Story switching in the stage's controls must be gated on `canStartStory` and show the "creates a new session" warning.
 
 ## Top-level component
 
@@ -353,43 +287,59 @@ export const VisualNovel = () => {
 
 ## Integrate with `Room.tsx`
 
-Keep the existing `RoomContext.Provider`, media controls, `ChatTranscript`, `MessageForm`, and `TypingStatusBar`. Replace only the main content arrangement with a responsive view. `useRoom` already returns `peerRoom` (verified), and the transport self ID comes from the new `peerRoom.getSelfId()` getter — **not** from `userId`, which is the Chitchatter identity, not the Trystero peer ID.
+**Mount exactly one provider per browser, in the group room only.** `Room` renders both the group room and targeted direct-message rooms (`useRoom` reports `isDirectMessageRoom`), and each peer-list item keeps a `keepMounted` dialog containing another targeted `Room`. An unconditional wrap would create multiple receivers on the same `gvn` action, duplicate bootstrap requests, divergent replicas, and — because `PeerRoom` stores one join/leave handler per `PeerHookType` — providers that overwrite and then delete each other's lifecycle handlers.
+
+Keep the existing `RoomContext.Provider`, media controls, `ChatTranscript`, `MessageForm`, `TypingStatusBar`, **and `RoomVideoDisplay`** — the previous revision's layout dropped the video/screen-share display while claiming media stayed functional.
 
 ```tsx
-<RoomContext.Provider value={roomContextValue}>
-  <VisualNovelProvider
-    peerRoom={peerRoom}
-    selfPeerId={peerRoom.getSelfId()}
-  >
-    <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
-      {/* Existing room controls stay mounted here. */}
-      <Box sx={{
-        display: 'grid',
-        flex: 1,
-        gridTemplateColumns: landscape ? 'minmax(0, 1fr) 400px' : '1fr',
-        gridTemplateRows: landscape ? '1fr' : 'minmax(55%, 1fr) minmax(0, 45%)',
-        minHeight: 0,
-      }}>
-        <VisualNovel />
-        <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <ChatTranscript messageLog={messageLog} userId={userId} />
-          <Divider />
-          <MessageForm
-            onMessageSubmit={handleMessageSubmit}
-            isMessageSending={isMessageSending}
-            onMessageChange={handleMessageChange}
-          />
-          {showActiveTypingStatus && (
-            <TypingStatusBar isDirectMessageRoom={isDirectMessageRoom} />
-          )}
-        </Box>
+const roomBody = (
+  <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+    {/* Existing room controls stay mounted here. */}
+    <Box sx={{
+      display: 'grid',
+      flex: 1,
+      gridTemplateColumns: landscape ? 'minmax(0, 1fr) 400px' : '1fr',
+      gridTemplateRows: landscape ? '1fr' : 'minmax(55%, 1fr) minmax(0, 45%)',
+      minHeight: 0,
+    }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {/* Story and media share the main column; video collapses when no
+            streams are active (existing showVideoDisplay logic). */}
+        {showVideoDisplay && <RoomVideoDisplay userId={userId} />}
+        {!isDirectMessageRoom && <VisualNovel />}
+      </Box>
+      <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <ChatTranscript messageLog={messageLog} userId={userId} />
+        <Divider />
+        <MessageForm
+          onMessageSubmit={handleMessageSubmit}
+          isMessageSending={isMessageSending}
+          onMessageChange={handleMessageChange}
+        />
+        {showActiveTypingStatus && (
+          <TypingStatusBar isDirectMessageRoom={isDirectMessageRoom} />
+        )}
       </Box>
     </Box>
-  </VisualNovelProvider>
-</RoomContext.Provider>
+  </Box>
+)
+
+return (
+  <RoomContext.Provider value={roomContextValue}>
+    {isDirectMessageRoom ? (
+      roomBody
+    ) : (
+      <VisualNovelProvider transport={peerRoom}>
+        {roomBody}
+      </VisualNovelProvider>
+    )}
+  </RoomContext.Provider>
+)
 ```
 
-Election no longer needs `connectedPeerIds` as a prop — the sync hook reads `peerRoom.getPeers()` at leave time (transport truth; the shell `peerList` updates asynchronously and its ordering relative to the novella leave handler is not guaranteed).
+`peerRoom` (returned by `useRoom`) satisfies `VisualNovelTransport` structurally. The transport self ID comes from `peerRoom.getSelfId()` — **not** from `userId`, which is the Chitchatter identity, not the Trystero peer ID. Election reads `transport.getPeers()` at leave time inside the sync hook; no peer-list prop is threaded through React.
+
+When both video streams and a story are active, prefer a tabbed or stacked main column on narrow screens (Story / Video / Chat view switcher) — design this composition explicitly rather than letting the story push video out of the layout.
 
 ## Accessibility and responsive requirements
 
@@ -397,6 +347,7 @@ Election no longer needs `connectedPeerIds` as a prop — the sync hook reads `p
 - Choices and continue are native buttons with focus states and pending/disabled feedback.
 - Decorative characters have empty alt text; meaningful backgrounds get an accessible stage label.
 - Never render story text with `dangerouslySetInnerHTML`.
-- On narrow screens use tabs or a view switcher for Story/Chat/Participants, but keep microphone controls persistent.
+- On narrow screens use tabs or a view switcher for Story/Video/Chat/Participants, but keep microphone controls persistent.
 - Choices must not be obscured by bottom navigation or browser safe-area insets.
-- Restart needs a confirmation dialog; story switching warns that it creates a new session (and the sync layer supports it via cross-session snapshots — see 03).
+- Restart needs a confirmation dialog; story switching is controller-only (`canStartStory`) and warns that it creates a new session.
+- The controller's "leave story" affordance is replaced by "pass control" / "end story for everyone" while participants remain.
