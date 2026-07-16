@@ -1,6 +1,6 @@
-# 02 — Pure engine and bundled example story
+# 05 — Pure engine
 
-> **Revision 3 changes:** the engine is unchanged from Revision 2 except for its expanded role: replicas now use it to **replay** canonical `ADVANCED`/`CHOICE_RESOLVED` deltas and compare the result before applying (see 03), so determinism and immutability are load-bearing protocol properties, not just hygiene. Dead-end semantics from Revision 2 stand: an entry that *declares* choices but has none available is a `CHOICE_DEAD_END` error, never a silent skip. Snapshot emission uses `toSnapshotState` truncation at the sync layer (the engine keeps full in-memory history).
+> **Revision 4 changes:** none functional — the engine is stable since Revision 3. Its determinism and immutability are load-bearing protocol properties: replicas replay canonical deltas through it (09), and semantic session validation (04) guarantees `getScene`/`getEntry` cannot throw on replicated state.
 
 The engine owns legal story transitions. It receives a validated manifest, explicit dependencies, and an immutable session. It never imports React, storage, WebRTC, DOM APIs, or global time/randomness.
 
@@ -79,8 +79,7 @@ export class VisualNovelEngine {
     if (this.getAvailableChoices(state).length > 0) return false
     // An entry that declares choices but offers none is a dead end, not an
     // advance opportunity — advancing here would silently skip a designed
-    // branch. validateStory warns about this at build time (01, rule 12);
-    // at runtime it is an authoring error surfaced to the controller.
+    // branch. validateStory warns about this at build time (04, rule 11).
     if ((entry.choices ?? []).length > 0) return false
     const scene = this.getScene(state)
     const currentIndex = scene.dialogue.findIndex(item => item.id === entry.id)
@@ -94,10 +93,7 @@ export class VisualNovelEngine {
       throw new VisualNovelEngineError('CHOICE_REQUIRED', 'Resolve a choice before advancing')
     }
     if ((entry.choices ?? []).length > 0) {
-      throw new VisualNovelEngineError(
-        'CHOICE_DEAD_END',
-        'All choices at this entry are unavailable'
-      )
+      throw new VisualNovelEngineError('CHOICE_DEAD_END', 'All choices at this entry are unavailable')
     }
 
     const currentScene = this.getScene(state)
@@ -234,165 +230,22 @@ export class VisualNovelEngine {
 }
 ```
 
-## `src/stories/example-story/story.json`
-
-This complete story has three scenes, two visible characters, a background change, one branch, effects, and two endings.
-
-```json
-{
-  "id": "harbour-lights",
-  "version": "1.0.0",
-  "title": "Harbour Lights",
-  "description": "Two friends decide how to guide a boat home.",
-  "startSceneId": "pier",
-  "assets": {
-    "pierNight": "stories/example-story/assets/pier-night.webp",
-    "beaconNight": "stories/example-story/assets/beacon-night.webp",
-    "harbourDawn": "stories/example-story/assets/harbour-dawn.webp",
-    "maraConcerned": "stories/example-story/assets/mara-concerned.webp",
-    "maraHappy": "stories/example-story/assets/mara-happy.webp",
-    "solThinking": "stories/example-story/assets/sol-thinking.webp",
-    "solHappy": "stories/example-story/assets/sol-happy.webp",
-    "nightMusic": "stories/example-story/assets/night.ogg",
-    "dawnMusic": "stories/example-story/assets/dawn.ogg",
-    "beaconSound": "stories/example-story/assets/beacon.wav"
-  },
-  "scenes": {
-    "pier": {
-      "id": "pier",
-      "background": "pierNight",
-      "music": "nightMusic",
-      "characters": [
-        { "characterId": "mara", "sprite": "maraConcerned", "position": "left" },
-        { "characterId": "sol", "sprite": "solThinking", "position": "right" }
-      ],
-      "dialogue": [
-        {
-          "id": "pier-1",
-          "speaker": "Mara",
-          "text": "The harbour beacon is dark, and the fishing boat is still outside the breakwater."
-        },
-        {
-          "id": "pier-2",
-          "speaker": "Sol",
-          "text": "We have time for one signal. What should we do?",
-          "choices": [
-            {
-              "id": "light-beacon",
-              "label": "Light the old beacon",
-              "nextSceneId": "beacon-ending",
-              "effects": [
-                { "type": "set", "variable": "usedBeacon", "value": true },
-                { "type": "increment", "variable": "courage", "amount": 1 }
-              ]
-            },
-            {
-              "id": "wait-for-dawn",
-              "label": "Wait together for dawn",
-              "nextSceneId": "dawn-ending",
-              "effects": [
-                { "type": "set", "variable": "usedBeacon", "value": false },
-                { "type": "increment", "variable": "patience", "amount": 1 }
-              ]
-            }
-          ]
-        }
-      ]
-    },
-    "beacon-ending": {
-      "id": "beacon-ending",
-      "background": "beaconNight",
-      "music": "nightMusic",
-      "characters": [
-        { "characterId": "mara", "sprite": "maraHappy", "position": "left" },
-        { "characterId": "sol", "sprite": "solHappy", "position": "right" }
-      ],
-      "dialogue": [
-        {
-          "id": "beacon-1",
-          "speaker": "Mara",
-          "text": "The lens catches, then floods the water with gold.",
-          "soundEffect": "beaconSound"
-        },
-        {
-          "id": "beacon-2",
-          "speaker": "Sol",
-          "text": "The boat answers with two flashes. They found the channel."
-        }
-      ]
-    },
-    "dawn-ending": {
-      "id": "dawn-ending",
-      "background": "harbourDawn",
-      "music": "dawnMusic",
-      "characters": [
-        { "characterId": "mara", "sprite": "maraHappy", "position": "left" },
-        { "characterId": "sol", "sprite": "solHappy", "position": "right" }
-      ],
-      "dialogue": [
-        {
-          "id": "dawn-1",
-          "speaker": "Sol",
-          "text": "The first light draws a silver road across the water."
-        },
-        {
-          "id": "dawn-2",
-          "speaker": "Mara",
-          "text": "Slowly, the boat follows it home."
-        }
-      ]
-    }
-  }
-}
-```
-
-## `src/stories/catalog.ts`
-
-```ts
-import exampleStoryData from './example-story/story.json'
-import type { VisualNovelManifest } from 'models/visualNovel'
-import { validateStory } from 'services/visualNovel/VisualNovelValidator'
-
-const loadBundledStory = (input: unknown): VisualNovelManifest => {
-  const result = validateStory(input, window.location.origin)
-  if (!result.ok) {
-    throw new Error(`Invalid bundled story: ${result.errors.join(', ')}`)
-  }
-  return result.value
-}
-
-export const bundledStories = [loadBundledStory(exampleStoryData)]
-
-export const getBundledStory = (storyId: string, storyVersion?: string) =>
-  bundledStories.find(story =>
-    story.id === storyId && (!storyVersion || story.version === storyVersion)
-  ) ?? null
-```
-
-## `src/services/visualNovel/index.ts`
-
-```ts
-export * from './VisualNovelEngine'
-export * from './VisualNovelSyncService'
-export * from './VisualNovelValidator'
-export * from './createVisualNovelEnvelope'
-```
-
 ## Engine tests
 
-Test with a fake clock so exact revisions/timestamps are deterministic:
+Use a fake clock so revisions/timestamps are deterministic:
 
 ```ts
 import storyData from 'stories/example-story/story.json'
 import { VisualNovelEngine } from './VisualNovelEngine'
 
 const story = storyData as VisualNovelManifest
-const engine = new VisualNovelEngine(story, { now: () => 1000 })
+const makeEngine = () => new VisualNovelEngine(story, { now: () => 1000 })
 
 it('starts and reaches the beacon ending', () => {
+  const engine = makeEngine()
   const start = engine.start('session-1', 'peer-a')
-  const choice = engine.advance(start)
-  const ending = engine.choose(choice, 'light-beacon')
+  const atChoice = engine.advance(start)
+  const ending = engine.choose(atChoice, 'light-beacon')
   expect(ending).toMatchObject({
     sceneId: 'beacon-ending',
     dialogueEntryId: 'beacon-1',
@@ -402,6 +255,7 @@ it('starts and reaches the beacon ending', () => {
 })
 
 it('restarts without changing session/controller', () => {
+  const engine = makeEngine()
   const progressed = engine.advance(engine.start('session-1', 'peer-a'))
   expect(engine.restart(progressed)).toMatchObject({
     sessionId: 'session-1',
@@ -413,14 +267,21 @@ it('restarts without changing session/controller', () => {
 })
 
 it('treats all-unavailable choices as a dead end, not a skip', () => {
-  // Build a fixture whose only entry declares one choice gated behind an
-  // impossible condition. advance must throw CHOICE_DEAD_END and canAdvance
-  // must be false; the branch must never be silently skipped.
   const gated = new VisualNovelEngine(gatedStory, { now: () => 1000 })
   const state = gated.start('session-1', 'peer-a')
   expect(gated.canAdvance(state)).toBe(false)
   expect(() => gated.advance(state)).toThrow('unavailable')
 })
+
+it('is deterministic and immutable', () => {
+  const engine = makeEngine()
+  const start = engine.start('session-1', 'peer-a')
+  const frozen = JSON.parse(JSON.stringify(start))
+  const a = engine.advance(start)
+  const b = engine.advance(start)
+  expect(a).toEqual(b)              // determinism: replay-safe (09)
+  expect(start).toEqual(frozen)     // immutability: input untouched
+})
 ```
 
-Also test unavailable choices, attempts to advance at a choice, both endings, numeric effects, incompatible state, missing scenes/entries, history bounding, controller change, end-of-branch behavior, and immutability (input state and manifest are not mutated).
+Also test: unavailable choice, advancing at a choice, both endings, numeric effects, `INVALID_INCREMENT`, incompatible state (`STORY_MISMATCH`), missing scenes/entries, history bounding at `maxHistoryEntries`, `changeController`, end-of-branch `STORY_ENDED`, and that the manifest object is never mutated.

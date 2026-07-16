@@ -1,0 +1,123 @@
+# 04 — Semantic validation: stories and sessions against stories
+
+> **Revision 4 changes:** new `validateSessionAgainstStory(state, manifest)`. Structural validation proves IDs *look like* IDs; it cannot prove `sceneId` exists in the story, `dialogueEntryId` exists in that scene, or that history is coherent. Previously a structurally valid bad snapshot was installed directly and then threw inside `engine.getScene`/`getEntry` **during rendering**. Semantic validation now runs before every snapshot/checkpoint application.
+
+## `validateSessionAgainstStory`
+
+Add to `src/services/visualNovel/VisualNovelValidator.ts`:
+
+```ts
+import type {
+  VisualNovelManifest,
+  VisualNovelSessionState,
+} from 'models/visualNovel'
+
+// Precondition: `state` already passed validateSessionState (03) and
+// `manifest` already passed validateStory (below). Returns errors, not a
+// value — the state is not transformed, only vetted against the story.
+export const validateSessionAgainstStory = (
+  state: VisualNovelSessionState,
+  manifest: VisualNovelManifest
+): ValidationResult<VisualNovelSessionState> => {
+  const errors: string[] = []
+
+  if (state.storyId !== manifest.id || state.storyVersion !== manifest.version) {
+    return fail('State belongs to a different story/version')
+  }
+
+  const scene = manifest.scenes[state.sceneId]
+  if (!scene) errors.push(`Unknown scene: ${state.sceneId}`)
+  else if (!scene.dialogue.some(entry => entry.id === state.dialogueEntryId)) {
+    errors.push(`Unknown dialogue entry: ${state.dialogueEntryId}`)
+  }
+
+  // History coherence: entries reference real scenes/entries/choices, and
+  // revisions are strictly increasing and strictly below state.revision.
+  let previousRevision = -1
+  for (const entry of state.history) {
+    const historyScene = manifest.scenes[entry.sceneId]
+    if (!historyScene) { errors.push('History references unknown scene'); break }
+    const historyEntry = historyScene.dialogue.find(item => item.id === entry.dialogueEntryId)
+    if (!historyEntry) { errors.push('History references unknown entry'); break }
+    if (entry.choiceId !== undefined &&
+        !(historyEntry.choices ?? []).some(choice => choice.id === entry.choiceId)) {
+      errors.push('History references unknown choice')
+      break
+    }
+    if (entry.revision <= previousRevision) {
+      errors.push('History revisions are not strictly increasing')
+      break
+    }
+    previousRevision = entry.revision
+  }
+  if (state.history.length > 0 &&
+      state.history[state.history.length - 1].revision >= state.revision) {
+    errors.push('History revision not below state revision')
+  }
+
+  return errors.length ? { ok: false, errors } : { ok: true, value: state }
+}
+```
+
+## Call sites (mandatory)
+
+Semantic validation runs at **every** point a full state enters the replica:
+
+| Entry point | Doc | Rule |
+| --- | --- | --- |
+| `STATE_SNAPSHOT` / `SESSION_STARTED` / `RESTARTED` application | 09 | structural (03) → resolve story from the catalog (`getBundledStory(state.storyId, state.storyVersion)`) → **story must exist** → `validateSessionAgainstStory` → authorization (08) → apply |
+| `CONTROLLER_CHANGED` adopted state | 09 | same chain; the round rules (08) come after semantic validity |
+| `ELECTION_ADVERTISE` collection at the winner | 09 | advertisements failing semantic validation are discarded, never adopted |
+| Checkpoint load | 12 | a checkpoint that fails against the *currently bundled* story (e.g. story updated between visits) is discarded, not rendered |
+
+A snapshot whose story is not in the local catalog is a **recoverable condition**, not an error loop: surface "story unavailable in this build" and stay in the lobby.
+
+## `validateStory(input, applicationOrigin)`
+
+Same file. Deep, normalizing (fresh object graph — same rule as 03), and the source of the manifest trusted by `validateSessionAgainstStory`:
+
+1. Bound serialized story size via `utf8Bytes` before walking it.
+2. Validate manifest `id`, semantic-looking `version`, `title`, optional `description`, `startSceneId`.
+3. Bound the asset map and scene map (`maxScenes`, `maxDialogueEntriesPerScene`, `maxChoicesPerEntry`).
+4. Validate each asset path with `validateAssetPath` (below).
+5. Require `sceneMapKey === scene.id` and non-empty bounded dialogue.
+6. Require unique dialogue IDs across the story and unique choice IDs.
+7. Validate speaker/text/portrait/sound/background/music/character placement fields against the limits (01).
+8. Ensure every asset key reference (`background`, `music`, `sprite`, `portrait`, `soundEffect`) exists in the asset map.
+9. Ensure every `next.sceneId` and `choice.nextSceneId` exists; ensure `next.dialogueEntryId` exists in the effective target scene; ensure `startSceneId` exists and its scene has dialogue.
+10. Accept only declared condition operators and effect types.
+11. Warn (build-time) about entries whose choices can *all* be condition-gated off with no `next` fallback — the runtime `CHOICE_DEAD_END` (05) makes this an authoring error, never a silent skip.
+12. Return a normalized fresh manifest; never the untrusted reference.
+
+## `validateAssetPath`
+
+```ts
+export const validateAssetPath = (
+  path: unknown,
+  applicationOrigin: string
+): ValidationResult<string> => {
+  if (!isString(path, 1024)) return fail('Invalid asset path')
+  const value = path as string
+  if (value.includes('..') || value.startsWith('//')) {
+    return fail('Asset path escapes its story root')
+  }
+  try {
+    const url = new URL(value, applicationOrigin)
+    const extension = url.pathname.slice(url.pathname.lastIndexOf('.')).toLowerCase()
+    if (url.origin !== applicationOrigin) return fail('Cross-origin story assets are disabled')
+    if (!allowedVisualNovelAssetExtensions.has(extension)) return fail('Unsupported asset extension')
+    return { ok: true, value }
+  } catch {
+    return fail('Malformed asset URL')
+  }
+}
+```
+
+## Tests for this step
+
+- A structurally valid snapshot with a scene ID absent from the story is rejected by `validateSessionAgainstStory` — and a hook-level test asserts such a snapshot **never reaches `setState`** (no render-time engine throw).
+- Unknown dialogue entry in a known scene; unknown scene/entry/choice inside history; non-increasing history revisions; last history revision ≥ state revision.
+- Snapshot for a story/version not in the catalog → recoverable "story unavailable", no state change, no error loop.
+- Checkpoint that no longer matches the bundled story is discarded on load.
+- Story validation: all rules 1–12, including the dead-end authoring warning and asset-path traversal/cross-origin/extension rejections.
+- Normalization: mutating the input story object after `validateStory` does not affect the returned manifest.
