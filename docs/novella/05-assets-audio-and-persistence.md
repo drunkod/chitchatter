@@ -1,5 +1,7 @@
 # 05 — Assets, local story audio, and provisional persistence
 
+> **Revision 2 changes:** the asset-loading effect now collects failures locally instead of reading stale `failedUrls` state; the checkpoint adapter is explicitly `StorageContext.getPersistedStorage()` (localforage — verified in the repo, and its async API matches the adapter shape exactly).
+
 Story assets are bundled or statically hosted by the same application. Only state identifiers travel through the novella protocol.
 
 ## `src/hooks/useVisualNovelAssets.ts`
@@ -66,6 +68,10 @@ export const useVisualNovelAssets = (
     setStatus('loading')
     setFailedUrls([])
 
+    // Collect failures locally — reading failedUrls state inside .then()
+    // would observe a stale snapshot from this render.
+    const failures: string[] = []
+
     void Promise.all(urls.map(async url => {
       const pathname = new URL(url).pathname.toLowerCase()
       const isImage = /\.(avif|gif|jpe?g|png|webp)$/.test(pathname)
@@ -77,9 +83,11 @@ export const useVisualNovelAssets = (
         image.src = url
       })
     }).map(promise => promise.catch(error => {
-      if (!cancelled) setFailedUrls(current => [...current, String(error.message)])
+      failures.push(String(error.message))
     }))).then(() => {
-      if (!cancelled) setStatus(failedUrls.length ? 'partial-error' : 'ready')
+      if (cancelled) return
+      setFailedUrls(failures)
+      setStatus(failures.length ? 'partial-error' : 'ready')
     })
 
     return () => { cancelled = true }
@@ -94,8 +102,6 @@ export const useVisualNovelAssets = (
   }
 }
 ```
-
-Use functional/local error collection rather than reading stale `failedUrls` in the final production effect. The example emphasizes the loading boundary and URL policy.
 
 ## Missing-asset behavior
 
@@ -127,6 +133,8 @@ export const useVisualNovelAudio = () => {
   }, [])
 
   const playMusic = useCallback(async (url: string | null) => {
+    // Note: HTMLAudioElement.src is absolutized by the browser — pass the
+    // resolved absolute URL from useVisualNovelAssets so this compare works.
     if (musicRef.current?.src === url) return
     stopMusic()
     if (!url) return
@@ -213,12 +221,12 @@ These controls are separate from voice communication volume.
 
 ## `src/hooks/useVisualNovelCheckpoint.ts`
 
-Use the repository's existing storage abstraction instead of raw `localStorage` when implementing. This adapter-shaped example shows the required rules.
+Use the repository's existing storage abstraction: `StorageContext.getPersistedStorage()` returns a localforage instance whose async `getItem`/`setItem`/`removeItem` API matches this adapter shape directly.
 
 ```ts
 import { useEffect, useState } from 'react'
 import type { VisualNovelSessionState } from 'models/visualNovel'
-import { validateSessionState } from 'services/visualNovel'
+import { validateSessionState, toSnapshotState } from 'services/visualNovel'
 
 interface StorageAdapter {
   getItem: (key: string) => Promise<unknown>
@@ -242,7 +250,12 @@ export const useVisualNovelCheckpoint = ({
 
   useEffect(() => {
     if (!state) return
-    void storage.setItem(checkpointKey(roomScope, state.sessionId), state)
+    // Store the truncated form so a loaded checkpoint always passes
+    // validateSessionState (which enforces the snapshot history bound).
+    void storage.setItem(
+      checkpointKey(roomScope, state.sessionId),
+      toSnapshotState(state)
+    )
   }, [roomScope, state, storage])
 
   const load = async (sessionId: string) => {
@@ -283,4 +296,3 @@ export const useVisualNovelCheckpoint = ({
 ## Optional custom story packages after MVP
 
 If added later, reuse the existing file-transfer service for a bounded archive, validate every archive path/type/size, assign a content digest, and require exact digest/version agreement before starting. Do not put archive bytes in action envelopes and do not make custom transfer part of MVP acceptance.
-

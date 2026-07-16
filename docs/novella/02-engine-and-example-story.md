@@ -1,5 +1,7 @@
 # 02 — Pure engine and bundled example story
 
+> **Revision 2 changes:** explicit dead-end semantics — an entry that *declares* choices but has none available (all condition-gated off) is now a `CHOICE_DEAD_END` error instead of silently falling through to the next entry and erasing a designed branch. `restart` and snapshot emission use `toSnapshotState` history truncation at the sync layer (engine keeps full in-memory history).
+
 The engine owns legal story transitions. It receives a validated manifest, explicit dependencies, and an immutable session. It never imports React, storage, WebRTC, DOM APIs, or global time/randomness.
 
 ## `src/services/visualNovel/VisualNovelEngine.ts`
@@ -75,6 +77,11 @@ export class VisualNovelEngine {
   canAdvance(state: VisualNovelSessionState): boolean {
     const entry = this.getEntry(state)
     if (this.getAvailableChoices(state).length > 0) return false
+    // An entry that declares choices but offers none is a dead end, not an
+    // advance opportunity — advancing here would silently skip a designed
+    // branch. validateStory warns about this at build time (01, rule 12);
+    // at runtime it is an authoring error surfaced to the controller.
+    if ((entry.choices ?? []).length > 0) return false
     const scene = this.getScene(state)
     const currentIndex = scene.dialogue.findIndex(item => item.id === entry.id)
     return Boolean(entry.next?.sceneId || entry.next?.dialogueEntryId ||
@@ -85,6 +92,12 @@ export class VisualNovelEngine {
     const entry = this.getEntry(state)
     if (this.getAvailableChoices(state).length > 0) {
       throw new VisualNovelEngineError('CHOICE_REQUIRED', 'Resolve a choice before advancing')
+    }
+    if ((entry.choices ?? []).length > 0) {
+      throw new VisualNovelEngineError(
+        'CHOICE_DEAD_END',
+        'All choices at this entry are unavailable'
+      )
     }
 
     const currentScene = this.getScene(state)
@@ -362,6 +375,7 @@ export const getBundledStory = (storyId: string, storyVersion?: string) =>
 export * from './VisualNovelEngine'
 export * from './VisualNovelSyncService'
 export * from './VisualNovelValidator'
+export * from './createVisualNovelEnvelope'
 ```
 
 ## Engine tests
@@ -397,7 +411,16 @@ it('restarts without changing session/controller', () => {
     revision: 2,
   })
 })
+
+it('treats all-unavailable choices as a dead end, not a skip', () => {
+  // Build a fixture whose only entry declares one choice gated behind an
+  // impossible condition. advance must throw CHOICE_DEAD_END and canAdvance
+  // must be false; the branch must never be silently skipped.
+  const gated = new VisualNovelEngine(gatedStory, { now: () => 1000 })
+  const state = gated.start('session-1', 'peer-a')
+  expect(gated.canAdvance(state)).toBe(false)
+  expect(() => gated.advance(state)).toThrow('unavailable')
+})
 ```
 
-Also test unavailable choices, attempts to advance at a choice, both endings, numeric effects, incompatible state, missing scenes/entries, history bounding, controller change, and end-of-branch behavior.
-
+Also test unavailable choices, attempts to advance at a choice, both endings, numeric effects, incompatible state, missing scenes/entries, history bounding, controller change, end-of-branch behavior, and immutability (input state and manifest are not mutated).

@@ -1,5 +1,7 @@
 # 01 — Models, limits, and runtime validation
 
+> **Revision 2 changes:** payload/envelope/state interfaces extend `Record<string, any>` (not `unknown`) so they satisfy Trystero's `DataPayload` constraint in `usePeerAction<T>` — this matches `UnsentMessage`, `TypingStatus`, and `UserMetadata` in the repository. Snapshot limits are now internally consistent: snapshots carry truncated history (`maxSnapshotHistoryEntries`), variable string values are bounded, and the byte limits are derived from worst-case field limits. A reserved bootstrap scope allows `STATE_REQUEST` before any state exists.
+
 This phase creates the trust boundary. TypeScript types help authors, but every story file, checkpoint, and remote payload must still be validated at runtime.
 
 ## `src/config/visualNovel.ts`
@@ -7,11 +9,17 @@ This phase creates the trust boundary. TypeScript types help authors, but every 
 ```ts
 export const visualNovelProtocolVersion = 1 as const
 
+// Byte limits are derived from the field limits below. Worst case for a
+// snapshot: 32 truncated history entries (~450 B each) + 128 variables
+// (~420 B each) + identifiers ≈ 70 KB upper bound. maxEnvelopeBytes must
+// exceed maxSnapshotBytes plus envelope overhead.
 export const visualNovelLimits = {
-  maxEnvelopeBytes: 64 * 1024,
-  maxSnapshotBytes: 48 * 1024,
-  maxHistoryEntries: 256,
+  maxEnvelopeBytes: 96 * 1024,
+  maxSnapshotBytes: 80 * 1024,
+  maxHistoryEntries: 256, // in-memory only
+  maxSnapshotHistoryEntries: 32, // what actually travels in snapshots
   maxVariables: 128,
+  maxVariableValueLength: 256,
   maxScenes: 256,
   maxDialogueEntriesPerScene: 512,
   maxChoicesPerEntry: 16,
@@ -19,6 +27,15 @@ export const visualNovelLimits = {
   maxLabelLength: 256,
   maxTextLength: 8 * 1024,
   maxSeenActionIds: 2048,
+  requestTimeoutMs: 10_000,
+} as const
+
+// Reserved scope for STATE_REQUEST sent by a peer that has no session state
+// yet (late join before any push arrives). See 03.
+export const visualNovelBootstrapScope = {
+  sessionId: 'bootstrap',
+  storyId: 'bootstrap',
+  storyVersion: '0.0.0',
 } as const
 
 export const allowedVisualNovelAssetExtensions = new Set([
@@ -37,6 +54,11 @@ export const allowedVisualNovelAssetExtensions = new Set([
 ## `src/models/visualNovel.ts`
 
 ```ts
+// NOTE: interfaces that travel over usePeerAction extend Record<string, any>.
+// Trystero's DataPayload is JSON-value based and is NOT satisfied by
+// Record<string, unknown>. This matches the existing repository convention
+// (UnsentMessage, TypingStatus, UserMetadata).
+
 export type VisualNovelValue = string | number | boolean
 
 export interface VisualNovelCharacterPlacement {
@@ -105,7 +127,7 @@ export interface VisualNovelHistoryEntry {
   choiceId?: string
 }
 
-export interface VisualNovelSessionState extends Record<string, unknown> {
+export interface VisualNovelSessionState extends Record<string, any> {
   protocolVersion: 1
   storyId: string
   storyVersion: string
@@ -117,6 +139,14 @@ export interface VisualNovelSessionState extends Record<string, unknown> {
   controllerPeerId: string
   revision: number
   updatedAt: number
+}
+
+// Identifiers shared by every envelope; separated from full state so that
+// envelopes (e.g. bootstrap STATE_REQUEST) can be built without one.
+export interface VisualNovelScope {
+  sessionId: string
+  storyId: string
+  storyVersion: string
 }
 
 export type VisualNovelActionType =
@@ -134,8 +164,8 @@ export type VisualNovelActionType =
   | 'RESTARTED'
   | 'ERROR'
 
-export interface VisualNovelActionEnvelope<T = unknown>
-  extends Record<string, unknown> {
+export interface VisualNovelActionEnvelope<T = any>
+  extends Record<string, any> {
   protocol: 'visual-novel'
   protocolVersion: 1
   actionId: string
@@ -175,6 +205,21 @@ export type EnvelopeFor<T extends VisualNovelActionType> =
     actionType: T
   }
 ```
+
+## Snapshot truncation helper
+
+Add to `src/services/visualNovel/VisualNovelValidator.ts` (or a sibling module) and use it for **every** outgoing `STATE_SNAPSHOT`, `SESSION_STARTED`, and `RESTARTED` payload:
+
+```ts
+export const toSnapshotState = (
+  state: VisualNovelSessionState
+): VisualNovelSessionState => ({
+  ...state,
+  history: state.history.slice(-visualNovelLimits.maxSnapshotHistoryEntries),
+})
+```
+
+Without this, a state that is legal by every field limit (256 history entries with long IDs) exceeds the snapshot byte limit and late joiners can never sync.
 
 ## `src/services/visualNovel/VisualNovelValidator.ts`
 
@@ -219,8 +264,10 @@ const isRevision = (value: unknown): value is number =>
   Number.isSafeInteger(value) && Number(value) >= 0
 
 const isValue = (value: unknown): value is VisualNovelValue =>
-  ['string', 'number', 'boolean'].includes(typeof value) &&
-  (typeof value !== 'number' || Number.isFinite(value))
+  (typeof value === 'string' &&
+    value.length <= visualNovelLimits.maxVariableValueLength) ||
+  typeof value === 'boolean' ||
+  (typeof value === 'number' && Number.isFinite(value))
 
 const utf8Bytes = (value: unknown) =>
   new TextEncoder().encode(JSON.stringify(value)).byteLength
@@ -271,8 +318,9 @@ export const validateSessionState = (
       errors.push('Invalid variable')
     }
   }
+  // Incoming (snapshot) states must satisfy the snapshot history bound.
   if (!Array.isArray(input.history) ||
-      input.history.length > visualNovelLimits.maxHistoryEntries) {
+      input.history.length > visualNovelLimits.maxSnapshotHistoryEntries) {
     errors.push('Invalid state.history')
   }
   if (utf8Bytes(input) > visualNovelLimits.maxSnapshotBytes) {
@@ -364,7 +412,8 @@ Implement `validateStory(input, applicationOrigin)` in the same file with these 
 9. Ensure every `next.sceneId` and `choice.nextSceneId` exists.
 10. Ensure `next.dialogueEntryId` exists in the effective target scene.
 11. Accept only declared condition operators and effect types.
-12. Normalize into a fresh object rather than returning the untrusted reference.
+12. Warn (build-time) about entries whose choices can *all* be condition-gated off with no `next` fallback — that is an authoring dead end (see 02).
+13. Normalize into a fresh object rather than returning the untrusted reference.
 
 ## Message-context identity check
 
@@ -386,6 +435,7 @@ Do not log the room password, private URL, encryption key, full snapshot, or rej
 
 - Accept a complete valid story and envelope of every action type.
 - Reject arrays/null/primitives where objects are required.
-- Reject missing/duplicate IDs, nonexistent transitions, bad asset keys, path traversal, cross-origin assets, unsupported extensions, NaN/infinity, oversized histories/variables/envelopes, unknown actions/effects/operators, and unsupported versions.
+- Reject missing/duplicate IDs, nonexistent transitions, bad asset keys, path traversal, cross-origin assets, unsupported extensions, NaN/infinity, oversized histories/variables/variable values/envelopes, unknown actions/effects/operators, and unsupported versions.
+- Assert `toSnapshotState` truncates to `maxSnapshotHistoryEntries` and that a maximal truncated state passes `validateSessionState` (byte limits are consistent by construction).
 - Assert the transport peer ID mismatch is rejected before state changes.
-
+- Assert a bootstrap-scoped `STATE_REQUEST` envelope passes `validateEnvelope`.

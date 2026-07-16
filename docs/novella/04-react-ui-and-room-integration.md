@@ -1,5 +1,7 @@
 # 04 — React state, UI components, and room integration
 
+> **Revision 2 changes:** `startStory` now actually broadcasts `SESSION_STARTED` via `sync.startSession`; `restart` is implemented (with confirmation left to the dialog component); `pendingAction` has a timeout so a dropped request cannot permanently disable the UI; `selfPeerId` comes from `peerRoom.getSelfId()` (verified: `useRoom` returns `peerRoom`, and `Peer.peerId` in the shell peer list is the transport ID).
+
 React owns rendering and user intent. It does not decide whether a remote transition is valid; that belongs to validators, the engine, and the sync service.
 
 ## `src/contexts/VisualNovelContext.tsx`
@@ -53,14 +55,15 @@ export const useVisualNovelContext = () => {
 
 ## `src/hooks/useVisualNovel.ts`
 
-This composition hook is the only stateful API the provider needs. Complete the restart/control functions with the sync-hook methods from the prior guide.
+This composition hook is the only stateful API the provider needs. `CONTROL_REQUEST`/`CONTROL_PASSED` wiring follows the same request pattern (M3/M4).
 
 ```ts
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { v4 as uuid } from 'uuid'
 
+import { visualNovelLimits } from 'config/visualNovel'
 import type { PeerRoom } from 'lib/PeerRoom'
-import type { VisualNovelManifest, VisualNovelSessionState } from 'models/visualNovel'
+import type { VisualNovelSessionState } from 'models/visualNovel'
 import { VisualNovelEngine } from 'services/visualNovel'
 import { bundledStories, getBundledStory } from 'stories/catalog'
 import { useVisualNovelSync } from './useVisualNovelSync'
@@ -68,7 +71,6 @@ import { useVisualNovelSync } from './useVisualNovelSync'
 interface Options {
   peerRoom: PeerRoom
   selfPeerId: string
-  connectedPeerIds: string[]
 }
 
 export const useVisualNovel = (options: Options) => {
@@ -77,6 +79,13 @@ export const useVisualNovel = (options: Options) => {
     'ready' | 'waiting' | 'error'>('lobby')
   const [error, setError] = useState<string | null>(null)
   const [pendingAction, setPendingAction] = useState(false)
+  const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearPending = useCallback(() => {
+    if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current)
+    pendingTimerRef.current = null
+    setPendingAction(false)
+  }, [])
 
   const story = useMemo(() => state
     ? getBundledStory(state.storyId, state.storyVersion)
@@ -92,12 +101,12 @@ export const useVisualNovel = (options: Options) => {
     setState: next => {
       setState(next)
       setStatus('ready')
-      setPendingAction(false)
+      clearPending() // any canonical update resolves the pending request
     },
     onProtocolError: message => {
       setError(message)
       setStatus('error')
-      setPendingAction(false)
+      clearPending()
     },
   })
 
@@ -109,25 +118,34 @@ export const useVisualNovel = (options: Options) => {
     try {
       const next = new VisualNovelEngine(selected, { now: Date.now })
         .start(uuid(), options.selfPeerId)
-      setState(next)
-      // Add sync.startSession(next) to broadcast SESSION_STARTED.
+      // Broadcasts SESSION_STARTED and sets local state — peers already in
+      // the room bootstrap from this envelope.
+      await sync.startSession(next)
       setStatus('ready')
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Unable to start story')
       setStatus('error')
     }
-  }, [options.selfPeerId])
+  }, [options.selfPeerId, sync])
 
+  // A request that never receives a canonical response (controller left,
+  // request silently dropped as duplicate/mismatch) must not wedge the UI.
   const runPending = useCallback(async (work: () => Promise<void>) => {
     if (pendingAction) return
     setPendingAction(true)
     setError(null)
+    pendingTimerRef.current = setTimeout(() => {
+      pendingTimerRef.current = null
+      setPendingAction(false)
+      setError('No response from the story controller')
+      setStatus('waiting')
+    }, visualNovelLimits.requestTimeoutMs)
     try { await work() }
     catch (reason) {
-      setPendingAction(false)
+      clearPending()
       setError(reason instanceof Error ? reason.message : 'Story action failed')
     }
-  }, [pendingAction])
+  }, [clearPending, pendingAction])
 
   const scene = state && engine ? engine.getScene(state) : null
   const entry = state && engine ? engine.getEntry(state) : null
@@ -147,13 +165,14 @@ export const useVisualNovel = (options: Options) => {
     startStory,
     advance: () => runPending(sync.requestAdvance),
     choose: (choiceId: string) => runPending(() => sync.requestChoice(choiceId)),
-    restart: async () => {},
-    requestControl: async () => {},
-    passControl: async (_peerId: string) => {},
+    restart: () => runPending(sync.requestRestart), // confirm in dialog first
+    requestControl: async () => {}, // M3: CONTROL_REQUEST via same pattern
+    passControl: async (_peerId: string) => {}, // M3: CONTROL_PASSED
     leaveStory: () => {
       setState(null)
       setStatus('lobby')
       setError(null)
+      clearPending()
     },
   }
 }
@@ -172,7 +191,6 @@ import { useVisualNovel } from 'hooks/useVisualNovel'
 interface Props extends PropsWithChildren {
   peerRoom: PeerRoom
   selfPeerId: string
-  connectedPeerIds: string[]
 }
 
 export const VisualNovelProvider = ({ children, ...options }: Props) => {
@@ -335,14 +353,13 @@ export const VisualNovel = () => {
 
 ## Integrate with `Room.tsx`
 
-Keep the existing `RoomContext.Provider`, media controls, `ChatTranscript`, `MessageForm`, and `TypingStatusBar`. Replace only the main content arrangement with a responsive view.
+Keep the existing `RoomContext.Provider`, media controls, `ChatTranscript`, `MessageForm`, and `TypingStatusBar`. Replace only the main content arrangement with a responsive view. `useRoom` already returns `peerRoom` (verified), and the transport self ID comes from the new `peerRoom.getSelfId()` getter — **not** from `userId`, which is the Chitchatter identity, not the Trystero peer ID.
 
 ```tsx
 <RoomContext.Provider value={roomContextValue}>
   <VisualNovelProvider
     peerRoom={peerRoom}
-    selfPeerId={selfPeerId}
-    connectedPeerIds={peerList.map(peer => peer.peerId)}
+    selfPeerId={peerRoom.getSelfId()}
   >
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
       {/* Existing room controls stay mounted here. */}
@@ -372,7 +389,7 @@ Keep the existing `RoomContext.Provider`, media controls, `ChatTranscript`, `Mes
 </RoomContext.Provider>
 ```
 
-The live `useRoom` currently exposes peer data through `ShellContext`; determine `selfPeerId` from the transport rather than assuming `userId`. If it is not currently exposed, add a narrow getter to `PeerRoom` or capture it from Trystero's room API.
+Election no longer needs `connectedPeerIds` as a prop — the sync hook reads `peerRoom.getPeers()` at leave time (transport truth; the shell `peerList` updates asynchronously and its ordering relative to the novella leave handler is not guaranteed).
 
 ## Accessibility and responsive requirements
 
@@ -382,5 +399,4 @@ The live `useRoom` currently exposes peer data through `ShellContext`; determine
 - Never render story text with `dangerouslySetInnerHTML`.
 - On narrow screens use tabs or a view switcher for Story/Chat/Participants, but keep microphone controls persistent.
 - Choices must not be obscured by bottom navigation or browser safe-area insets.
-- Restart needs a confirmation dialog; story switching warns that it creates a new session.
-
+- Restart needs a confirmation dialog; story switching warns that it creates a new session (and the sync layer supports it via cross-session snapshots — see 03).
