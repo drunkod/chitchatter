@@ -78,20 +78,22 @@ flowchart TD
     PublicRoute --> ThrottleA[Throttle rapid room remounts]
     PrivateRoute --> ThrottleB[Throttle rapid room remounts]
     ThrottleA --> RoomA[Room]
-    ThrottleB --> Fragment{Fragment parameters?}
-    Fragment -- secret --> Advanced{BrowserRouter advanced sharing?}
-    Advanced -- Yes --> Clear[Capture secret and clear fragment]
-    Advanced -- No --> Existing[Use parsed secret without clearing fragment]
-    Fragment -- legacy pwd --> Legacy[Encode pwd with room ID]
-    Fragment -- none --> Prompt[PasswordPrompt]
+    ThrottleB --> Parse[Parse fragment parameters]
+    Parse --> ClearDecision{Non-empty fragment and BrowserRouter advanced sharing?}
+    ClearDecision -- Yes --> Clear[Clear entire fragment from address bar]
+    ClearDecision -- No --> Keep[Keep address bar unchanged]
+    Clear --> Params{Parsed parameters?}
+    Keep --> Params
+    Params -- secret --> Existing[Use parsed secret]
+    Params -- legacy pwd --> Legacy[Encode pwd with room ID]
+    Params -- none --> Prompt[PasswordPrompt]
     Prompt --> Derive[Encode password with room ID]
-    Clear --> RoomB[Room with derived secret]
-    Existing --> RoomB
+    Existing --> RoomB[Room with derived secret]
     Legacy --> RoomB
     Derive --> RoomB
 ```
 
-Private-room secrets may arrive in the URL fragment. Fragment clearing is conditional on `allowAdvancedRoomLinkSharing`, which is enabled only with `BrowserRouter`; hash-routed builds do not use that advanced sharing behavior. The page also accepts a legacy `pwd` fragment parameter and encodes it with the room ID automatically. If neither `secret` nor legacy `pwd` supplies a usable secret, the UI prompts for a password and derives the room secret locally.
+Private-room parameters are parsed from the URL fragment first. If the fragment is non-empty and `allowAdvancedRoomLinkSharing` is enabled—which occurs only with `BrowserRouter`—the entire fragment is cleared before either `secret` or legacy `pwd` is processed. Hash-routed builds do not use that clearing behavior. A legacy `pwd` value is encoded with the room ID automatically. If neither parameter supplies a usable secret, the UI prompts for a password and derives the room secret locally.
 
 ## 4. Room UI composition
 
@@ -111,10 +113,10 @@ flowchart TD
     Controls -- Yes --> Video[Video controls]
     Controls -- Yes --> Screen[Screen-share controls]
     Controls -- Yes --> Files[File-upload controls]
-    Controls -- Yes --> Toggle[Message visibility control]
 
     Context --> Media{Any webcam or screen-share stream?}
     Media -- Yes --> Display[RoomVideoDisplay]
+    Media -- Yes --> Toggle[Message visibility control]
     Context --> Messages{Messages visible?}
     Messages -- Yes --> Transcript[ChatTranscript]
     Messages -- Yes --> Form[MessageForm]

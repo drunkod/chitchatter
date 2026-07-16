@@ -173,7 +173,8 @@ flowchart TD
     AudioHook --> AudioCapture[getUserMedia audio]
     AudioCapture --> AudioPeerRoom[PeerRoom.addStream]
     AudioHook --> AudioAction[Send audio state action]
-    AudioPeerRoom --> AudioRemote[Remote peers]
+    AudioPeerRoom --> AudioQueue[Delayed stream queue]
+    AudioQueue --> AudioRemote[Remote peers]
     AudioRemote --> AudioIncoming[onPeerStream audio]
     AudioIncoming --> AudioElement[Create autoplaying HTMLAudioElement]
     AudioElement --> AudioShell[ShellContext peerAudioChannels]
@@ -184,44 +185,55 @@ flowchart TD
 
 ## 7. Inline media and file transfer
 
-Inline media uses two coordinated channels: a peer action announces the magnet URI in the chat transcript, while `secure-file-transfer` handles the actual file offer and transfer.
+File selection creates a general file offer for the full `FileList`. If any selected files are inline-compatible images, audio, or video, it also creates a second offer for only that inline subset. The two offers have different peer-action metadata and receiving UI paths.
 
 ```mermaid
 sequenceDiagram
     participant User
     participant Controls as File upload controls
-    participant Hook as useRoom
+    participant Share as useRoomFileShare
+    participant Room as useRoom
     participant Transfer as FileTransferService
-    participant Message as Media-message action
-    participant Peer as Remote browser
-    participant Transcript as ChatTranscript
+    participant Actions as Peer actions
+    participant Remote as Remote browser
+    participant Preview as Remote InlineMedia
 
-    User->>Controls: Select inline-media files
-    Controls->>Hook: handleInlineMediaUpload
-    Hook->>Transfer: Offer files with room ID
-    Transfer-->>Hook: Magnet URI or offer ID
-    Hook->>Transcript: Add optimistic inline-media entry
-    Hook->>Message: Broadcast inline-media metadata
-    Message->>Peer: Author, magnet URI, ID, and time
-    Peer->>Transfer: Retrieve offered content
-    Hook->>Transcript: Mark local entry received
+    User->>Controls: Select files
+    Controls->>Share: handleFileShareStart with full FileList
+    Share->>Transfer: Offer all selected files
+    Transfer-->>Share: General magnet URI
+    Share->>Actions: Broadcast FILE_OFFER metadata
+    Actions->>Remote: General magnet URI and all-inline flag
+    Remote->>Remote: Expose general offer in peer/file-download UI
+
+    opt At least one inline-compatible file
+        Share->>Room: handleInlineMediaUpload with inline subset
+        Room->>Transfer: Offer inline subset again
+        Transfer-->>Room: Inline-preview magnet URI
+        Room->>Actions: Broadcast MEDIA_MESSAGE
+        Actions->>Remote: Author, inline magnet URI, ID, and time
+        Remote->>Preview: Render message and mount InlineMedia
+        Preview->>Transfer: Automatically download inline magnet URI
+        Transfer-->>Preview: Torrent files for inline rendering
+    end
 ```
 
-`FileTransferService` configures `secure-file-transfer` with the same tracker list and current RTC configuration used by the room's connectivity layer.
+The general `FILE_OFFER` advertises the complete selected set through peer/file-download state. The second `MEDIA_MESSAGE` advertises only the inline subset in the chat transcript. On the receiving side, mounting `InlineMedia` automatically invokes `fileTransfer.download`; no explicit user retrieval step is required for the inline preview. `FileTransferService` configures `secure-file-transfer` with the same tracker list and current RTC configuration used by the room's connectivity layer.
 
 ## 8. Private-room security flow
 
 ```mermaid
 flowchart TD
-    Route[Private room route] --> Fragment{Fragment parameters?}
-    Fragment -- secret --> Read[Read secret locally]
-    Read --> Advanced{BrowserRouter advanced sharing?}
-    Advanced -- Yes --> Clear[Remove fragment from visible address bar]
-    Advanced -- No --> Secret[Keep parsed secret]
-    Clear --> Secret
-    Fragment -- legacy pwd --> Legacy[Encode pwd with room ID]
+    Route[Private room route] --> Parse[Parse fragment parameters]
+    Parse --> Advanced{Non-empty fragment and BrowserRouter advanced sharing?}
+    Advanced -- Yes --> Clear[Remove entire fragment from visible address bar]
+    Advanced -- No --> Keep[Keep address bar unchanged]
+    Clear --> Params{Parsed parameters?}
+    Keep --> Params
+    Params -- secret --> Secret[Use parsed secret]
+    Params -- legacy pwd --> Legacy[Encode pwd with room ID]
     Legacy --> Secret
-    Fragment -- none --> Prompt[Prompt for password]
+    Params -- none --> Prompt[Prompt for password]
     Prompt --> Encode[Encode password with room ID]
     Encode --> Secret
     Secret --> RoomConfig[Use secret as room password]
@@ -235,7 +247,7 @@ flowchart TD
 
 The user's key pair is created in the browser. Each peer supplies an asserted user ID, its public key, and a signature produced by the corresponding private key over the room/user string. A successful check proves possession of that private key and detects inconsistency or tampering in the signed metadata. It does **not** authenticate a real-world identity or prove that the asserted user ID belongs to a previously known person: this flow has no certificate authority, pinned key, trust-on-first-use record, or out-of-band fingerprint comparison. The implementation's `VERIFIED` and `UNVERIFIED` labels should therefore be understood as cryptographic consistency states, not identity trust decisions.
 
-Fragment clearing is also conditional: `allowAdvancedRoomLinkSharing` is enabled only for `BrowserRouter`. A legacy `pwd` fragment parameter is accepted and encoded with the room ID automatically.
+Fragment parameters are parsed before clearing. If advanced sharing is enabled for `BrowserRouter`, every non-empty fragment is then removed from the visible address bar before the parsed `secret` or legacy `pwd` branch is processed. A legacy `pwd` value is encoded with the room ID automatically.
 
 ## 9. Embedded SDK configuration
 
@@ -247,12 +259,13 @@ sequenceDiagram
     participant Settings as SettingsContext
 
     Frame->>Bootstrap: Start with query parameters
-    alt getSdkConfig is present
-        Bootstrap->>Host: CONFIG_REQUESTED postMessage
-        Host-->>Bootstrap: Initial configuration payload
-        Bootstrap->>Bootstrap: Merge host configuration
-    else getSdkConfig is absent
-        Bootstrap->>Bootstrap: Skip initial request handshake
+    alt getSdkConfig is present and parentDomain is a valid URL
+        Bootstrap->>Bootstrap: Decode parentDomain and derive trusted origin
+        Bootstrap->>Host: CONFIG_REQUESTED to trusted origin
+        Host-->>Bootstrap: CONFIG from matching origin
+        Bootstrap->>Bootstrap: Validate origin and event shape, then merge payload
+    else getSdkConfig is absent or parentDomain is invalid
+        Bootstrap->>Bootstrap: Skip or fail initial request and continue with local settings
     end
     Bootstrap->>Settings: Publish effective settings
     alt embed is present
@@ -265,7 +278,7 @@ sequenceDiagram
     end
 ```
 
-`getSdkConfig` and `embed` are independent flags. `getSdkConfig` alone triggers the initial `CONFIG_REQUESTED` handshake. `embed` suppresses persistence and enables the listener for subsequent configuration messages. Merely embedding the iframe does not initiate the request handshake unless `getSdkConfig` is also present.
+`getSdkConfig` and `embed` are independent flags. `getSdkConfig` selects the initial handshake path, but a present, valid `parentDomain` is also required: it supplies the target origin for `postMessage` and the trusted origin used to validate replies. Incoming configuration is accepted only when `parentDomain` can be resolved, `event.origin` matches it, and the event has the expected configuration shape. `embed` suppresses persistence and enables the listener for subsequent configuration messages; those messages are subject to the same origin and shape validation. Merely embedding the iframe does not initiate the request handshake unless `getSdkConfig` is present and `parentDomain` is valid.
 
 ## Source anchors
 
