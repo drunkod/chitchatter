@@ -78,14 +78,20 @@ flowchart TD
     PublicRoute --> ThrottleA[Throttle rapid room remounts]
     PrivateRoute --> ThrottleB[Throttle rapid room remounts]
     ThrottleA --> RoomA[Room]
-    ThrottleB --> Secret{Secret available?}
-    Secret -- No --> Prompt[PasswordPrompt]
+    ThrottleB --> Fragment{Fragment parameters?}
+    Fragment -- secret --> Advanced{BrowserRouter advanced sharing?}
+    Advanced -- Yes --> Clear[Capture secret and clear fragment]
+    Advanced -- No --> Existing[Use parsed secret without clearing fragment]
+    Fragment -- legacy pwd --> Legacy[Encode pwd with room ID]
+    Fragment -- none --> Prompt[PasswordPrompt]
     Prompt --> Derive[Encode password with room ID]
-    Derive --> RoomB[Room with derived secret]
-    Secret -- Yes --> RoomB
+    Clear --> RoomB[Room with derived secret]
+    Existing --> RoomB
+    Legacy --> RoomB
+    Derive --> RoomB
 ```
 
-Private-room secrets may arrive in the URL fragment. The page removes the secret from the visible address bar before mounting the room. If no secret is available, it prompts for a password and derives the room secret locally.
+Private-room secrets may arrive in the URL fragment. Fragment clearing is conditional on `allowAdvancedRoomLinkSharing`, which is enabled only with `BrowserRouter`; hash-routed builds do not use that advanced sharing behavior. The page also accepts a legacy `pwd` fragment parameter and encodes it with the room ID automatically. If neither `secret` nor legacy `pwd` supplies a usable secret, the UI prompts for a password and derives the room secret locally.
 
 ## 4. Room UI composition
 
@@ -107,7 +113,7 @@ flowchart TD
     Controls -- Yes --> Files[File-upload controls]
     Controls -- Yes --> Toggle[Message visibility control]
 
-    Context --> Media{Any local or peer media stream?}
+    Context --> Media{Any webcam or screen-share stream?}
     Media -- Yes --> Display[RoomVideoDisplay]
     Context --> Messages{Messages visible?}
     Messages -- Yes --> Transcript[ChatTranscript]
@@ -115,7 +121,7 @@ flowchart TD
     Messages -- Yes --> Typing[TypingStatusBar]
 ```
 
-Direct-message rooms suppress the group-room media control strip. The message and stream state still comes from the same room orchestration layer, but actions use a direct-message namespace and target a specific peer.
+Direct-message rooms suppress the group-room media control strip. Webcam and screen-share streams are stored in `RoomContext` and determine whether `RoomVideoDisplay` appears. Microphone audio follows a separate path: incoming streams become autoplaying `HTMLAudioElement` instances stored in `ShellContext.peerAudioChannels`, where the peer and volume UI can manage them. Direct-message actions use a separate namespace and target a specific peer.
 
 ## 5. Responsive room layout
 
@@ -131,7 +137,7 @@ flowchart TD
     Both -- No --> Full[Visible panel uses full height]
 ```
 
-When no media streams exist, messages are forced visible so the room cannot become an empty screen.
+When no webcam or screen-share streams exist, messages are forced visible so the room cannot become an empty screen. Microphone-only audio does not cause `RoomVideoDisplay` to appear.
 
 ## Source anchors
 

@@ -55,14 +55,15 @@ flowchart TD
     Shell --> ShellContext[ShellContext]
     ShellContext --> ShellState[Navigation, alerts, title, fullscreen]
     ShellContext --> PeerState[Peer list and connection state]
-    ShellContext --> MediaState[Local audio, video, and screen state]
+    ShellContext --> MediaState[Local media control state]
+    ShellContext --> PeerAudio[Peer HTMLAudioElements and volume state]
     ShellContext --> MessageState[Group and direct-message logs]
     ShellContext --> PeerRoomRef[Shared PeerRoom reference]
 
     ShellContext --> RoutePage[Current route page]
     RoutePage --> Room[Room]
     Room --> RoomContext[RoomContext]
-    RoomContext --> Streams[Local and remote media streams]
+    RoomContext --> VisualStreams[Local and remote webcam and screen streams]
     RoomContext --> FileOffers[File offers and FileTransferService]
     RoomContext --> RoomView[Room controls, video display, and chat]
 ```
@@ -141,32 +142,45 @@ sequenceDiagram
     Peer-->>Action: Incoming message
     Action-->>Hook: Receive message and peer context
     Hook->>Hook: Sound or notification when appropriate
-    Hook->>Shell: Append received message and clear typing state
+    Hook->>Shell: Append message and clear group-typing flag
     Shell-->>UI: Render updated transcript
 ```
 
 The shell stores separate group and per-peer direct-message logs. Transcript size is bounded; evicted inline-media offers are rescinded when still active.
 
+The receive handler currently clears only `isTypingGroupMessage`, even for the direct-message namespace. It does not clear `isTypingDirectMessage`. This diagram documents that current behavior; it should not be interpreted as namespace-aware typing cleanup.
+
 ## 6. Audio, video, and screen-share flow
 
 ```mermaid
 flowchart TD
-    Control[Room media control] --> FeatureHook[Audio, video, or screen-share hook]
-    FeatureHook --> Device[Browser media capture API]
-    Device --> LocalStream[Local MediaStream]
-    LocalStream --> RoomContext[Store local stream]
-    FeatureHook --> Metadata[Send peer action state]
-    FeatureHook --> PeerRoom[PeerRoom.addStream]
-    PeerRoom --> Queue[Delayed stream queue]
-    Queue --> Trystero[Trystero addStream]
-    Trystero --> Remote[Remote peers]
-    Remote --> Incoming[onPeerStream]
-    Incoming --> FeatureHook
-    FeatureHook --> RoomContext
-    RoomContext --> Display[RoomVideoDisplay or audio playback]
+    Control[Room media control] --> Kind{Media kind}
+
+    Kind -- Webcam or screen --> VisualHook[Video or screen-share hook]
+    VisualHook --> VisualCapture[Browser media capture API]
+    VisualCapture --> VisualLocal[Local MediaStream]
+    VisualLocal --> VisualContext[RoomContext visual streams]
+    VisualHook --> VisualAction[Send video or screen state action]
+    VisualHook --> VisualPeerRoom[PeerRoom.addStream]
+    VisualPeerRoom --> VisualQueue[Delayed stream queue]
+    VisualQueue --> VisualRemote[Remote peers]
+    VisualRemote --> VisualIncoming[onPeerStream]
+    VisualIncoming --> VisualHook
+    VisualHook --> VisualContext
+    VisualContext --> Display[RoomVideoDisplay]
+
+    Kind -- Microphone --> AudioHook[useRoomAudio]
+    AudioHook --> AudioCapture[getUserMedia audio]
+    AudioCapture --> AudioPeerRoom[PeerRoom.addStream]
+    AudioHook --> AudioAction[Send audio state action]
+    AudioPeerRoom --> AudioRemote[Remote peers]
+    AudioRemote --> AudioIncoming[onPeerStream audio]
+    AudioIncoming --> AudioElement[Create autoplaying HTMLAudioElement]
+    AudioElement --> AudioShell[ShellContext peerAudioChannels]
+    AudioShell --> AudioUI[Playback and volume UI]
 ```
 
-`PeerRoom` serializes stream additions with a delay. This prevents stream and metadata races on receiving peers. The room displays video whenever a local or remote video/screen stream exists.
+`PeerRoom` serializes all stream additions with a delay. This prevents stream and metadata races on receiving peers. Webcam and screen-share streams pass through `RoomContext` and control `RoomVideoDisplay`. Incoming microphone streams do not enter `RoomContext`; `useRoomAudio` converts them directly to autoplaying `HTMLAudioElement` instances and stores them in `ShellContext.peerAudioChannels`.
 
 ## 7. Inline media and file transfer
 
@@ -199,23 +213,29 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Route[Private room route] --> Fragment{Secret in URL fragment?}
-    Fragment -- Yes --> Capture[Read secret locally]
-    Capture --> Clear[Remove secret from visible address bar]
-    Fragment -- No --> Prompt[Prompt for password]
-    Prompt --> Encode[Encode password with room ID]
-    Encode --> Secret[Derived room secret]
+    Route[Private room route] --> Fragment{Fragment parameters?}
+    Fragment -- secret --> Read[Read secret locally]
+    Read --> Advanced{BrowserRouter advanced sharing?}
+    Advanced -- Yes --> Clear[Remove fragment from visible address bar]
+    Advanced -- No --> Secret[Keep parsed secret]
     Clear --> Secret
+    Fragment -- legacy pwd --> Legacy[Encode pwd with room ID]
+    Legacy --> Secret
+    Fragment -- none --> Prompt[Prompt for password]
+    Prompt --> Encode[Encode password with room ID]
+    Encode --> Secret
     Secret --> RoomConfig[Use secret as room password]
     RoomConfig --> Join[Join P2P room]
 
-    Join --> Identity[Sign room ID plus user ID with private key]
-    Identity --> Metadata[Send public key and signature]
-    Metadata --> Verify[Peers verify signature]
-    Verify --> State[Mark peer verified or unverified]
+    Join --> Proof[Sign room ID plus asserted user ID]
+    Proof --> Metadata[Send asserted user ID, public key, and signature]
+    Metadata --> Verify[Verify self-signed metadata and private-key possession]
+    Verify --> State[Record cryptographic consistency result]
 ```
 
-The user's key pair is created in the browser. Peer metadata includes a public key and a signature over the room/user identity string, allowing recipients to classify peer identity as verified or unverified. The application still depends on WebRTC/Trystero for transport; there is no central service storing conversation history.
+The user's key pair is created in the browser. Each peer supplies an asserted user ID, its public key, and a signature produced by the corresponding private key over the room/user string. A successful check proves possession of that private key and detects inconsistency or tampering in the signed metadata. It does **not** authenticate a real-world identity or prove that the asserted user ID belongs to a previously known person: this flow has no certificate authority, pinned key, trust-on-first-use record, or out-of-band fingerprint comparison. The implementation's `VERIFIED` and `UNVERIFIED` labels should therefore be understood as cryptographic consistency states, not identity trust decisions.
+
+Fragment clearing is also conditional: `allowAdvancedRoomLinkSharing` is enabled only for `BrowserRouter`. A legacy `pwd` fragment parameter is accepted and encoded with the room ID automatically.
 
 ## 9. Embedded SDK configuration
 
@@ -226,16 +246,26 @@ sequenceDiagram
     participant Bootstrap
     participant Settings as SettingsContext
 
-    Frame->>Bootstrap: Start with embedded query parameters
-    Bootstrap->>Host: CONFIG_REQUESTED postMessage
-    Host-->>Bootstrap: Configuration payload
-    Bootstrap->>Bootstrap: Merge initial, persisted, and host settings
+    Frame->>Bootstrap: Start with query parameters
+    alt getSdkConfig is present
+        Bootstrap->>Host: CONFIG_REQUESTED postMessage
+        Host-->>Bootstrap: Initial configuration payload
+        Bootstrap->>Bootstrap: Merge host configuration
+    else getSdkConfig is absent
+        Bootstrap->>Bootstrap: Skip initial request handshake
+    end
     Bootstrap->>Settings: Publish effective settings
-    Host-->>Bootstrap: Later configuration message
-    Bootstrap->>Settings: Update in-memory settings
+    alt embed is present
+        Bootstrap->>Bootstrap: Do not persist settings
+        Host-->>Bootstrap: Later configuration message
+        Bootstrap->>Settings: Apply in-memory override
+    else embed is absent
+        Bootstrap->>Bootstrap: Persist settings normally
+        Bootstrap->>Bootstrap: Do not install embedded update listener
+    end
 ```
 
-Embedded overrides are kept in memory rather than persisted to IndexedDB.
+`getSdkConfig` and `embed` are independent flags. `getSdkConfig` alone triggers the initial `CONFIG_REQUESTED` handshake. `embed` suppresses persistence and enables the listener for subsequent configuration messages. Merely embedding the iframe does not initiate the request handshake unless `getSdkConfig` is also present.
 
 ## Source anchors
 
