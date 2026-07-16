@@ -1,124 +1,121 @@
-# 10 — Election rounds: local freezing, joint convergence
+# 10 — Controller migration and supersession
 
-> **Revision 6 changes:** two review fixes. (1) **Round IDs are bounded digests** (`deriveRoundId`, 01) — the concatenated pipe-joined form failed `isId`'s charset and length, so multi-peer election traffic was rejected by the validator feeding this very protocol; the payload carries the raw round fields and the validator verifies the digest **binds** them (03). (2) **Frozen membership is acknowledged as a local observation, not an agreement.** Honest replicas can freeze *different* rounds (they saw different membership when the leave fired), and Revision 5's exact-`roundId` matching would deadlock them on mutual `wrong-round`. Acceptance is now based on the announcement's own **internally consistent fields plus self-relevant conditions**, with a **total supersession order across announcements** — divergent views converge instead of rejecting each other. Per the threat model (00): safety unconditional, convergence under eventual stability.
+> **Revision 7 changes:** preserves the original departed-controller identity after the first announcement, makes supersession total over the complete adopted state, and reuses the shared reconciliation comparator.
 
-## Round identity
+## Local election round
 
-```ts
-const electionRoundId = (
-  sessionEpoch: number,
-  departedControllerPeerId: string,
-  electorate: string[] // canonical: sorted unique, departed excluded
-) => deriveRoundId(
-  `${sessionEpoch}:${departedControllerPeerId}:${electorate.join(',')}`)
-```
-
-Bounded (17 chars), `isId`-clean, synchronous (01). Collision resistance is not load-bearing: `CONTROLLER_CHANGED` carries the raw fields, receivers compare them exactly, and the structural validator recomputes the digest to verify the binding (03) — the ID is a dedup/bookkeeping key, the fields are the authority.
-
-`ElectionRound` (02) freezes this replica's **local view** at open: `roundId`, `sessionEpoch`, `departedControllerPeerId`, canonical `electorate` (`[selfId, ...getPeers()]` minus departed, sorted unique), `winnerPeerId`, `openedAt`, `advertised`, `applied`.
-
-## What freezing does and does not claim
-
-Freezing prevents this replica's electorate from drifting while its round is open — the Revision 5 join-mid-round divergence stays fixed. It does **not** make the electorate agreed across replicas: B may freeze `{B, C}` (winner B) while C, having transiently lost sight of B, freezes `{C}` (winner C). Both are honest. The protocol therefore never requires an announcement to match the local round exactly; the local round governs only **this replica's own behavior** (whether to advertise, whether to announce), while **acceptance** is announcement-scoped:
-
-## Opening, restarting, deferring (local behavior)
-
-- **Open** on the transport leave of the current controller; freeze the local view.
-- **Another electorate member leaves mid-round** → restart locally: recompute, re-derive `roundId`, re-freeze, re-advertise.
-- **A join mid-round** → deferred: no change to the frozen local view; the joiner bootstraps after the round closes.
-- **Close** after `electionRoundMs` (plus the supersession window past the first applied announcement); `electionRoundRef.current = null`.
-
-## Advertisement and adoption (at the local winner)
-
-```text
-non-winners → local round's winner: ELECTION_ADVERTISE(roundId, truncated state)
-winner: collect for electionRoundMs; discard wrong-roundId, wrong-epoch, or
-        semantically invalid entries
-winner: adopted = chooseElectionState([own, ...advertised])
-        // (sessionEpoch DESC, revision DESC, controllerPeerId ASC) — a stale
-        // pre-switch session can never win regardless of revision (08)
-winner: next = engine.changeController(adopted, selfId)
-winner → all: CONTROLLER_CHANGED(roundId, departed, electorate, selfId,
-              toSnapshotState(next))
-```
-
-Advertisements still use exact local-round matching — they only feed the local winner's adoption choice, so divergent views merely mean a candidate is missing from one winner's set, which the supersession order repairs. *(Advertisement provenance: crash-fault concession, 00.)*
-
-## Announcement acceptance (replica side) — internally consistent + self-relevant
+Each peer opens a local round when its current controller leaves:
 
 ```ts
-authorizeControllerChange(
-  envelope: VisualNovelActionEnvelope,
-  current: VisualNovelSessionState,
-  transportPeerId: string,
-  selfPeerId: string,
-  connectedTransportPeerIds: string[],
-  lastApplied: ElectionRound['applied'], // survives local round restarts
-): { ok: true } | { ok: false; reason: string } {
-  const payload = envelope.payload as VisualNovelPayloadByAction['CONTROLLER_CHANGED']
-  // Structural (03) already guaranteed: controllerPeerId === state.controllerPeerId
-  // === sender; electorate canonical (sorted, unique, departed excluded);
-  // roundId digest binds the supplied fields; envelope/state consistency.
+const electorate = [...new Set([selfId, ...transport.getPeers()])]
+  .filter(id => id !== departedControllerPeerId)
+  .sort()
 
-  // INTERNAL consistency: the announcer must be the winner of ITS OWN
-  // canonical electorate. We do not require it to equal OUR electorate —
-  // honest views differ; convergence comes from supersession below.
-  if (payload.controllerPeerId !== this.electController(payload.electorate)) {
-    return { ok: false, reason: 'not-winner-of-own-electorate' }
-  }
-  if (payload.controllerPeerId !== transportPeerId) {
-    return { ok: false, reason: 'sender-mismatch' }
-  }
+const roundId = deriveRoundId(
+  `${state.sessionEpoch}:${departedControllerPeerId}:${electorate.join(',')}`
+)
+```
 
-  // SELF-RELEVANT conditions: this announcement must be about MY controller's
-  // departure, and that peer must actually be gone from MY transport view.
-  if (payload.departedControllerPeerId !== current.controllerPeerId) {
-    return { ok: false, reason: 'wrong-departure' }
-  }
-  if (connectedTransportPeerIds.includes(payload.departedControllerPeerId)) {
-    return { ok: false, reason: 'departed-still-connected' }
-  }
+The local round controls advertisement collection only. It is not assumed to be a globally agreed membership certificate.
 
-  // Epoch-aware adoption order: never regress across (epoch, revision).
-  const s = payload.state
-  const notBehind =
-    s.sessionEpoch > current.sessionEpoch ||
-    (s.sessionEpoch === current.sessionEpoch && s.revision >= current.revision)
-  if (!notBehind) return { ok: false, reason: 'adopted-state-regresses' }
+## Durable migration record
 
-  // TOTAL supersession order ACROSS announcements (not per-roundId): epoch,
-  // then revision, then lower winner ID. Every replica that eventually sees
-  // both of two competing announcements picks the same one — this is what
-  // converges B's {B,C} round and C's {C} round instead of mutual wrong-round.
-  if (lastApplied) {
-    const better =
-      s.sessionEpoch > lastApplied.sessionEpoch ||
-      (s.sessionEpoch === lastApplied.sessionEpoch && (
-        s.revision > lastApplied.revision ||
-        (s.revision === lastApplied.revision &&
-          payload.controllerPeerId < lastApplied.controllerPeerId)))
-    if (!better) return { ok: false, reason: 'superseded' }
-  }
-  return { ok: true }
+The first accepted announcement must not erase the departure that authorizes later supersession:
+
+```ts
+interface MigrationRecord {
+  sessionEpoch: number
+  departedControllerPeerId: string
+  openedAt: number
+  closesAt: number
+  lastAppliedState: VisualNovelSessionState | null
 }
 ```
 
-Application (12) installs `payload.state` atomically, records `lastApplied` (kept for the supersession window even across local round restarts), and commits.
+Open it on the leave event. If a peer missed the leave event, it may create the record from an internally consistent announcement only when:
 
-### The divergent-views scenario, replayed
+- `payload.departedControllerPeerId === current.controllerPeerId`;
+- the departed peer is absent from its transport view;
+- the state epoch is not older.
 
-- B freezes `{B, C}`, expects B; C freezes `{C}`, expects C. Both announce.
-- B receives C's announcement: internally consistent (C = min of `{C}`), self-relevant (same departed controller, absent). B compares against its applied announcement (its own): equal epoch/revision → lower winner ID wins. If `B < C`, B keeps its own and C's is `superseded`; if `C < B`, B adopts C's.
-- C receives B's announcement: same comparison, same total order, same outcome.
-- Both replicas — and every bystander that sees both — converge on the identical winner without any join/leave event forcing a common round. During the window before both announcements propagate, each population follows its own applied announcement; that transient disagreement is exactly the liveness-under-stability concession of the threat model (00), and it self-resolves on delivery.
+After applying the first announcement, authorization continues to compare against `migration.departedControllerPeerId`, not the newly installed `current.controllerPeerId`.
 
-Note `not-in-electorate` is deliberately **not** a rejection reason: B not appearing in C's `{C}` view means C's observation was degraded, not dishonest. The self-relevant checks (my departed controller, actually absent) plus the total order carry convergence.
+## Advertisement and announcement
 
-## Tests for this step
+```text
+remaining peers → local winner: ELECTION_ADVERTISE(local round, own state)
+local winner: choose best state, change controller, broadcast CONTROLLER_CHANGED
+```
 
-- **Round ID validity:** every generated `roundId` passes `isId` for electorates of 1–64 members (property test); the Revision 5 pipe-joined form is demonstrably rejected by `isId` (regression documentation test).
-- **Digest binding:** an announcement whose `roundId` does not match its own fields is rejected structurally (03); tampering with the electorate after derivation is caught.
-- **Divergent-views convergence (the reviewer scenario):** B freezes `{B,C}`, C freezes `{C}`, both announce — every delivery order converges all replicas on the same winner; no `wrong-round` deadlock; no join/leave needed.
-- **Epoch resurrection blocked:** post-switch lagging `S1@20` advertisement loses at the winner (wrong epoch) and at the gate; no replica re-installs S1 — including after a full-room reload (persisted `latestEpoch`, 08/15).
-- Frozen-local behavior: join mid-round defers (no acceptance split — acceptance no longer depends on the local electorate); member leave restarts the local round; winner crash → restarted round announces with new fields and supersedes by the total order.
-- Non-winner-of-own-electorate, sender mismatch, wrong departure, departed-still-connected, adopted-state regression, post-application supersession (equal state → lower winner ID), replayed announcement = duplicate, missed-leave replica converges (self-relevant checks pass without any local round).
+The announcement includes canonical electorate fields and a digest-bound `roundId`. The announced controller must be the minimum ID in that electorate and the transport sender.
+
+## Authorization
+
+```ts
+authorizeControllerChange(
+  payload: VisualNovelPayloadByAction['CONTROLLER_CHANGED'],
+  current: VisualNovelSessionState,
+  contextPeerId: string,
+  connectedPeers: string[],
+  migration: MigrationRecord | null,
+  now: number,
+): boolean {
+  if (payload.controllerPeerId !== contextPeerId) return false
+  if (payload.controllerPeerId !== electController(payload.electorate)) return false
+  if (connectedPeers.includes(payload.departedControllerPeerId)) return false
+
+  const active = migration && now <= migration.closesAt ? migration : null
+  if (active) {
+    if (payload.departedControllerPeerId !== active.departedControllerPeerId) return false
+    if (payload.state.sessionEpoch !== active.sessionEpoch) return false
+  } else {
+    if (payload.departedControllerPeerId !== current.controllerPeerId) return false
+  }
+
+  if (payload.state.sessionEpoch < current.sessionEpoch) return false
+
+  const baseline = active?.lastAppliedState ?? current
+  return compareSessionPriority(payload.state, baseline) > 0 ||
+    stableStateString(payload.state) === stableStateString(baseline)
+}
+```
+
+Equal normalized state is an idempotent no-op. A genuinely different state must strictly win the shared comparator.
+
+## Applying and superseding
+
+```ts
+const applyControllerChange = async (envelope, context) => {
+  const incoming = envelope.payload.state
+  const record = ensureMigrationRecord(envelope.payload, stateRef.current)
+  if (!authorizeControllerChange(/* ... */)) return
+
+  if (stableStateString(incoming) !== stableStateString(stateRef.current!)) {
+    setPhase('reconciling')
+    clearCheckpointIfSessionChanged(stateRef.current!, incoming)
+    setState(incoming)
+  }
+  record.lastAppliedState = incoming
+  record.closesAt = now() + visualNovelLimits.migrationSupersessionMs
+  sync.commit(envelope)
+}
+```
+
+`lastAppliedState` survives local round restarts and the first controller replacement until the supersession window closes.
+
+## Divergent local views
+
+B may announce from `{B,C}` while C announces from `{C}`. Both are internally consistent. Once both announcements are delivered, every peer compares the complete adopted states using the same total comparator. The lower-ID winner is only one tie-break; differing session IDs or state content cannot remain arrival-order-dependent.
+
+## Interaction with start conflicts
+
+If migration occurs while populations hold different same-epoch sessions, announcements carry those complete states. The shared comparator chooses one. Losing peers show reconciliation and replace atomically. This is the same availability-with-rollback behavior documented in 00/09.
+
+## Tests
+
+- second announcement remains authorized after the first controller is installed;
+- two equal epoch/revision/controller announcements with different session or content converge deterministically;
+- local electorate disagreement does not cause `wrong-round` deadlock;
+- departed peer still connected is rejected;
+- announcement fields and digest binding are normalized and checked;
+- migration record expires only after the supersession window and is not overwritten by unrelated join/leave events.

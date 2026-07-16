@@ -1,313 +1,188 @@
-# 03 — Runtime structural validation (normalizing)
+# 03 — Runtime structural validation and normalization
 
-> **Revision 6 changes:** `START_COMMITTED` validates `coordinatorPeerId === senderPeerId`; new `SESSION_END_ACK` payload; `CONTROLLER_CHANGED.electorate` must be **canonical** — sorted, unique, non-empty, and excluding the departed peer — closing the duplicate-entry gap; round IDs are bounded digests (01) that pass `isId` (the Revision 5 concatenated form violated both the charset and the length limit of the very validator it fed). Normalization guarantees stand.
+> **Revision 7 changes:** validates the new start-gossip and reconciliation actions, binds start decisions to deterministic IDs, normalizes persisted room metadata, and removes every trust-on-cast path.
 
-Structural validation proves shape, bounds, and internal consistency, and yields a clean copy. It does **not** prove story-semantic consistency (04) or sender authority (08). All gates run before any state mutation (order in 12).
+## Validation order
 
-## Primitives
+1. Reject values that are not bounded records.
+2. Enforce `maxEnvelopeBytes` before deep traversal.
+3. Validate primitive fields and action type.
+4. Validate and normalize the action payload.
+5. Cross-check envelope scope against embedded state.
+6. Return a fresh envelope; drop unknown properties and the reserved MVP `proof`.
+
+The existing `isId`, `isEpoch`, `isRevision`, `utf8Bytes`, `validateVariables`, `validateHistory`, `validateSessionState`, and semantic-validation boundaries remain.
+
+## Start decision validation
 
 ```ts
-import {
-  allowedVisualNovelAssetExtensions,
-  visualNovelLimits,
-  visualNovelProtocolVersion,
-} from 'config/visualNovel'
-import type {
-  VisualNovelActionEnvelope, VisualNovelActionType, VisualNovelHistoryEntry,
-  VisualNovelSessionState, VisualNovelValue,
-} from 'models/visualNovel'
+const validateStartDecision = (
+  input: unknown
+): ValidationResult<StartDecisionRecord> => {
+  if (!isRecord(input)) return fail('Start decision must be an object')
+  if (!isId(input.decisionId) ||
+      !isId(input.coordinatorPeerId) ||
+      !isId(input.originActionId)) {
+    return fail('Invalid start decision identifiers')
+  }
 
-export type ValidationResult<T> =
-  | { ok: true; value: T }
-  | { ok: false; errors: string[] }
+  const state = validateSessionState(input.state)
+  if (!state.ok) return state
+  if (state.value.revision !== 0) return fail('Start decision state must be revision 0')
 
-const fail = <T>(...errors: string[]): ValidationResult<T> => ({ ok: false, errors })
+  const expectedId = deriveRoundId([
+    'start',
+    state.value.sessionEpoch,
+    input.coordinatorPeerId,
+    input.originActionId,
+    state.value.controllerPeerId,
+    state.value.sessionId,
+  ].join(':'))
+  if (input.decisionId !== expectedId) {
+    return fail('Start decision ID does not bind its fields')
+  }
 
-const actionTypes = new Set<VisualNovelActionType>([
-  'START_PROPOSE', 'START_COMMITTED',
-  'STATE_REQUEST', 'STATE_SNAPSHOT', 'ADVANCE_REQUEST', 'ADVANCED',
-  'CHOICE_REQUEST', 'CHOICE_RESOLVED', 'SESSION_STARTED', 'SESSION_ENDED',
-  'SESSION_END_ACK', 'ELECTION_ADVERTISE', 'CONTROL_REQUEST', 'CONTROL_PASSED',
-  'CONTROLLER_CHANGED', 'RESTART_REQUEST', 'RESTARTED', 'ERROR',
-])
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value)
-
-const isString = (value: unknown, max = visualNovelLimits.maxTextLength) =>
-  typeof value === 'string' && value.length > 0 && value.length <= max
-
-const isId = (value: unknown): value is string =>
-  isString(value, visualNovelLimits.maxIdLength) &&
-  /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value as string)
-
-const isRevision = (value: unknown): value is number =>
-  Number.isSafeInteger(value) && Number(value) >= 0
-
-const isEpoch = (value: unknown): value is number =>
-  Number.isSafeInteger(value) && Number(value) >= 1
-
-const isValue = (value: unknown): value is VisualNovelValue =>
-  (typeof value === 'string' &&
-    value.length <= visualNovelLimits.maxVariableValueLength) ||
-  typeof value === 'boolean' ||
-  (typeof value === 'number' && Number.isFinite(value))
-
-// Single size gate. Never throws — cyclic input is simply "oversized".
-export const utf8Bytes = (value: unknown): number => {
-  try {
-    return new TextEncoder().encode(JSON.stringify(value)).byteLength
-  } catch {
-    return Number.POSITIVE_INFINITY
+  return {
+    ok: true,
+    value: {
+      decisionId: input.decisionId,
+      coordinatorPeerId: input.coordinatorPeerId,
+      originActionId: input.originActionId,
+      state: state.value,
+    },
   }
 }
 ```
 
-## Collections (fresh objects + aggregate byte budgets)
+## New payload cases
 
 ```ts
-export const validateVariables = (
-  input: unknown
-): ValidationResult<Record<string, VisualNovelValue>> => {
-  if (!isRecord(input)) return fail('Variables must be an object')
-  const entries = Object.entries(input)
-  if (entries.length > visualNovelLimits.maxVariables) return fail('Too many variables')
-  const fresh: Record<string, VisualNovelValue> = {}
-  for (const [key, value] of entries) {
-    if (!isId(key) || !isValue(value)) {
-      return fail(`Invalid variable: ${String(key).slice(0, 32)}`)
-    }
-    fresh[key] = value as VisualNovelValue
-  }
-  if (utf8Bytes(fresh) > visualNovelLimits.maxVariablesBytes) {
-    return fail('Variables too large')
-  }
-  return { ok: true, value: fresh }
+case 'START_PROPOSE': {
+  if (!isId(payload.proposalId)) return fail('Invalid proposalId')
+  const candidate = validateSessionState(payload.candidate)
+  if (!candidate.ok) return candidate
+  if (candidate.value.revision !== 0) return fail('Start candidate must be revision 0')
+  return { ok: true, value: { proposalId: payload.proposalId, candidate: candidate.value } }
 }
 
-const validateHistoryEntry = (
-  input: unknown
-): ValidationResult<VisualNovelHistoryEntry> => {
-  if (!isRecord(input)) return fail('History entry must be an object')
-  if (!isRevision(input.revision) || !isId(input.sceneId) ||
-      !isId(input.dialogueEntryId) ||
-      (input.choiceId !== undefined && !isId(input.choiceId))) {
-    return fail('Invalid history entry')
+case 'START_COMMITTED': {
+  const decision = validateStartDecision(payload.decision)
+  if (!decision.ok) return decision
+  if (decision.value.coordinatorPeerId !== senderPeerId) {
+    return fail('Start commit sender/coordinator mismatch')
+  }
+  return { ok: true, value: { decision: decision.value } }
+}
+
+case 'START_DECISION_GOSSIP': {
+  const decision = validateStartDecision(payload.decision)
+  if (!decision.ok) return decision
+  const knownState = validateSessionState(payload.knownState)
+  if (!knownState.ok) return knownState
+  if (knownState.value.sessionEpoch !== decision.value.state.sessionEpoch ||
+      knownState.value.sessionId !== decision.value.state.sessionId) {
+    return fail('Gossip state does not belong to the decision')
   }
   return {
     ok: true,
-    value: {
-      revision: input.revision as number,
-      sceneId: input.sceneId as string,
-      dialogueEntryId: input.dialogueEntryId as string,
-      ...(input.choiceId !== undefined ? { choiceId: input.choiceId as string } : {}),
-    },
+    value: { decision: decision.value, knownState: knownState.value },
   }
 }
 
-export const validateHistory = (
-  input: unknown
-): ValidationResult<VisualNovelHistoryEntry[]> => {
-  if (!Array.isArray(input) ||
-      input.length > visualNovelLimits.maxSnapshotHistoryEntries) {
-    return fail('Invalid history')
+case 'SESSION_RECONCILE': {
+  if (payload.reason !== 'start-conflict' &&
+      payload.reason !== 'migration-conflict') return fail('Invalid reconcile reason')
+  const state = validateSessionState(payload.state)
+  return state.ok
+    ? { ok: true, value: { reason: payload.reason, state: state.value } }
+    : state
+}
+
+case 'SESSION_END_ACK':
+  return isId(payload.endActionId)
+    ? { ok: true, value: { endActionId: payload.endActionId } }
+    : fail('Invalid end acknowledgement')
+```
+
+## Election payloads
+
+`CONTROLLER_CHANGED.electorate` must be non-empty, sorted, unique, bounded to 64, contain valid IDs, and exclude the departed peer. Recompute:
+
+```ts
+const expectedRoundId = deriveRoundId(
+  `${state.sessionEpoch}:${departedControllerPeerId}:${electorate.join(',')}`
+)
+```
+
+Require `controllerPeerId === state.controllerPeerId === senderPeerId` and `controllerPeerId === electController(electorate)`.
+
+## Envelope scope checks
+
+- `START_PROPOSE`, `START_COMMITTED`, and `START_DECISION_GOSSIP` use bootstrap outer scope and outer revision 0.
+- For `START_PROPOSE`, embedded controller equals sender.
+- For `START_COMMITTED`, embedded coordinator equals sender.
+- Gossip and reconciliation outer sender is only the forwarder; do not require it to equal the state controller.
+- Every other state-carrying action must match envelope session/story/version/revision.
+
+## `RoomMeta` validator
+
+```ts
+export const validateRoomMeta = (input: unknown): ValidationResult<RoomMeta> => {
+  if (utf8Bytes(input) > visualNovelLimits.maxRoomMetaBytes) {
+    return fail('Room metadata is too large')
   }
-  const fresh: VisualNovelHistoryEntry[] = []
-  for (const entry of input) {
-    const validated = validateHistoryEntry(entry)
+  if (!isRecord(input) || input.version !== 1 || !isRevision(input.highWaterEpoch)) {
+    return fail('Invalid room metadata')
+  }
+  if (!Array.isArray(input.endedSessions) ||
+      input.endedSessions.length > visualNovelLimits.maxPersistedTombstones) {
+    return fail('Invalid persisted tombstones')
+  }
+
+  const endedSessions: PersistedEndNotice[] = []
+  const seen = new Set<string>()
+  for (const item of input.endedSessions) {
+    if (!isRecord(item) || !isId(item.sessionId) || !isEpoch(item.epoch)) {
+      return fail('Invalid persisted tombstone')
+    }
+    const end = validateEnvelope(item.endEnvelope)
+    if (!end.ok || end.value.actionType !== 'SESSION_ENDED' ||
+        end.value.sessionId !== item.sessionId) {
+      return fail('Invalid retained end notice')
+    }
+    if (seen.has(item.sessionId)) return fail('Duplicate persisted tombstone')
+    seen.add(item.sessionId)
+    endedSessions.push({
+      sessionId: item.sessionId,
+      epoch: item.epoch,
+      endEnvelope: end.value as EnvelopeFor<'SESSION_ENDED'>,
+    })
+  }
+
+  let activeStartDecision: StartDecisionRecord | null = null
+  if (input.activeStartDecision !== null) {
+    const validated = validateStartDecision(input.activeStartDecision)
     if (!validated.ok) return validated
-    fresh.push(validated.value)
+    activeStartDecision = validated.value
   }
-  if (utf8Bytes(fresh) > visualNovelLimits.maxHistoryBytes) {
-    return fail('History too large')
-  }
-  return { ok: true, value: fresh }
-}
-```
-
-## Session state
-
-```ts
-export const validateSessionState = (
-  input: unknown
-): ValidationResult<VisualNovelSessionState> => {
-  if (!isRecord(input)) return fail('State must be an object')
-  if (utf8Bytes(input) > visualNovelLimits.maxSnapshotBytes) {
-    return fail('Snapshot is too large')
-  }
-  const errors: string[] = []
-  if (input.protocolVersion !== visualNovelProtocolVersion) {
-    errors.push('Unsupported state protocol')
-  }
-  for (const key of ['storyId', 'storyVersion', 'sessionId', 'sceneId',
-    'dialogueEntryId', 'controllerPeerId'] as const) {
-    if (!isId(input[key])) errors.push(`Invalid state.${key}`)
-  }
-  if (!isEpoch(input.sessionEpoch)) errors.push('Invalid state.sessionEpoch')
-  if (!isRevision(input.revision)) errors.push('Invalid state.revision')
-  if (typeof input.updatedAt !== 'number' || !Number.isFinite(input.updatedAt)) {
-    errors.push('Invalid state.updatedAt')
-  }
-  const variables = validateVariables(input.variables)
-  if (!variables.ok) errors.push(...variables.errors)
-  const history = validateHistory(input.history)
-  if (!history.ok) errors.push(...history.errors)
-  if (errors.length) return { ok: false, errors }
 
   return {
     ok: true,
     value: {
-      protocolVersion: visualNovelProtocolVersion,
-      storyId: input.storyId as string,
-      storyVersion: input.storyVersion as string,
-      sessionId: input.sessionId as string,
-      sessionEpoch: input.sessionEpoch as number,
-      sceneId: input.sceneId as string,
-      dialogueEntryId: input.dialogueEntryId as string,
-      variables: (variables as { ok: true; value: Record<string, VisualNovelValue> }).value,
-      history: (history as { ok: true; value: VisualNovelHistoryEntry[] }).value,
-      controllerPeerId: input.controllerPeerId as string,
-      revision: input.revision as number,
-      updatedAt: input.updatedAt as number,
+      version: 1,
+      highWaterEpoch: input.highWaterEpoch,
+      endedSessions,
+      activeStartDecision,
     },
   }
 }
-
-export const toSnapshotState = (
-  state: VisualNovelSessionState
-): VisualNovelSessionState => {
-  let history = state.history.slice(-visualNovelLimits.maxSnapshotHistoryEntries)
-  while (history.length > 0 &&
-         utf8Bytes(history) > visualNovelLimits.maxHistoryBytes) {
-    history = history.slice(1)
-  }
-  return { ...state, history }
-}
 ```
 
-## Payloads (normalized values per action)
+Corrupt metadata does not silently become empty metadata while the network receiver is active. The bootstrap UI surfaces the problem and requires reset or retry before novella writes are enabled.
 
-New/changed cases only; the Revision 4 cases (`STATE_REQUEST`, `STATE_SNAPSHOT`, `ADVANCE_REQUEST`, `ADVANCED`, `CHOICE_REQUEST`, `CHOICE_RESOLVED`, `SESSION_STARTED`, `RESTARTED`, `SESSION_ENDED`, `CONTROL_*`, `ELECTION_ADVERTISE` — the latter now also validating `roundId`, `ERROR`) are unchanged in structure and all return normalized values:
+## Required tests
 
-```ts
-    case 'START_PROPOSE': {
-      if (!isId(payload.roundId)) return fail('Invalid roundId')
-      const candidate = validateSessionState(payload.candidate)
-      if (!candidate.ok) return candidate
-      if (candidate.value.revision !== 0) return fail('Start candidate must be revision 0')
-      return { ok: true, value: { roundId: payload.roundId, candidate: candidate.value } }
-    }
-
-    case 'START_COMMITTED': {
-      if (!isId(payload.roundId) || !isId(payload.coordinatorPeerId)) {
-        return fail('Invalid start commit')
-      }
-      const state = validateSessionState(payload.state)
-      if (!state.ok) return state
-      if (state.value.revision !== 0) return fail('Start state must be revision 0')
-      return {
-        ok: true,
-        value: {
-          roundId: payload.roundId,
-          coordinatorPeerId: payload.coordinatorPeerId,
-          state: state.value,
-        },
-      }
-    }
-
-    case 'SESSION_END_ACK':
-      return isId(payload.endActionId)
-        ? { ok: true, value: { endActionId: payload.endActionId } }
-        : fail('Invalid end ack')
-
-    case 'ELECTION_ADVERTISE': {
-      if (!isId(payload.roundId)) return fail('Invalid roundId')
-      const state = validateSessionState(payload.state)
-      return state.ok
-        ? { ok: true, value: { roundId: payload.roundId, state: state.value } }
-        : state
-    }
-
-    case 'CONTROLLER_CHANGED': {
-      if (!isId(payload.roundId) ||
-          !isId(payload.departedControllerPeerId) ||
-          !isId(payload.controllerPeerId)) return fail('Invalid controller change')
-      // Canonical electorate: sorted, unique, bounded, valid IDs, and the
-      // departed peer excluded. Duplicate or unsorted entries would let two
-      // "different" electorates describe one membership and break the
-      // roundId binding below.
-      const electorate = payload.electorate
-      if (!Array.isArray(electorate) ||
-          electorate.length === 0 ||
-          electorate.length > 64 ||
-          !electorate.every(isId) ||
-          new Set(electorate).size !== electorate.length ||
-          [...electorate].sort().some((id, i) => id !== electorate[i]) ||
-          electorate.includes(payload.departedControllerPeerId as string)) {
-        return fail('Invalid electorate')
-      }
-      const state = validateSessionState(payload.state)
-      if (!state.ok) return state
-      if (state.value.controllerPeerId !== payload.controllerPeerId) {
-        return fail('Controller change state/controller mismatch')
-      }
-      // roundId must be DERIVED from the supplied fields — the digest binding
-      // is what makes the raw fields authoritative (01/10).
-      const expected = deriveRoundId(
-        `${state.value.sessionEpoch}:${payload.departedControllerPeerId}:${(electorate as string[]).join(',')}`)
-      if (payload.roundId !== expected) return fail('roundId does not bind round fields')
-      return {
-        ok: true,
-        value: {
-          roundId: payload.roundId,
-          departedControllerPeerId: payload.departedControllerPeerId,
-          electorate: [...(electorate as string[])],
-          controllerPeerId: payload.controllerPeerId,
-          state: state.value,
-        },
-      }
-    }
-```
-
-## Envelope (rebuilt field by field)
-
-Identical structure to Revision 4 — rebuild from validated parts, never cast — with these cross-check updates:
-
-```ts
-const stateCarryingActions = new Set<VisualNovelActionType>([
-  'START_PROPOSE', 'START_COMMITTED', 'STATE_SNAPSHOT', 'SESSION_STARTED',
-  'RESTARTED', 'ELECTION_ADVERTISE', 'CONTROLLER_CHANGED',
-])
-
-// Cross-checks (embedded = payload.state ?? payload.candidate):
-// - envelope.sessionId/storyId/storyVersion/revision === embedded.* for every
-//   state-carrying action EXCEPT the two start actions, whose envelopes use
-//   the bootstrap scope (no session exists yet) while embedded.revision must
-//   be 0 and envelope.revision must be 0.
-// - SESSION_STARTED: embedded.controllerPeerId === senderPeerId. (Its epoch
-//   rule — exactly current + 1 — is authorization, not structure: 08/09.)
-// - START_PROPOSE: candidate.controllerPeerId === senderPeerId.
-// - START_COMMITTED: coordinatorPeerId === senderPeerId — sender
-//   authorization is structural, so it applies at null-state peers too (09).
-// - CONTROLLER_CHANGED: state.controllerPeerId === senderPeerId; roundId
-//   digest binding verified in validatePayload above.
-// - `proof` is dropped during normalization (reserved, 00).
-```
-
-`SESSION_STARTED` no longer requires revision 0 structurally — fresh starts moved to `START_COMMITTED`; `SESSION_STARTED` is now exclusively the controller story-switch (09), which starts the new session at revision 0 **and** epoch `current + 1`, both checked by the matrix (08).
-
-## Message-context identity check
-
-Unchanged: after validation, `senderPeerId !== messageContext.peerId` → drop, warn without logging secrets or payloads.
-
-## Tests for this step
-
-Revision 4 set (round-trip normalization incl. nested aliasing, cyclic input, aggregate byte budgets with worst-case encodings, cross-field mismatches, malformed collection elements, bootstrap scope, identity mismatch) plus:
-
-- `sessionEpoch` missing / 0 / negative / non-integer rejected in every state-carrying payload.
-- `START_PROPOSE` with candidate revision ≠ 0, candidate controller ≠ sender, or bad `roundId` rejected; `START_COMMITTED` with state revision ≠ 0 or **`coordinatorPeerId` ≠ sender** rejected.
-- Start-action envelopes must use bootstrap scope with envelope revision 0.
-- `CONTROLLER_CHANGED` with missing/empty/oversized/**duplicate-entry/unsorted/departed-including** `electorate`, bad or **non-binding `roundId`** (digest ≠ derived from the supplied fields), or state/controller/sender mismatch rejected; electorate array in the normalized value is a fresh copy.
-- `deriveRoundId` output passes `isId` for arbitrary inputs (property test); a 64-member electorate yields a 17-character ID, never a multi-kilobyte pipe-joined string.
-- `SESSION_END_ACK` with a malformed `endActionId` rejected.
-- `ELECTION_ADVERTISE` without `roundId` rejected.
+- Every validator returns fresh nested objects.
+- A holder can forward a start decision without failing sender/context identity, because only the outer envelope sender is checked against transport context.
+- Decision ID tampering, gossip-state mismatch, invalid reconciliation reason, and malformed retained notices are rejected.
+- Metadata normalization restores retained envelopes and honors the configured tombstone bound.
