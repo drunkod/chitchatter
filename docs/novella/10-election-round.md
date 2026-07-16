@@ -1,48 +1,50 @@
-# 10 — Election rounds: frozen electorate, epoch-aware adoption
+# 10 — Election rounds: local freezing, joint convergence
 
-> **New step in Revision 5.** Two Revision 4 defects are fixed here. First, `chooseElectionState` ordered by bare revision, so after a story switch a lagging peer's `S1@rev20` advertisement beat every `S2@rev0` — the election could atomically restore an obsolete session. Adoption now orders by **`(sessionEpoch, revision)`**, and rounds are scoped to one epoch. Second, the electorate and winner were recomputed from live `getPeers()` at every authorization, so a lower-ID peer joining mid-round made subsets of replicas accept different announcements. Rounds now **freeze** `roundId`, electorate, and winner at open; membership changes deterministically restart the round; joins are deferred.
+> **Revision 6 changes:** two review fixes. (1) **Round IDs are bounded digests** (`deriveRoundId`, 01) — the concatenated pipe-joined form failed `isId`'s charset and length, so multi-peer election traffic was rejected by the validator feeding this very protocol; the payload carries the raw round fields and the validator verifies the digest **binds** them (03). (2) **Frozen membership is acknowledged as a local observation, not an agreement.** Honest replicas can freeze *different* rounds (they saw different membership when the leave fired), and Revision 5's exact-`roundId` matching would deadlock them on mutual `wrong-round`. Acceptance is now based on the announcement's own **internally consistent fields plus self-relevant conditions**, with a **total supersession order across announcements** — divergent views converge instead of rejecting each other. Per the threat model (00): safety unconditional, convergence under eventual stability.
 
 ## Round identity
 
 ```ts
-// Deterministic: replicas that observed the same departure and membership
-// agree on the round without extra messages.
 const electionRoundId = (
   sessionEpoch: number,
   departedControllerPeerId: string,
-  electorate: string[]
-) => `${sessionEpoch}:${departedControllerPeerId}:${[...electorate].sort().join('|')}`
+  electorate: string[] // canonical: sorted unique, departed excluded
+) => deriveRoundId(
+  `${sessionEpoch}:${departedControllerPeerId}:${electorate.join(',')}`)
 ```
 
-`ElectionRound` (02) freezes at open: `roundId`, `sessionEpoch` (of the session being migrated), `departedControllerPeerId`, `electorate` (`[selfId, ...getPeers()]` at the leave event, departed excluded), `winnerPeerId` (`electController(electorate)`), `openedAt`, `advertised`, `applied`.
+Bounded (17 chars), `isId`-clean, synchronous (01). Collision resistance is not load-bearing: `CONTROLLER_CHANGED` carries the raw fields, receivers compare them exactly, and the structural validator recomputes the digest to verify the binding (03) — the ID is a dedup/bookkeeping key, the fields are the authority.
 
-## Opening, restarting, deferring
+`ElectionRound` (02) freezes this replica's **local view** at open: `roundId`, `sessionEpoch`, `departedControllerPeerId`, canonical `electorate` (`[selfId, ...getPeers()]` minus departed, sorted unique), `winnerPeerId`, `openedAt`, `advertised`, `applied`.
 
-- **Open** on the transport leave of the current controller. All conformant replicas see the same leave against the same session epoch and freeze identical rounds.
-- **Another peer leaves mid-round** (including the frozen winner): restart deterministically — recompute the electorate from the transport, derive the new `roundId`, re-freeze, re-advertise. Both events are observed by every remaining replica, so restarts stay symmetric.
-- **A peer joins mid-round**: **deferred** — the join does not change the frozen electorate or winner. The joiner is not in the electorate, cannot be the winner, and cannot vote; it bootstraps normally after the round closes (its bootstrap `STATE_REQUEST` is answered by the new controller). This removes the "lower-ID joiner splits acceptance" divergence entirely.
-- **Close** after `electionRoundMs` past `openedAt` (plus applied-announcement supersession window); `electionRoundRef.current = null`.
+## What freezing does and does not claim
 
-## Advertisement and adoption
+Freezing prevents this replica's electorate from drifting while its round is open — the Revision 5 join-mid-round divergence stays fixed. It does **not** make the electorate agreed across replicas: B may freeze `{B, C}` (winner B) while C, having transiently lost sight of B, freezes `{C}` (winner C). Both are honest. The protocol therefore never requires an announcement to match the local round exactly; the local round governs only **this replica's own behavior** (whether to advertise, whether to announce), while **acceptance** is announcement-scoped:
+
+## Opening, restarting, deferring (local behavior)
+
+- **Open** on the transport leave of the current controller; freeze the local view.
+- **Another electorate member leaves mid-round** → restart locally: recompute, re-derive `roundId`, re-freeze, re-advertise.
+- **A join mid-round** → deferred: no change to the frozen local view; the joiner bootstraps after the round closes.
+- **Close** after `electionRoundMs` (plus the supersession window past the first applied announcement); `electionRoundRef.current = null`.
+
+## Advertisement and adoption (at the local winner)
 
 ```text
-non-winners → frozen winner: ELECTION_ADVERTISE(roundId, own truncated state)
-winner: collect for electionRoundMs; discard entries failing semantic
-        validation (04), wrong roundId, or epoch ≠ round.sessionEpoch
+non-winners → local round's winner: ELECTION_ADVERTISE(roundId, truncated state)
+winner: collect for electionRoundMs; discard wrong-roundId, wrong-epoch, or
+        semantically invalid entries
 winner: adopted = chooseElectionState([own, ...advertised])
-        // orders by (sessionEpoch DESC, revision DESC, controllerPeerId ASC)
+        // (sessionEpoch DESC, revision DESC, controllerPeerId ASC) — a stale
+        // pre-switch session can never win regardless of revision (08)
 winner: next = engine.changeController(adopted, selfId)
 winner → all: CONTROLLER_CHANGED(roundId, departed, electorate, selfId,
               toSnapshotState(next))
 ```
 
-The epoch scope is what prevents resurrection: a lagging peer still holding `S1@epoch1rev20` after a switch to `S2@epoch2` either (a) has its advertisement dropped at the winner (epoch ≠ round epoch), or (b) never gets that far — the pre-dispatch gate (08) already drops embedded states below `latestEpoch`. The obsolete session cannot win regardless of its revision.
+Advertisements still use exact local-round matching — they only feed the local winner's adoption choice, so divergent views merely mean a candidate is missing from one winner's set, which the supersession order repairs. *(Advertisement provenance: crash-fault concession, 00.)*
 
-*(Advertisement provenance remains a crash-fault concession — 00.)*
-
-## Announcement authorization (replica side)
-
-Replaces Revision 4's `authorizeControllerChange`; add to the sync service:
+## Announcement acceptance (replica side) — internally consistent + self-relevant
 
 ```ts
 authorizeControllerChange(
@@ -51,38 +53,27 @@ authorizeControllerChange(
   transportPeerId: string,
   selfPeerId: string,
   connectedTransportPeerIds: string[],
-  round: ElectionRound | null,
-  now: number
+  lastApplied: ElectionRound['applied'], // survives local round restarts
 ): { ok: true } | { ok: false; reason: string } {
   const payload = envelope.payload as VisualNovelPayloadByAction['CONTROLLER_CHANGED']
-  // Validator (03) guaranteed: controllerPeerId === state.controllerPeerId
-  // === senderPeerId; electorate well-formed; envelope/state consistency.
+  // Structural (03) already guaranteed: controllerPeerId === state.controllerPeerId
+  // === sender; electorate canonical (sorted, unique, departed excluded);
+  // roundId digest binds the supplied fields; envelope/state consistency.
+
+  // INTERNAL consistency: the announcer must be the winner of ITS OWN
+  // canonical electorate. We do not require it to equal OUR electorate —
+  // honest views differ; convergence comes from supersession below.
+  if (payload.controllerPeerId !== this.electController(payload.electorate)) {
+    return { ok: false, reason: 'not-winner-of-own-electorate' }
+  }
   if (payload.controllerPeerId !== transportPeerId) {
     return { ok: false, reason: 'sender-mismatch' }
   }
 
-  // Frozen-round matching. If this replica has an open round, identities
-  // must match exactly. If it has none (missed the leave event), it may
-  // implicitly open the announced round — provided the departed peer is its
-  // recorded controller, it is itself in the announced electorate, and the
-  // winner claim is consistent with that electorate.
-  const openRound = round && now - round.openedAt <= visualNovelLimits.electionRoundMs
-    ? round : null
-  if (openRound) {
-    if (payload.roundId !== openRound.roundId) return { ok: false, reason: 'wrong-round' }
-    if (payload.controllerPeerId !== openRound.winnerPeerId) {
-      return { ok: false, reason: 'not-frozen-winner' }
-    }
-  } else {
-    if (payload.departedControllerPeerId !== current.controllerPeerId) {
-      return { ok: false, reason: 'wrong-round' }
-    }
-    if (!payload.electorate.includes(selfPeerId)) {
-      return { ok: false, reason: 'not-in-electorate' }
-    }
-    if (payload.controllerPeerId !== this.electController(payload.electorate)) {
-      return { ok: false, reason: 'not-elected-winner' }
-    }
+  // SELF-RELEVANT conditions: this announcement must be about MY controller's
+  // departure, and that peer must actually be gone from MY transport view.
+  if (payload.departedControllerPeerId !== current.controllerPeerId) {
+    return { ok: false, reason: 'wrong-departure' }
   }
   if (connectedTransportPeerIds.includes(payload.departedControllerPeerId)) {
     return { ok: false, reason: 'departed-still-connected' }
@@ -95,30 +86,39 @@ authorizeControllerChange(
     (s.sessionEpoch === current.sessionEpoch && s.revision >= current.revision)
   if (!notBehind) return { ok: false, reason: 'adopted-state-regresses' }
 
-  // Round-scoped supersession after a first application.
-  if (openRound?.applied) {
-    const a = openRound.applied
+  // TOTAL supersession order ACROSS announcements (not per-roundId): epoch,
+  // then revision, then lower winner ID. Every replica that eventually sees
+  // both of two competing announcements picks the same one — this is what
+  // converges B's {B,C} round and C's {C} round instead of mutual wrong-round.
+  if (lastApplied) {
     const better =
-      s.sessionEpoch > a.sessionEpoch ||
-      (s.sessionEpoch === a.sessionEpoch && (
-        s.revision > a.revision ||
-        (s.revision === a.revision &&
-          payload.controllerPeerId < a.controllerPeerId)))
+      s.sessionEpoch > lastApplied.sessionEpoch ||
+      (s.sessionEpoch === lastApplied.sessionEpoch && (
+        s.revision > lastApplied.revision ||
+        (s.revision === lastApplied.revision &&
+          payload.controllerPeerId < lastApplied.controllerPeerId)))
     if (!better) return { ok: false, reason: 'superseded' }
   }
   return { ok: true }
 }
 ```
 
-Application (12) installs `payload.state` atomically — controller and content together — records `round.applied`, and keeps the round open for supersession until `electionRoundMs` elapses.
+Application (12) installs `payload.state` atomically, records `lastApplied` (kept for the supersession window even across local round restarts), and commits.
 
-## Restart-vs-announcement races
+### The divergent-views scenario, replayed
 
-A restart (second leave) changes the frozen `roundId` at every replica that saw both leaves. An announcement from the *previous* round then fails `wrong-round` uniformly. The restarted round's winner re-announces with the new identity. A replica that saw only one of the two leaves converges through the implicit-open branch (its recorded controller and electorate membership still determine acceptance) or, in the worst case, through gap recovery targeting the announcer — the adopted-state ordering guarantees no regression either way.
+- B freezes `{B, C}`, expects B; C freezes `{C}`, expects C. Both announce.
+- B receives C's announcement: internally consistent (C = min of `{C}`), self-relevant (same departed controller, absent). B compares against its applied announcement (its own): equal epoch/revision → lower winner ID wins. If `B < C`, B keeps its own and C's is `superseded`; if `C < B`, B adopts C's.
+- C receives B's announcement: same comparison, same total order, same outcome.
+- Both replicas — and every bystander that sees both — converge on the identical winner without any join/leave event forcing a common round. During the window before both announcements propagate, each population follows its own applied announcement; that transient disagreement is exactly the liveness-under-stability concession of the threat model (00), and it self-resolves on delivery.
+
+Note `not-in-electorate` is deliberately **not** a rejection reason: B not appearing in C's `{C}` view means C's observation was degraded, not dishonest. The self-relevant checks (my departed controller, actually absent) plus the total order carry convergence.
 
 ## Tests for this step
 
-- **Epoch resurrection blocked:** switch S1→S2, lag one peer at S1@20, disconnect the controller — the winner adopts an S2 state; the S1@20 advertisement is discarded (wrong epoch at the winner *and* stale at the gate); no replica ever re-installs S1.
-- **Frozen winner under join:** open a round with electorate {B, C} (winner B); connect new peer A (lower ID) mid-round; B's announcement is accepted by every replica — none recompute A as winner; A bootstraps after the round.
-- **Mid-round leave restarts:** electorate {B, C, D}, C leaves during the round → new roundId with {B, D}; the old round's announcement is `wrong-round` everywhere; the restarted round converges.
-- Winner-crash restart; non-winner announcement rejected (`not-frozen-winner` / `not-elected-winner`); departed-still-connected rejected; adopted-state regression rejected; post-application supersession within one round (higher revision, then lower winner ID) converges replicas that applied in different orders; replica that missed the leave converges via implicit open; announcement replay is a duplicate.
+- **Round ID validity:** every generated `roundId` passes `isId` for electorates of 1–64 members (property test); the Revision 5 pipe-joined form is demonstrably rejected by `isId` (regression documentation test).
+- **Digest binding:** an announcement whose `roundId` does not match its own fields is rejected structurally (03); tampering with the electorate after derivation is caught.
+- **Divergent-views convergence (the reviewer scenario):** B freezes `{B,C}`, C freezes `{C}`, both announce — every delivery order converges all replicas on the same winner; no `wrong-round` deadlock; no join/leave needed.
+- **Epoch resurrection blocked:** post-switch lagging `S1@20` advertisement loses at the winner (wrong epoch) and at the gate; no replica re-installs S1 — including after a full-room reload (persisted `latestEpoch`, 08/15).
+- Frozen-local behavior: join mid-round defers (no acceptance split — acceptance no longer depends on the local electorate); member leave restarts the local round; winner crash → restarted round announces with new fields and supersedes by the total order.
+- Non-winner-of-own-electorate, sender mismatch, wrong departure, departed-still-connected, adopted-state regression, post-application supersession (equal state → lower winner ID), replayed announcement = duplicate, missed-leave replica converges (self-relevant checks pass without any local round).

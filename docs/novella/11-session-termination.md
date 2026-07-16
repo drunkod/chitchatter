@@ -1,14 +1,14 @@
 # 11 — Session termination and participation
 
-> **New step in Revision 5.** The generic send-failure rule (apply locally → retry → snapshot repair) cannot repair `SESSION_ENDED`: ending clears the very state a repair snapshot would need, other peers continue the session, and the former controller remains connected — so no transport departure ever triggers an election. The fix is a **pending-termination record**: the controller keeps state and authority until the end envelope has disseminated, answering interim requests with the same persisted end envelope. Participant leave/rejoin moves into a **sync-owned mutable ref** so a snapshot arriving during the rejoin send cannot be discarded by a stale React closure.
+> **Revision 6 changes:** termination is now a **round with acknowledgements**. Revision 5 finalized when the broadcast promise resolved — "send resolved" is not "everyone applied," so partial delivery could leave one population in the lobby and another playing on, with the finalized ex-controller stateless-but-connected and no election possible. The fix: a **frozen recipient set**, `SESSION_END_ACK` per recipient, finalization only when the set is exhausted (acked or departed), and the completed **end notice retained past finalization** inside the persistent tombstone (`RoomMeta`, 15) — resolving Revision 5's self-contradiction where `finalizeTermination` cleared the very envelope later text promised to replay to stale peers. Participation-ref rejoin fix carries over unchanged.
 
-## Termination protocol (controller side)
+## Termination round (controller side)
 
 ```ts
-// PendingTermination (02): { sessionId, sessionEpoch, envelope }
-// where envelope is EnvelopeFor<'SESSION_ENDED'> at revision current + 1,
-// created ONCE — retries resend the same actionId so replicas that already
-// applied it treat resends as duplicates.
+// PendingTermination (02):
+//   { sessionId, sessionEpoch, envelope, recipients: Set, acked: Set }
+// envelope created ONCE at revision current + 1 — every resend carries the
+// same actionId, so replicas that already applied treat resends as duplicates.
 
 const endSession = async () => {
   const current = stateRef.current
@@ -21,88 +21,104 @@ const endSession = async () => {
     sessionId: current.sessionId,
     sessionEpoch: current.sessionEpoch,
     envelope,
+    recipients: new Set(transport.getPeers()), // FROZEN recipient set
+    acked: new Set(),
   }
-  // NOTE: state is NOT cleared, the session is NOT tombstoned locally, and
-  // controller authority is retained until the send succeeds.
+  // State NOT cleared; session NOT tombstoned locally; authority RETAINED.
   await disseminateTermination()
 }
 
 const disseminateTermination = async () => {
   const pending = pendingTerminationRef.current
   if (!pending) return
+  const unacked = [...pending.recipients].filter(id => !pending.acked.has(id))
+  if (unacked.length === 0) return finalizeTermination()
   try {
-    await sendRef.current?.(pending.envelope) // broadcast
-    finalizeTermination()                     // only on success
+    await sendRef.current?.(pending.envelope, { target: unacked })
   } catch {
     surfaceSyncWarning('Ending the story has not reached everyone yet')
-    scheduleTerminationRetry() // backoff retry; also retried from handleRequest
   }
+  // Re-check after terminationAckTimeoutMs; acks and departures also
+  // re-evaluate completion immediately (below).
+  scheduleTerminationCycle()
+}
+
+// Receipt of SESSION_END_ACK (targeted; matrix row, 08):
+const handleSessionEndAck = (envelope, context) => {
+  const pending = pendingTerminationRef.current
+  if (!pending) return // no round pending — ignore, do not commit
+  if ((envelope.payload as { endActionId: string }).endActionId !==
+      pending.envelope.actionId) return
+  pending.acked.add(context.peerId)
+  sync.commit(envelope)
+  maybeFinalize()
+}
+
+// Transport departures shrink the frozen set — a peer that left no longer
+// needs to ack (it will be caught by the retained notice if it returns):
+const onPeerLeaveDuringTermination = (peerId: string) => {
+  pendingTerminationRef.current?.recipients.delete(peerId)
+  maybeFinalize()
+}
+
+const maybeFinalize = () => {
+  const pending = pendingTerminationRef.current
+  if (!pending) return
+  const outstanding = [...pending.recipients].filter(id => !pending.acked.has(id))
+  if (outstanding.length === 0) finalizeTermination()
 }
 
 const finalizeTermination = () => {
   const pending = pendingTerminationRef.current
   if (!pending) return
   pendingTerminationRef.current = null
-  sync.tombstone(pending.sessionId, pending.sessionEpoch)
+  // The retained notice OUTLIVES finalization: it is stored inside the
+  // persistent tombstone and replayed to stale/reconnecting peers.
+  sync.tombstone(pending.sessionId, pending.sessionEpoch, pending.envelope) // (08)
   sync.commit(pending.envelope)
   setState(null)
   onSessionEnded(pending.sessionId) // clears checkpoint + latest pointer (15)
 }
 ```
 
+**Completion rule:** the round finalizes when every member of the frozen recipient set has acked **or left the transport**. This is the "all-current-members" rule — no quorum arithmetic, matching the room's cooperative model. It terminates under eventual stability (00): each remaining recipient eventually acks (targeted resends every `terminationAckTimeoutMs`) or departs.
+
 ### While termination is pending
 
-- **Authority is retained.** The controller still owns the session; it has not vanished, so no election can start, and no replica is stranded mid-session.
-- **Progression is refused.** `handleRequest` answers `ADVANCE_REQUEST` / `CHOICE_REQUEST` / `RESTART_REQUEST` for the ending session with a **targeted resend of the pending end envelope** (same `actionId`), not with a transition — the matrix row "no pending termination" (08). This doubles as a per-request retry channel: every request from a peer that has not yet seen the end gives the controller another delivery attempt.
-- **`STATE_REQUEST` gets the end envelope too**, so late joiners learn the session is over instead of receiving a snapshot of a dying session.
-- **The controller may not start or switch** while a termination is pending (`canStartStory` is false, 13).
-- If the controller itself disconnects while pending, remaining replicas that already applied the end are in the lobby; replicas that did not will open an election round (10), and the elected winner inherits a live session — acceptable under the crash-fault model, and the winner's own `endSession` can finish the job.
+- **Authority retained; state retained.** No election can start (the controller is present); no replica is stranded mid-session.
+- **Progression refused:** advance/choice/restart requests for the ending session are answered with a **targeted resend of the pending end envelope** — each such request is another delivery attempt to exactly the peer that provably missed it.
+- **`STATE_REQUEST` gets the end envelope**, not a snapshot of a dying session.
+- **No start/switch:** `canStartStory` false; `switchSession` refused (13).
+- **Controller crash mid-round:** replicas that applied the end are in the lobby with a persisted tombstone; replicas that missed it elect a winner (10) that inherits the live session and can run its own termination round. Transient split, self-resolving — consistent with the threat model's liveness scoping (00).
 
 ### Replica side
 
-`SESSION_ENDED` reuses the progression rules (controller-only, same session, exactly `revision + 1` — 08). On apply: `sync.tombstone(sessionId, epoch)` → `setState(null)` → `onSessionEnded(sessionId)` → `commit`. A delayed old end for a restarted session fails the revision rule; late traffic for the ended session dies at the pre-dispatch gate; resends are duplicates.
-
-### Answering `STATE_REQUEST` for a tombstoned session
-
-The gate's single exception (08): a `STATE_REQUEST` whose scope is a tombstoned session (or from a peer whose bootstrap arrives after the end) is answered by **any peer that has the persisted end envelope** — in practice the former controller keeps `PendingTermination.envelope` around until finalized, and replicas simply don't answer (the requester's own gate will drop stale session traffic, and its lobby state is correct once no controller responds with a snapshot).
-
-## Participation — sync-owned ref
-
-The Revision 4 rejoin flow (`setParticipation(...); await sync.rejoinSession()`) raced React's render commit: the receive callback could still close over `left-current-session` while the rejoin snapshot arrived, discarding it. Participation is now a **mutable ref owned by the sync hook**, updated synchronously before any send; React state only mirrors it for rendering.
+`SESSION_ENDED` reuses the progression rules (controller-only, same session, exactly `revision + 1` — 08). On apply: `sync.tombstone(sessionId, epoch, envelope)` (persisted, notice retained) → **send `SESSION_END_ACK { endActionId }` targeted at the sender** → `setState(null)` → `onSessionEnded(sessionId)` → commit. Resends are duplicates — but the ack is resent for a duplicate end envelope too, since a resend means the controller has not recorded our ack:
 
 ```ts
-// Inside useVisualNovelSync:
-const participationRef = useRef<VisualNovelParticipation>({ kind: 'joined' })
-
-const leaveSession = () => {
-  const current = stateRef.current
-  if (!current) return
-  participationRef.current = {
-    kind: 'left-current-session', sessionId: current.sessionId,
-  }
-  onParticipationChange(participationRef.current) // mirrors to React state
-}
-
-const rejoinSession = async () => {
-  participationRef.current = { kind: 'joined' } // SYNCHRONOUS — before send
-  onParticipationChange(participationRef.current)
-  await requestBootstrapSnapshot() // records outstandingRequestIdRef
-}
-
-// In the receive path (12), the guard reads the REF, never React state:
-if (participationRef.current.kind === 'left-current-session' &&
-    envelope.sessionId === participationRef.current.sessionId) {
+// In the pre-dispatch duplicate path (12), the ONE narrow duplicate
+// exception: a duplicate SESSION_ENDED still triggers a (re-)ack.
+if (sync.isDuplicate(envelope.actionId)) {
+  if (envelope.actionType === 'SESSION_ENDED') void resendEndAck(envelope, context)
   return
 }
 ```
 
-A snapshot delivered synchronously during the `rejoinSession` send now sees `joined` and is applied. Leave remains durable: the ref survives every incoming envelope, and only an explicit `rejoinSession` (or a *new* session installed via `START_COMMITTED`/switch — leaving applies per session) resets it.
+### Stale and reconnecting peers
+
+Any peer holding the persistent tombstone answers a `STATE_REQUEST` for the ended session — or same-session progression traffic from a peer that clearly missed the end — with the **retained end notice** (`sync.getRetainedEndNotice(sessionId)`, 08). Because the notice lives in `RoomMeta`, this works after finalization *and after a full reload of every peer* — the Revision 5 contradiction (cleared ref vs. promised replay) and the reload-amnesia hole (P1, epochs) are both closed by the same record.
+
+## Participation — sync-owned ref
+
+Unchanged from Revision 5: `participationRef` lives in the sync hook, is updated synchronously before any send (`leaveSession`, `rejoinSession`), and the receive-path guard reads the ref — never React state — so a snapshot delivered during the rejoin send is applied, and leave stays durable across incoming envelopes.
 
 ## Tests for this step
 
-- **End-send failure:** make the broadcast reject — the controller retains state and authority; a participant's `ADVANCE_REQUEST` receives the end envelope (not a transition, not a snapshot); once a resend succeeds, everyone reaches the lobby and the controller finalizes (tombstone, cleared state + checkpoint).
-- The end envelope is created once: resends carry the same `actionId`; replicas that applied it ignore resends as duplicates.
-- No election triggers while the ending controller stays connected; if it disconnects mid-pending, replicas that missed the end elect a winner that can still end the session.
-- `canStartStory` is false during pending termination; `switchSession` refused.
-- Delayed old `SESSION_ENDED` cannot clear a restarted session (revision rule); late `RESTARTED`/`SESSION_STARTED` for the tombstoned session are gate-dropped; a late-joiner `STATE_REQUEST` after the end receives the end notice, not a snapshot.
-- **Rejoin race:** with a synchronous test transport, deliver the bootstrap snapshot during the `rejoinSession` send — it must be applied (ref updated before send). Leave stays durable across incoming progression, snapshots, and announcements for the left session.
+- **Ack round:** end with 3 recipients; deliver the envelope to only 2 — the round does not finalize; the third peer's `ADVANCE_REQUEST` receives the end envelope and its subsequent ack completes the round; only then is state cleared and the tombstone persisted.
+- **"Send resolved" is not enough:** a transport whose broadcast promise resolves while delivering to a subset (16) must leave the round pending — the Revision 5 counterexample as a regression test.
+- **Departure completes:** a never-acking recipient disconnects → removed from the frozen set → round finalizes.
+- **Duplicate end re-acks:** a replica that already applied the end responds to a resent (duplicate) end envelope with a fresh ack; the controller's `acked` set converges.
+- **Retained notice after finalization:** post-finalization (and post-reload, via `RoomMeta`), a stale peer's `STATE_REQUEST` receives the end notice, not silence — the ex-controller no longer "has neither state nor envelope."
+- **Ack hygiene:** `SESSION_END_ACK` with the wrong `endActionId`, or arriving with no pending round, is ignored and not committed.
+- Controller crash mid-round → live replicas elect and the new controller can finish termination; no start/switch during pending; delayed old end vs. restarted session (revision rule) and gate-drops for the tombstoned session carry over from Revision 5.
+- **Rejoin race** (participation ref) carries over: synchronous snapshot during the rejoin send is applied; leave durable.

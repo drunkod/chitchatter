@@ -1,29 +1,41 @@
-# 15 — Provisional persistence (checkpoints)
+# 15 — Persistence: checkpoints and room safety metadata
 
-> **Revision 5 changes:** the **integration contract** is now explicit and implemented in `useVisualNovel` (13) — Revision 4 described the hook but never instantiated it, so `loadLatest`, `acceptCanonical`, and `clear` were dead API. Checkpoints also store and respect `sessionEpoch`, and clearing happens on both authoritative end (11) and stale-session replacement (switch/adoption).
+> **Revision 6 changes:** a third storage record, **`RoomMeta`** — the epoch high-water mark, session tombstones, and retained end notices. This is **protocol safety data, not story content**: checkpoints are deletable UI continuity, but if epochs and tombstones live only in memory, a full-room reload resets `latestEpoch` to 0, makes a lagging peer's old epoch-5 state "newer" than the next epoch-1 start, and forgets ended sessions entirely. `RoomMeta` survives checkpoint deletion and is loaded before the sync service processes any envelope (08/13). The checkpoint hook also tolerates the now-async `roomScope` (null until the digest resolves, 13).
 
 ## Integration contract (implemented in 13)
 
 | Obligation | Where |
 | --- | --- |
 | Acquire `getPersistedStorage()` from `StorageContext` | `useVisualNovel` |
-| Derive `roomScope` as a one-way digest of the room ID | `useVisualNovel` (`digestRoomId`) |
-| Call `loadLatest()` on mount | `useVisualNovel` effect |
-| Render provisional state **read-only** until canonical arrives | `VisualNovel` → `ProvisionalStagePreview` |
+| Resolve `roomScope` **asynchronously** (`crypto.subtle` digest) and hold work until it exists | `useVisualNovel` effect (13) |
+| **Load `RoomMeta` and construct the sync service from it** | same effect, before any envelope is processed (08) |
+| Call `loadLatest()` after the scope resolves; mark persistence settled | `useVisualNovel` effect |
+| Render provisional state **read-only**; block fresh starts until settled or explicitly discarded (`discardProvisional`) | `VisualNovel` / `canStartStory` (13) |
 | Call `acceptCanonical()` when canonical state installs | `setState` wrapper in `useVisualNovel` |
 | Call `clear(sessionId)` on authoritative end | `onSessionEnded` (11 → 13) |
 | Call `clear(sessionId)` on stale-session replacement (switch, adoption, commit of a new epoch) | `setState` wrapper in `useVisualNovel` |
+| Write-through `RoomMeta` on every epoch/tombstone change | `onMetaChange` (08) |
 
 ## Storage layout
 
-Adapter: localforage (`setItem` resolves to the stored value, not `void`). Two keys per room scope:
+Adapter: localforage (`setItem` resolves to the stored value, not `void`). Three keys per room scope:
 
 ```text
+visual-novel:v1:<roomScope>:meta          → RoomMeta (SAFETY: epochs, tombstones,
+                                            retained end notices — see 02/08)
 visual-novel:v1:<roomScope>:latest        → sessionId (pointer)
 visual-novel:v1:<roomScope>:<sessionId>   → checkpoint state (truncated form)
 ```
 
-Without the pointer, a cold-started browser cannot know which session ID to load.
+Without the pointer, a cold-started browser cannot know which session ID to load. Without the meta record, it cannot know which epochs are already decided or which sessions are already ended.
+
+## Room meta lifecycle
+
+- **Load:** in the same effect that resolves `roomScope` (13), before the sync service is constructed — `new VisualNovelSyncService(meta, onMetaChange)` (08). A missing/corrupt record degrades to `{ highWaterEpoch: 0, endedSessions: [] }` with a console warning (safety still holds for the sessions this browser never knew about; peers with intact meta re-teach it via the gate and retained notices).
+- **Write-through:** every `noteEpoch` and `tombstone` persists the updated record (`onMetaChange` → `storage.setItem(metaKey, meta)`, rejection-tolerant like all other writes).
+- **Bound:** `endedSessions` keeps the most recent `maxPersistedTombstones` (01); `highWaterEpoch` is a single integer and never trimmed.
+- **"Reset local novella data"** clears checkpoints *and* meta — with a confirmation noting that resetting meta can transiently resurface an ended session until a peer with intact meta replies with the retained end notice.
+- Each entry retains its `endEnvelope` so stale or reloaded peers can be answered after finalization (11).
 
 ## `src/hooks/useVisualNovelCheckpoint.ts`
 

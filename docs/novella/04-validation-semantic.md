@@ -89,7 +89,9 @@ Same file. Deep, normalizing (fresh object graph — same rule as 03), and the s
 10. Accept only declared condition operators and effect types.
 11. Warn (build-time) about entries whose choices can *all* be condition-gated off with no `next` fallback — the runtime `CHOICE_DEAD_END` (05) makes this an authoring error, never a silent skip.
 12. Return a normalized fresh manifest; never the untrusted reference.
-13. **Bound effect-reachable variables:** collect the distinct `variable` names across every effect in the story; reject if they exceed `maxEffectVariables`. Compute the worst-case reachable variable map (each `set` at its authored value size, each `increment` as a full-width finite number) and reject if its `utf8Bytes` exceeds `maxVariablesBytes`. This guarantees the engine's transport-limit enforcement (05) can never fire on a validated story in normal play.
+13. **Bound effect-reachable variables:** collect the distinct `variable` names across every effect in the story; reject if they exceed `maxEffectVariables`. Compute the worst-case reachable variable map (each `set` at its authored value size, each `increment` as a full-width finite number) and reject if its `utf8Bytes` exceeds `maxVariablesBytes`.
+
+    **Scope of the guarantee (stated honestly):** this static analysis bounds variable *names* and serialized value *width*. It does **not** bound how many times an increment executes through story loops — a loop repeatedly adding a large finite amount can eventually reach a non-finite result. The engine refuses that transition (`INVALID_INCREMENT`, 05) *before* mutating state, so it surfaces as an **authoring/runtime error for that one action, never as an untransmittable canonical state**. Validation additionally warns (build-time) about increment effects inside cycles whose per-iteration amount exceeds a conservative threshold (e.g. `|amount| > 2^40`), catching the practical cases without claiming loop-termination analysis.
 
 ## `validateAssetPath`
 

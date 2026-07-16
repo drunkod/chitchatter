@@ -1,147 +1,148 @@
 # 09 — Coordinated start rounds and story switching
 
-> **New step in Revision 5.** Replaces Revision 4's local start-arbitration timers, which provably could not converge: with no bounded delivery delay, peer A could close its window having seen only its own candidate, install it, and later reopen arbitration when B's delayed candidate arrived — while B, having seen both, chose A. Total ordering cannot help when candidate sets differ. The fix is a single deterministic decision point: **only a coordinator commit installs a fresh session.**
+> **Revision 6 changes:** four review fixes. (1) **Decided-epoch gating is real now** — the gate drops start actions at `embedded.sessionEpoch ≤ latestEpoch` against the embedded candidate's session (08), and `handleStartPropose` additionally requires null local state and `candidate.sessionEpoch === latestEpoch + 1`; a delayed epoch-1 proposal can no longer be restamped into epoch 2. (2) **`START_COMMITTED` always authorizes its sender** — `coordinatorPeerId === sender` is structural (03), acceptance rules below apply at null-state peers too, and same-epoch replacement is only possible while the start decision is unresolved at revision 0: **a progressed session can never be reset.** (3) **Partially delivered decisions recover** — commit holders retain and gossip the commit, and a partition-heal rule reconciles same-epoch conflicts deterministically; per the threat model (00), safety is unconditional and convergence completes under eventual stability. (4) Round IDs use the bounded digest form (01).
 
 ## Protocol
 
 ```text
 starter → coordinator: START_PROPOSE(roundId, candidate)     [targeted]
 coordinator: collect proposals for startRoundMs
-coordinator → all: START_COMMITTED(roundId, selectedState)   [broadcast]
-every peer (starters included): install ONLY on START_COMMITTED
+coordinator → all: START_COMMITTED(roundId, coordinatorPeerId, selectedState)
+every peer (starters included): install ONLY on an AUTHORIZED commit
+commit holders: retain the commit envelope for decision-recovery gossip
 ```
 
-- **Coordinator** = `electController([selfId, ...getPeers()])` — the lowest connected transport peer ID, computed by the starter at proposal time. The coordinator may itself be a starter (it then proposes to itself locally).
-- **Candidate** = `engine.start(uuid(), starterPeerId, latestEpoch + 1)` — revision 0, controller = the proposing starter (validator-enforced, 03).
-- **Selection** = min by `(controllerPeerId, sessionId)` over candidates collected in the window; the `sessionId` tie-break also collapses duplicate proposals from one starter.
-- **Epoch assignment**: the coordinator stamps the selected state with `epoch = coordinator's latestEpoch + 1` before committing (candidates proposed with a lower guess are re-stamped; the commit is what defines the epoch).
-- **Decided-round guard**: installing or tombstoning an epoch raises `latestEpoch` (08); the pre-dispatch gate then drops any proposal or commit embedding an epoch ≤ `latestEpoch`. A delayed proposal after the commit cannot reopen anything; a replayed commit is a duplicate.
+- **Coordinator** = `electController([selfId, ...getPeers()])` at proposal time. The coordinator may itself be a starter (local self-proposal).
+- **Candidate** = `engine.start(uuid(), starterPeerId, latestEpoch + 1)` — revision 0, controller = proposer (structural, 03).
+- **Selection** = min by `(controllerPeerId, sessionId)` over the collected candidates; the `sessionId` tie-break collapses duplicate proposals from one starter.
+- **Epoch assignment**: the coordinator stamps the selected state with `epoch = its latestEpoch + 1` at commit time.
+- **Decided-epoch guard** (08): installing or tombstoning an epoch raises persisted `latestEpoch`; the gate drops start actions at `≤ latestEpoch` — checked against the **embedded candidate's session**, since start envelopes carry the bootstrap outer scope.
 
-Why this converges where timers could not: no peer installs from its own view of the candidate set. Whatever subset of proposals reaches the coordinator, the coordinator makes exactly one decision per epoch, and that decision is the only installable artifact. Delivery order, candidate-set divergence, and window skew all become irrelevant.
-
-## Failure handling
-
-- **Coordinator never answers** (crashed, or the proposal was lost): the starter times out (`requestTimeoutMs`), recomputes the coordinator from the current transport view, and re-proposes with a fresh `roundId`. If the old coordinator actually committed meanwhile, the commit's epoch raises `latestEpoch` everywhere and the re-proposal dies at the gate.
-- **Coordinator leaves mid-window**: same path — its round dies with it; starters re-propose to the next coordinator.
-- **Two coordinators** (membership disagreement): both commit; the commits carry the same epoch number only if neither saw the other. The pre-dispatch gate lets the first-arriving commit install and raise `latestEpoch`; the second same-epoch commit is *not* stale by epoch, so break the tie deterministically: a second `START_COMMITTED` at the **same epoch** is accepted iff `(state.controllerPeerId, state.sessionId)` orders below the installed one (same total order as selection); otherwise ignored. Both replicas converge on the same session either way.
-- **Commit lost to some peer**: that peer still has null state and an outstanding proposal timeout; its re-proposal is answered by the gate-passing controller path — it bootstraps via `STATE_REQUEST` on seeing any current-epoch traffic, or its re-proposal reaches the coordinator which replies with a targeted snapshot of the committed session.
-
-## Sync-hook implementation sketch
+## Start gating (action-specific, on top of the gate)
 
 ```ts
-// --- starter ---
-const startSession = async (storyId: string) => {
-  if (stateRef.current || pendingStartRef.current) return
-  const story = getBundledStory(storyId)
-  if (!story) throw new Error('Story is unavailable')
-  const candidate = new VisualNovelEngine(story, { now })
-    .start(uuid(), selfId, sync.getLatestEpoch() + 1)
-  const coordinator = sync.electController([selfId, ...transport.getPeers()])
-  const roundId = uuid()
-  pendingStartRef.current = { roundId, candidate, coordinator, sentAt: now() }
-
-  if (coordinator === selfId) {
-    openStartRoundAsCoordinator(roundId, candidate) // local proposal
-  } else {
-    await send(makeEnvelope('START_PROPOSE',
-      { roundId, candidate }, visualNovelBootstrapScope, 0), { target: coordinator })
-    scheduleStartRetry() // requestTimeoutMs → recompute coordinator, re-propose
-  }
-}
-
-// --- coordinator ---
 const handleStartPropose = (envelope, context) => {
   const { candidate } = envelope.payload
-  // gate already dropped stale epochs; semantic validation (04) already ran
-  if (sync.electController([selfId, ...transport.getPeers()]) !== selfId) return
+  // Gate already dropped: tombstoned candidate sessions, epochs ≤ latestEpoch,
+  // duplicates. Defense in depth + role check:
+  if (stateRef.current !== null) return                    // active session: no rounds
+  if (candidate.sessionEpoch !== sync.getLatestEpoch() + 1) return // exact next only
+  if (sync.electController([selfId, ...transport.getPeers()]) !== selfId) {
+    // Not the coordinator: if we HOLD a commit for this epoch, gossip it back
+    // to the confused proposer (decision recovery, below).
+    const held = heldCommitRef.current
+    if (held) void sendRef.current?.(held, { target: context.peerId })
+    return
+  }
   if (!startRoundRef.current) {
     startRoundRef.current = {
-      roundId: uuid(), coordinatorPeerId: selfId,
-      epoch: sync.getLatestEpoch() + 1, candidates: [], openedAt: now(),
+      roundId: deriveRoundId(`start:${sync.getLatestEpoch() + 1}:${selfId}:${uuid()}`),
+      coordinatorPeerId: selfId,
+      epoch: sync.getLatestEpoch() + 1,
+      candidates: [],
+      openedAt: now(),
     }
     scheduleStartCommit() // setTimeout(startRoundMs)
   }
+  // NEVER restamp: a candidate proposed for a different epoch was already
+  // rejected above; candidates enter the round at the round's epoch only.
   startRoundRef.current.candidates.push(candidate)
   sync.commit(envelope)
 }
+```
 
-const commitStartRound = async () => {
-  const round = startRoundRef.current
-  if (!round) return
-  startRoundRef.current = null
-  const selected = {
-    ...sync.chooseStartCandidate(round.candidates), // min (controllerPeerId, sessionId)
-    sessionEpoch: round.epoch,
-  }
-  await broadcastAndInstall('START_COMMITTED',
-    { roundId: round.roundId, state: toSnapshotState(selected) }, selected)
-}
+## Commit authorization — every peer, every time
 
-// --- every peer ---
+The Revision 5 handler skipped sender checks at null-state peers and bypassed the tie-break once state existed. Corrected acceptance, in order:
+
+```ts
 const handleStartCommitted = (envelope, context) => {
-  const { state } = envelope.payload
-  // authorization: sender must be the coordinator for this peer's view
-  if (context.peerId !== sync.electController([selfId, ...transport.getPeers()]) &&
-      stateRef.current !== null) {
-    // same-epoch tie-break for dual-coordinator races:
-    if (!ordersBelowInstalled(state, stateRef.current)) return
+  const payload = envelope.payload // { roundId, coordinatorPeerId, state }
+  // Structural (03): coordinatorPeerId === senderPeerId. Gate: epoch >
+  // latestEpoch (≤ dropped), candidate session not tombstoned, not duplicate.
+  // Semantic (04): state validated against its story.
+
+  // 1. SENDER AUTHORIZATION — always, including at null-state peers.
+  //    Acceptable coordinators: my currently computed coordinator, or the
+  //    coordinator my pending proposal targeted (views may have shifted
+  //    between proposal and commit).
+  const acceptableCoordinators = new Set([
+    sync.electController([selfId, ...transport.getPeers()]),
+    pendingStartRef.current?.coordinator,
+  ])
+  if (!acceptableCoordinators.has(payload.coordinatorPeerId)) return
+
+  const current = stateRef.current
+
+  // 2. Null state → install.
+  if (current === null) {
+    installFreshSession(payload.state, envelope) // noteEpoch + setState + commit
+    return
   }
-  sync.noteEpoch(state.sessionEpoch)
-  setState(state) // the ONLY fresh-session installer
-  pendingStartRef.current = null
-  sync.commit(envelope)
+
+  // 3. Same-epoch conflict. Replacement is possible ONLY while the start
+  //    decision is unresolved and nothing has progressed:
+  if (payload.state.sessionEpoch === current.sessionEpoch &&
+      payload.state.sessionId !== current.sessionId) {
+    if (current.revision > 0) {
+      // A progressed session is NEVER reset by a revision-0 commit. Instead,
+      // gossip our progressed state to the sender (partition-heal, below).
+      void sendSnapshot(current, context.peerId)
+      return
+    }
+    if (!startDecisionResolvedRef.current &&
+        ordersBelow(payload.state, current)) { // (controllerPeerId, sessionId)
+      installFreshSession(payload.state, envelope)
+    }
+    return
+  }
+  // Higher-epoch commits were gated as ordinary session succession; lower
+  // were dropped at the gate. Same session: duplicate/no-op.
 }
 ```
 
-(`chooseStartCandidate` lives in the sync service; `ordersBelowInstalled` compares `(controllerPeerId, sessionId)`.)
+`installFreshSession` sets `startDecisionResolvedRef.current = true` once the local peer observes progression (any revision ≥ 1 event for the installed session) — from that moment no same-epoch commit is ever accepted, at any peer, in any order.
 
-## The reviewer's divergence scenario, replayed
+## Decision recovery (partial delivery + coordinator crash)
 
-1. A and B propose concurrently. Coordinator is C (lowest ID).
-2. C receives only A's proposal in the window → commits A's session at epoch 1.
-3. B's delayed proposal arrives at C after the commit → epoch guard drops it (candidate epoch 1 ≤ latestEpoch 1). C optionally answers B with a targeted snapshot.
-4. B installed nothing locally (proposals never install), so there is no "B at revision 0 reopening arbitration" — B receives the commit (or the snapshot) and joins A's session.
+The tie-break alone converges only if every competing decision eventually reaches every replica. Under crash + unbounded delay that needs an explicit mechanism; under the threat model (00) the guarantee is: **safety always, convergence once delivery stabilizes.** Three mechanisms:
 
-No sequence of delays produces two installed sessions, because installation has exactly one source per epoch.
+1. **Commit retention + gossip.** Every peer that installs from `START_COMMITTED` retains the commit envelope (`heldCommitRef`). It re-sends it, targeted, whenever it observes same-epoch confusion: a `START_PROPOSE` for the decided epoch (see `handleStartPropose`), a bootstrap `STATE_REQUEST`, or same-epoch traffic for a *different* session. The decision no longer lives only in the crashed coordinator.
+2. **Accepted-decision reporting on re-proposal.** A starter whose coordinator crashed re-proposes to the next coordinator after `requestTimeoutMs`. Any peer holding a commit for that epoch answers the re-proposal with the held commit (mechanism 1), so the new coordinator's round usually never commits — the proposer installs the existing decision instead. If the new coordinator does commit (nobody who held the decision was reachable), the same-epoch rules reconcile:
+3. **Partition-heal rule.** Same-epoch, different-session conflict between two installed sessions:
+   - one side progressed (revision > 0), the other at revision 0 → **the progressed session wins**; the revision-0 holder adopts it via the gossiped snapshot;
+   - both at revision 0 → total order `(controllerPeerId, sessionId)`;
+   - both progressed (only possible across a real partition) → total order `(controllerPeerId, sessionId)` decides, and losers adopt the winner via snapshot on heal — deterministic at every peer, so both populations converge to the same choice when traffic flows again.
+
+### The reviewer's partial-commit scenario, replayed
+
+1. Coordinator C commits session A; only D receives it before C crashes.
+2. Starters time out, re-propose to new coordinator C′.
+3. D receives a re-proposal or C′'s eventual same-epoch commit for session B:
+   - If D's re-proposal answer (held commit A) reaches C′/starters first, they install A. Converged.
+   - If C′'s commit B lands first at the others: D at A@rev0 vs B — total order decides identically at D and everyone else (D either adopts B or gossips A, which now reaches peers *because D holds it* — the decision is no longer trapped in the crashed C).
+   - If D progressed A before hearing about B (D is with A's controller in a partition): on heal, both-progressed rule picks one deterministic winner; the losing population adopts via snapshot.
+4. Controller A "not knowing it was selected" is harmless: a session whose controller never learned of it cannot progress; it sits at revision 0 and loses to any progressed session, or resolves by total order.
+
+No scenario leaves two populations that both keep their sessions after delivery stabilizes — and no scenario ever violates safety meanwhile, because every rule is deterministic in the pair of states being compared.
+
+## Failure handling summary
+
+- Coordinator silent → `requestTimeoutMs` → re-propose to recomputed coordinator (fresh `roundId`). Held-commit answers short-circuit duplicate decisions.
+- Coordinator leaves mid-window → round dies with it; same re-proposal path.
+- Dual coordinators (membership disagreement) → both commits carry sender authorization from their own view; replicas accept per the acceptable-coordinator set, then reconcile by the same-epoch rules. Deterministic either way.
+- Commit lost to some peer → that peer re-proposes or bootstraps; any commit holder answers.
 
 ## Story switching — `switchSession`
 
-The React hook previously reused `startSession` for switching, contradicting the null-state precondition and leaving no sending API for the receiver's controller-switch path. Switching is a distinct, controller-only operation that does **not** touch start rounds:
-
-```ts
-const switchSession = async (
-  storyId: string,
-  options: { expectedSessionId: string; expectedRevision: number }
-) => {
-  const current = stateRef.current
-  if (!current || current.controllerPeerId !== selfId) {
-    throw new Error('Only the story controller can switch stories')
-  }
-  if (current.sessionId !== options.expectedSessionId ||
-      current.revision !== options.expectedRevision) {
-    throw new Error('Session changed; re-confirm the switch') // stale UI guard
-  }
-  const story = getBundledStory(storyId)
-  if (!story) throw new Error('Story is unavailable')
-
-  const next = new VisualNovelEngine(story, { now })
-    .start(uuid(), selfId, current.sessionEpoch + 1)
-
-  // Retire the old session FIRST (tombstone locally), then announce the new
-  // epoch. Replicas tombstone the old session when they apply the switch.
-  sync.tombstone(current.sessionId, current.sessionEpoch)
-  await broadcastAndInstall('SESSION_STARTED',
-    { state: toSnapshotState(next) }, next)
-}
-```
-
-Receiver side (matrix row, 08): `SESSION_STARTED` is authorized only from the current controller at exactly `sessionEpoch + 1`, revision 0; applying it tombstones the previous session and clears its checkpoint (15). Late traffic for the old session dies at the gate.
+Unchanged from Revision 5 (controller-only, `expectedSessionId`/`expectedRevision` guard, tombstone old session, epoch + 1, `SESSION_STARTED` broadcast, never enters start rounds) — with one addition: the tombstone written for the replaced session persists via `RoomMeta` (08/15), so the retired session stays dead across reloads.
 
 ## Tests for this step
 
-- Reviewer scenario above: A-only candidate set at the coordinator, B delayed — both peers end on A's session; B's late proposal is gate-dropped; **at no point does any peer have B's session installed**.
-- Three starters, every delivery permutation of proposals and the commit → one session everywhere.
-- Coordinator crash before commit → starters re-propose to the next coordinator; exactly one commit installs.
-- Dual-coordinator same-epoch commits → all replicas converge via the `(controllerPeerId, sessionId)` tie-break.
-- Replayed `START_COMMITTED` is a duplicate; delayed `START_PROPOSE` after commit is epoch-dropped; `START_PROPOSE` for a tombstoned session is gate-dropped.
-- `switchSession`: non-controller refused locally and by every replica; stale `expectedRevision` refused; successful switch tombstones the old session, increments the epoch, clears the old checkpoint, and old-session stragglers are ignored everywhere.
+- **Decided-epoch guard, both layers:** with epoch 1 committed, a delayed epoch-1 proposal is gate-dropped (`≤`); a synthetic proposal that somehow reaches the handler with wrong epoch or non-null state is refused; no round reopens; nothing is restamped.
+- **Sender authorization at null state:** a `START_COMMITTED` from a non-coordinator is rejected by a null-state peer (the Revision 5 hole); one from the proposal-target coordinator is accepted even if the local view shifted.
+- **No reset after progression:** install A, progress to revision 10, deliver a same-epoch revision-0 commit for B from the current coordinator — rejected, and the sender receives A's snapshot instead.
+- **Unresolved same-epoch tie-break:** two commits at revision 0 converge on `(controllerPeerId, sessionId)` order at every delivery permutation; after any progression event, the loser can no longer displace the winner.
+- **Partial-commit recovery (reviewer scenario):** C commits A to D only, C crashes, C′ commits B — permute deliveries and partitions; assert every peer ends on the same session once the mesh reconnects, and that D's held commit answers a re-proposal.
+- **Both-progressed heal:** progress A and B in disjoint partitions, heal, assert deterministic winner and loser adoption via snapshot.
+- Replayed commit = duplicate; proposal for tombstoned session = gate-dropped (embedded check); `switchSession` cases from Revision 5, plus tombstone persistence across a simulated reload.

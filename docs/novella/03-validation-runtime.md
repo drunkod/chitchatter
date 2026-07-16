@@ -1,6 +1,6 @@
 # 03 — Runtime structural validation (normalizing)
 
-> **Revision 5 changes:** `sessionEpoch` validated in every state; payload validators for `START_PROPOSE` / `START_COMMITTED`; `CONTROLLER_CHANGED` payload now includes `roundId` + `electorate`. Revision 4 guarantees stand: every success path returns a **freshly constructed value** (no `input as ...`, no aliasing, no surviving extra properties), aggregate byte budgets, non-throwing `utf8Bytes`.
+> **Revision 6 changes:** `START_COMMITTED` validates `coordinatorPeerId === senderPeerId`; new `SESSION_END_ACK` payload; `CONTROLLER_CHANGED.electorate` must be **canonical** — sorted, unique, non-empty, and excluding the departed peer — closing the duplicate-entry gap; round IDs are bounded digests (01) that pass `isId` (the Revision 5 concatenated form violated both the charset and the length limit of the very validator it fed). Normalization guarantees stand.
 
 Structural validation proves shape, bounds, and internal consistency, and yields a clean copy. It does **not** prove story-semantic consistency (04) or sender authority (08). All gates run before any state mutation (order in 12).
 
@@ -27,7 +27,7 @@ const actionTypes = new Set<VisualNovelActionType>([
   'START_PROPOSE', 'START_COMMITTED',
   'STATE_REQUEST', 'STATE_SNAPSHOT', 'ADVANCE_REQUEST', 'ADVANCED',
   'CHOICE_REQUEST', 'CHOICE_RESOLVED', 'SESSION_STARTED', 'SESSION_ENDED',
-  'ELECTION_ADVERTISE', 'CONTROL_REQUEST', 'CONTROL_PASSED',
+  'SESSION_END_ACK', 'ELECTION_ADVERTISE', 'CONTROL_REQUEST', 'CONTROL_PASSED',
   'CONTROLLER_CHANGED', 'RESTART_REQUEST', 'RESTARTED', 'ERROR',
 ])
 
@@ -190,15 +190,35 @@ export const toSnapshotState = (
 New/changed cases only; the Revision 4 cases (`STATE_REQUEST`, `STATE_SNAPSHOT`, `ADVANCE_REQUEST`, `ADVANCED`, `CHOICE_REQUEST`, `CHOICE_RESOLVED`, `SESSION_STARTED`, `RESTARTED`, `SESSION_ENDED`, `CONTROL_*`, `ELECTION_ADVERTISE` — the latter now also validating `roundId`, `ERROR`) are unchanged in structure and all return normalized values:
 
 ```ts
-    case 'START_PROPOSE':
-    case 'START_COMMITTED': {
+    case 'START_PROPOSE': {
       if (!isId(payload.roundId)) return fail('Invalid roundId')
-      const stateKey = actionType === 'START_PROPOSE' ? 'candidate' : 'state'
-      const state = validateSessionState(payload[stateKey])
+      const candidate = validateSessionState(payload.candidate)
+      if (!candidate.ok) return candidate
+      if (candidate.value.revision !== 0) return fail('Start candidate must be revision 0')
+      return { ok: true, value: { roundId: payload.roundId, candidate: candidate.value } }
+    }
+
+    case 'START_COMMITTED': {
+      if (!isId(payload.roundId) || !isId(payload.coordinatorPeerId)) {
+        return fail('Invalid start commit')
+      }
+      const state = validateSessionState(payload.state)
       if (!state.ok) return state
       if (state.value.revision !== 0) return fail('Start state must be revision 0')
-      return { ok: true, value: { roundId: payload.roundId, [stateKey]: state.value } }
+      return {
+        ok: true,
+        value: {
+          roundId: payload.roundId,
+          coordinatorPeerId: payload.coordinatorPeerId,
+          state: state.value,
+        },
+      }
     }
+
+    case 'SESSION_END_ACK':
+      return isId(payload.endActionId)
+        ? { ok: true, value: { endActionId: payload.endActionId } }
+        : fail('Invalid end ack')
 
     case 'ELECTION_ADVERTISE': {
       if (!isId(payload.roundId)) return fail('Invalid roundId')
@@ -212,21 +232,36 @@ New/changed cases only; the Revision 4 cases (`STATE_REQUEST`, `STATE_SNAPSHOT`,
       if (!isId(payload.roundId) ||
           !isId(payload.departedControllerPeerId) ||
           !isId(payload.controllerPeerId)) return fail('Invalid controller change')
-      if (!Array.isArray(payload.electorate) ||
-          payload.electorate.length === 0 ||
-          payload.electorate.length > 64 ||
-          !payload.electorate.every(isId)) return fail('Invalid electorate')
+      // Canonical electorate: sorted, unique, bounded, valid IDs, and the
+      // departed peer excluded. Duplicate or unsorted entries would let two
+      // "different" electorates describe one membership and break the
+      // roundId binding below.
+      const electorate = payload.electorate
+      if (!Array.isArray(electorate) ||
+          electorate.length === 0 ||
+          electorate.length > 64 ||
+          !electorate.every(isId) ||
+          new Set(electorate).size !== electorate.length ||
+          [...electorate].sort().some((id, i) => id !== electorate[i]) ||
+          electorate.includes(payload.departedControllerPeerId as string)) {
+        return fail('Invalid electorate')
+      }
       const state = validateSessionState(payload.state)
       if (!state.ok) return state
       if (state.value.controllerPeerId !== payload.controllerPeerId) {
         return fail('Controller change state/controller mismatch')
       }
+      // roundId must be DERIVED from the supplied fields — the digest binding
+      // is what makes the raw fields authoritative (01/10).
+      const expected = deriveRoundId(
+        `${state.value.sessionEpoch}:${payload.departedControllerPeerId}:${(electorate as string[]).join(',')}`)
+      if (payload.roundId !== expected) return fail('roundId does not bind round fields')
       return {
         ok: true,
         value: {
           roundId: payload.roundId,
           departedControllerPeerId: payload.departedControllerPeerId,
-          electorate: [...(payload.electorate as string[])],
+          electorate: [...(electorate as string[])],
           controllerPeerId: payload.controllerPeerId,
           state: state.value,
         },
@@ -252,7 +287,10 @@ const stateCarryingActions = new Set<VisualNovelActionType>([
 // - SESSION_STARTED: embedded.controllerPeerId === senderPeerId. (Its epoch
 //   rule — exactly current + 1 — is authorization, not structure: 08/09.)
 // - START_PROPOSE: candidate.controllerPeerId === senderPeerId.
-// - CONTROLLER_CHANGED: state.controllerPeerId === senderPeerId.
+// - START_COMMITTED: coordinatorPeerId === senderPeerId — sender
+//   authorization is structural, so it applies at null-state peers too (09).
+// - CONTROLLER_CHANGED: state.controllerPeerId === senderPeerId; roundId
+//   digest binding verified in validatePayload above.
 // - `proof` is dropped during normalization (reserved, 00).
 ```
 
@@ -267,7 +305,9 @@ Unchanged: after validation, `senderPeerId !== messageContext.peerId` → drop, 
 Revision 4 set (round-trip normalization incl. nested aliasing, cyclic input, aggregate byte budgets with worst-case encodings, cross-field mismatches, malformed collection elements, bootstrap scope, identity mismatch) plus:
 
 - `sessionEpoch` missing / 0 / negative / non-integer rejected in every state-carrying payload.
-- `START_PROPOSE` with candidate revision ≠ 0, candidate controller ≠ sender, or bad `roundId` rejected; same for `START_COMMITTED` state.
+- `START_PROPOSE` with candidate revision ≠ 0, candidate controller ≠ sender, or bad `roundId` rejected; `START_COMMITTED` with state revision ≠ 0 or **`coordinatorPeerId` ≠ sender** rejected.
 - Start-action envelopes must use bootstrap scope with envelope revision 0.
-- `CONTROLLER_CHANGED` with missing/empty/oversized/invalid `electorate`, bad `roundId`, or state/controller/sender mismatch rejected; electorate array in the normalized value is a fresh copy.
+- `CONTROLLER_CHANGED` with missing/empty/oversized/**duplicate-entry/unsorted/departed-including** `electorate`, bad or **non-binding `roundId`** (digest ≠ derived from the supplied fields), or state/controller/sender mismatch rejected; electorate array in the normalized value is a fresh copy.
+- `deriveRoundId` output passes `isId` for arbitrary inputs (property test); a 64-member electorate yields a 17-character ID, never a multi-kilobyte pipe-joined string.
+- `SESSION_END_ACK` with a malformed `endActionId` rejected.
 - `ELECTION_ADVERTISE` without `roundId` rejected.

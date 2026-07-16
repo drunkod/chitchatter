@@ -1,6 +1,6 @@
 # 05 — Pure engine
 
-> **Revision 5 changes:** the engine now **enforces transport limits on its own output** — resulting variable maps are checked against `maxVariables`/`maxVariablesBytes` and increment results must be finite (`VARIABLES_LIMIT` / `INVALID_INCREMENT` errors). Previously the controller could legally apply an authored effect, exceed the network validator's limits, and strand the whole room: replicas rejected the delta *and* every recovery snapshot, with no path back to a transmissible state. `start` now takes the `sessionEpoch` (02). Determinism and immutability remain load-bearing: replicas replay deltas (12), and semantic validation (04) guarantees `getScene`/`getEntry` cannot throw on replicated state.
+> **Revision 6 changes:** the authoring guarantee is **reworded honestly** — story validation (04, rule 13) bounds variable names and value width but cannot bound looped increments, so engine enforcement may surface as an authoring/runtime error during play; what it can never do is produce an untransmittable canonical state, because the engine refuses the transition *before* committing (`VARIABLES_LIMIT` / `INVALID_INCREMENT` leave state unchanged). Everything else stands from Revision 5: transport-limit enforcement on engine output, `sessionEpoch` in `start`, determinism/immutability as load-bearing replay properties.
 
 The engine owns legal story transitions. It receives a validated manifest, explicit dependencies, and an immutable session. It never imports React, storage, WebRTC, DOM APIs, or global time/randomness.
 

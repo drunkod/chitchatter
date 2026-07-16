@@ -1,6 +1,6 @@
 # 17 — Regressions, manual validation, and rollout
 
-> **Revision 5 changes:** manual steps for start rounds, epochs, termination, and rejoin; rollout gates aligned with the new step layout; **CI requirement** added — the review noted no visible GitHub status checks, so wiring the suites into CI is now part of the M2 gate, not an afterthought.
+> **Revision 6 changes:** manual steps for termination acks, partial-delivery ends, and reload-safety of epochs/tombstones; the M3 gate now includes the link-layer mesh scenarios (decision recovery, divergent-view elections, ack rounds). The CI requirement stands — and remains unmet on the reviewed commit, so it is repeated: **no milestone gate passes without visible GitHub status checks.**
 
 ## Existing-feature regressions
 
@@ -24,7 +24,8 @@
 6. **Leave the story from the participant**; drive the story from the controller and confirm the participant is *not* pulled back; rejoin explicitly and confirm convergence (including immediately after clicking rejoin — the snapshot race).
 7. Refresh the participant; verify the read-only checkpoint preview, then bootstrap recovery.
 8. Close the controller; verify the election converges (survivor shows "You control the story") with the full latest state, and that a story switch beforehand is never undone by the election.
-9. **End the story from the controller**; both peers reach the lobby; refresh both and confirm the ended session does not resurrect from checkpoints. Repeat with devtools network throttled to force an end-send failure and confirm the "ending the story…" pending state, request answering, and eventual convergence.
+9. **End the story from the controller**; both peers reach the lobby; refresh both and confirm the ended session does not resurrect — from checkpoints *or* from a lagging third window holding old state (persisted epoch/tombstone meta).
+10. Repeat the end with devtools network throttled so the end envelope stalls: confirm the "ending the story…" pending state, that a participant request is answered with the end notice, that the round completes only after the ack arrives, and that closing the unacked participant also completes it.
 
 ### Same-network devices
 
@@ -50,7 +51,7 @@ Configured TURN. Record direct/relay status and latency. A failed peer connectio
 1. Merge models + normalizing/semantic validators + **limit-enforcing engine** + example story behind no visible UI. Gate: validator/engine matrices (16) green, including the engine/validator consistency property.
 2. Add local-only UI behind a development feature flag.
 3. Add two-peer sync: transport interface, pre-dispatch gate, exhaustive authorized dispatch, **start rounds**, engine replay, snapshots, recovery. Gate: dispatcher + start-round matrices green **and the suites running as visible GitHub status checks on the PR**.
-4. Add **election rounds, epochs end-to-end, termination protocol, participation, checkpoints wired**, `CONTROL_*`. Gate: election/termination/persistence-integration matrices and mesh cases green in CI.
+4. Add **election rounds, epochs end-to-end (persisted meta), termination ack rounds, participation, checkpoints wired**, `CONTROL_*`. Gate: election/termination/persistence-integration matrices green in CI, **including the link-layer mesh scenarios** — partial-commit recovery, divergent-view convergence, "send resolved ≠ applied", and the reload round-trip (16).
 5. Production UI composition + accessibility (M4).
 6. Enable the bundled example story by default after the full regression pass (M5).
 

@@ -1,6 +1,6 @@
 # 01 — Protocol constants and byte-limit derivation
 
-> **Revision 5 changes:** `startRoundMs` replaces `startArbitrationMs` (the start decision is now coordinator-committed, 09 — the timer only bounds proposal collection at the coordinator, it no longer *is* the decision); `sessionEpoch` documented as a protocol constant concern; `maxEffectVariables` bounds authoring so the engine's transport-limit enforcement (05) can never reject a validated story's reachable states.
+> **Revision 6 changes:** `terminationAckTimeoutMs` (per-cycle ack wait, 11) and `maxPersistedTombstones` (RoomMeta bound, 15); the **`deriveRoundId` bounded synchronous digest** replaces concatenated round IDs, which violated `isId`'s charset and length; epoch documentation now states persistence (RoomMeta) and the action-aware `≤`/`<` gate semantics. The `maxEffectVariables` authoring bound stands, with its guarantee reworded honestly in 04 (names and value width, not looped increments).
 
 ## `src/config/visualNovel.ts`
 
@@ -32,9 +32,11 @@ export const visualNovelLimits = {
 
   // ---- timing ----
   requestTimeoutMs: 10_000,
-  startRoundMs: 1_500,     // coordinator's proposal-collection window (09)
-  electionRoundMs: 2_000,  // advertisement collection + supersession window (10)
+  startRoundMs: 1_500,          // coordinator's proposal-collection window (09)
+  electionRoundMs: 2_000,       // advertisement collection + supersession window (10)
+  terminationAckTimeoutMs: 8_000, // per-cycle wait for SESSION_END_ACKs (11)
   canonicalSendRetries: 1,
+  maxPersistedTombstones: 16,   // room meta endedSessions bound (15)
 } as const
 
 // Reserved scope for STATE_REQUEST / START_PROPOSE sent by a peer that has
@@ -91,7 +93,29 @@ Three consequences implemented elsewhere:
 - The first committed session in a room has epoch `1`.
 - `START_COMMITTED` assigns `latestKnownEpoch + 1` (09); `switchSession` increments it (09).
 - All ordering that compares sessions — election adoption, snapshot preference, stale-event gating — orders by `(sessionEpoch, revision)`, never by revision alone (08/10).
-- Each peer tracks `latestEpoch` (the highest epoch it has ever installed or seen tombstoned); proposals, starts, and advertisements at or below a decided epoch are ignored (the decided-round guard, 09).
+- Each peer tracks `latestEpoch` (the highest epoch it has ever installed or seen tombstoned). The gate is **action-specific** (08): start actions are dropped at `embedded.sessionEpoch ≤ latestEpoch` (a decided epoch may never reopen), other state-carrying actions at `< latestEpoch` (same-epoch traffic is legitimate).
+- **`latestEpoch` and tombstones persist** in room meta storage (15) and are loaded into the sync service before it processes any envelope. In-memory-only epoch tracking would reset to 0 on a full-room reload, making stale epoch-5 state "newer" and forgetting ended sessions — the meta record is safety data and survives checkpoint deletion.
+
+## Round identifiers
+
+Round IDs must pass `isId` (03): ≤ 128 chars, `[A-Za-z0-9][A-Za-z0-9._:-]*`. Concatenating an electorate into the ID violates both the charset (`|`) and, at up to 64 members × 128 chars, the length — so round identity uses a **bounded synchronous digest** (10):
+
+```ts
+// FNV-1a 64-bit over the canonical round string, hex-encoded (16 chars).
+// Collision resistance is not load-bearing: the payload carries the raw
+// round fields (departed, electorate, epoch) and receivers compare those
+// exactly and recompute the digest to verify the binding (10).
+export const deriveRoundId = (canonical: string): string => {
+  let hash = 0xcbf29ce484222325n
+  for (let i = 0; i < canonical.length; i++) {
+    hash ^= BigInt(canonical.charCodeAt(i))
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn
+  }
+  return `r${hash.toString(16).padStart(16, '0')}`
+}
+```
+
+Synchronous on purpose: rounds open inside transport callbacks, where `crypto.subtle` (async) would race the events being gated.
 
 ## Timing constants
 

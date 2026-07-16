@@ -1,6 +1,6 @@
 # 16 — Testing: matrices and the transport test mesh
 
-> **Revision 5 changes:** the test transport's `makeAction` now declares **`<T extends DataPayload>`** with the import (the Revision 4 unconstrained `<T,>` failed `PeerRoomAction<T>`'s own constraint and could not type-check). New matrices cover start rounds, epochs, frozen elections, termination, the pre-dispatch gate, engine transport limits, and the ref-based rejoin race. CI note: wire these suites into the repository's existing GitHub checks so the PR shows status runs (00/M5).
+> **Revision 6 changes:** the mesh gains what the remaining failure modes require — **per-peer link views** (B and C can observe different electorates), **queued deliveries with a manual pump** (reorder, delay, drop), **partial-send crash points** (a broadcast that reaches a subset and then the sender "crashes" — the termination and start-decision counterexamples), and **one-way links / temporary partitions**. A globally shared mesh with immediate synchronous delivery could not express any of the scenarios that motivated Revisions 5–6. Matrices updated for decision recovery, divergent-view elections, termination acks, and persisted meta. CI: these suites must run as visible GitHub status checks (17).
 
 ## Validator matrix (03/04)
 
@@ -28,26 +28,29 @@ Revision 4 set (transitions, endings, effects, dead ends, `STORY_ENDED`, `STORY_
 
 ## Start round (09)
 
-- **Reviewer divergence scenario:** coordinator sees only A's proposal; B's proposal delayed past the commit — both peers converge on A's session; B never has its own session installed; B's late proposal is epoch-dropped.
-- Three starters × every proposal/commit delivery permutation → one session everywhere.
-- Coordinator crash before commit → re-proposal to next coordinator; exactly one commit installs.
-- Dual-coordinator same-epoch commits → `(controllerPeerId, sessionId)` tie-break converges all replicas.
-- Replayed commit = duplicate; delayed proposal after commit = epoch-dropped; proposal for a tombstoned session = gate-dropped.
-- `switchSession`: non-controller refused locally and by replicas; stale `expectedRevision` refused; success tombstones the old session, increments epoch, clears the old checkpoint; old-session stragglers ignored.
+- **Decided-epoch guard (Revision 6):** with epoch 1 committed, a delayed epoch-1 `START_PROPOSE` is gate-dropped (`≤` semantics, embedded-session tombstone check) — no round reopens, nothing is restamped to epoch 2.
+- **Commit sender authorization at null state:** a `START_COMMITTED` from a non-coordinator is rejected by a null-state peer; one from the proposal-target coordinator is accepted after the local view shifted.
+- **No reset after progression:** installed A at revision 10 + same-epoch revision-0 commit for B from the current coordinator → rejected, sender receives A's snapshot.
+- **Partial-commit recovery (reviewer scenario, via `deliverPartiallyThenCrash`):** C commits A to D only and crashes; C′ commits B; permute deliveries/partitions — every peer converges on one session after `heal()`; D's held commit answers a re-proposal.
+- **Both-progressed partition heal:** progress A and B in disjoint partitions, `heal()` → deterministic `(controllerPeerId, sessionId)` winner, loser adopts via snapshot.
+- Three starters × delivery permutations (`pumpReordered`) → one session everywhere; coordinator crash → re-proposal path; replayed commit = duplicate; `switchSession` cases incl. tombstone persistence across simulated reload.
 
 ## Election round (10)
 
-- **Epoch resurrection blocked:** after S1→S2 switch, lagging S1@20 advertiser cannot win; no replica re-installs S1.
-- **Frozen winner under join:** lower-ID peer joins mid-round; every replica still accepts the frozen winner's announcement; joiner bootstraps afterward.
-- Mid-round leave restarts the round deterministically; old-round announcements fail `wrong-round` everywhere; winner-crash restart converges.
-- Non-winner / self-nominated announcements rejected; departed-still-connected rejected; adopted-state `(epoch, revision)` regression rejected; post-application supersession within one round converges replicas that applied in different orders; missed-leave replica converges via implicit open; replayed announcement = duplicate.
+- **Round ID validity:** generated `roundId` passes `isId` for 1–64-member electorates (property test); digest binding — tampered electorate/departed/epoch fields are rejected structurally.
+- **Divergent views converge (reviewer scenario, via `setLink`):** B observes `{B, C}`, C observes `{C}`; both announce; every delivery order converges all replicas on the same winner via the total supersession order — no mutual `wrong-round` deadlock, no join/leave needed.
+- **Epoch resurrection blocked:** after S1→S2 switch, lagging S1@20 advertiser cannot win; no replica re-installs S1 — **including after a simulated full-room reload** (persisted `RoomMeta`).
+- Local-round behavior: join mid-round defers; member leave restarts; winner crash → restarted announcement supersedes.
+- Not-winner-of-own-electorate / sender mismatch / wrong departure / departed-still-connected / `(epoch, revision)` regression rejected; post-application supersession converges replicas that applied in different orders; missed-leave replica converges without a local round; replayed announcement = duplicate.
 
 ## Termination (11)
 
-- End-send failure: controller retains state/authority; participant requests answered with the persisted end envelope (same `actionId`); after successful resend all peers reach the lobby, controller finalizes (tombstone + cleared state + checkpoint).
-- No election while the ending controller is connected; controller disconnect mid-pending → remaining live replicas elect and can finish the end.
-- `canStartStory` false while pending; delayed old end cannot clear a restarted session; late events for the ended session gate-dropped; post-end `STATE_REQUEST` receives the end notice, not a snapshot.
-- **Rejoin race:** synchronous transport delivers the bootstrap snapshot during the `rejoinSession` send → applied (participation ref updated pre-send); leave durable across incoming traffic.
+- **Ack round:** 3 recipients, envelope delivered to 2 (`dropWhere`) — round stays pending; the third's `ADVANCE_REQUEST` gets the end envelope; its ack completes the round; only then tombstone + cleared state + checkpoint.
+- **"Send resolved" regression:** `send` resolves on enqueue with zero deliveries pumped — the round must remain pending (the Revision 5 counterexample).
+- **Departure completes:** never-acking recipient disconnects → removed from the frozen set → finalize.
+- **Duplicate end re-acks:** applied replica re-acks a resent end envelope; controller's `acked` set converges despite dropped acks.
+- **Retained notice after finalization and reload:** post-finalize (and after `RoomMeta` reload), a stale peer's `STATE_REQUEST` receives the end notice.
+- Ack hygiene (wrong `endActionId`, no pending round → ignored, uncommitted); controller crash mid-round → survivors elect and finish; `canStartStory` false while pending; delayed old end vs. restarted session; **rejoin race** (participation ref) carries over.
 
 ## Dispatcher (12)
 
@@ -55,12 +58,53 @@ Revision 4 set (transitions, endings, effects, dead ends, `STORY_ENDED`, `STORY_
 
 ## Persistence integration (13/15)
 
+- **Async scope:** the checkpoint hook and sync mount wait for the `crypto.subtle` digest to resolve (`roomScope: string | null`); nothing touches storage with a null scope.
+- **RoomMeta round-trip:** simulated full-room reload — service constructed from persisted `{highWaterEpoch: 5, endedSessions}`; the next start gets epoch 6; ended sessions stay dead; `onMetaChange` fires on every `noteEpoch`/`tombstone`.
 - Mount → `loadLatest()` → provisional preview rendered read-only; canonical arrival calls `acceptCanonical` and clears the preview.
-- `onSessionEnded` actually calls `clear(sessionId)` (spy on the adapter); stale-session replacement clears the replaced session's checkpoint; corrupted/foreign-story/ended-session checkpoints are discarded on load.
+- **Start gating vs. provisional:** `canStartStory` is false until persistence settles and while a provisional session exists; `discardProvisional` clears it and re-enables starts.
+- `onSessionEnded` actually calls `clear(sessionId)` (spy on the adapter); stale-session replacement clears the replaced session's checkpoint; corrupted/foreign-story/ended-session checkpoints are discarded on load; "Reset local novella data" clears checkpoints **and** meta.
 
 ## Transport test mesh
 
-Implements `VisualNovelTransport` (07): receiver **sets** per action key, keyed join/leave handler maps, insert-before-notify, a real `disconnect()`, and the **correct generic constraint**:
+Implements `VisualNovelTransport` (07): receiver **sets** per action key, keyed join/leave handler maps, insert-before-notify, a real `disconnect()`, and the **correct generic constraint**. On top of the Revision 5 base, the mesh routes every delivery through a **link layer**:
+
+```ts
+// Per-ordered-pair link state — the unit every new failure mode needs.
+type LinkState = 'up' | 'down'
+interface QueuedDelivery {
+  from: string; to: string; key: string
+  data: unknown
+  deliver: () => void
+}
+
+class TestMeshNetwork {
+  private links = new Map<string, LinkState>()      // `${from}->${to}`, one-way
+  private queue: QueuedDelivery[] = []
+  auto = false                                       // true: pump on enqueue
+
+  setLink(from: string, to: string, state: LinkState) { /* one-way */ }
+  partition(groupA: string[], groupB: string[]) { /* both directions down */ }
+  heal() { /* all links up */ }
+
+  enqueue(delivery: QueuedDelivery) {
+    if (this.links.get(`${delivery.from}->${delivery.to}`) === 'down') return // drop
+    this.queue.push(delivery)
+    if (this.auto) this.pump()
+  }
+  pump(count = Infinity) { /* deliver in order */ }
+  pumpReordered(order: number[]) { /* deliver a permutation */ }
+  dropWhere(match: (d: QueuedDelivery) => boolean) { /* selective loss */ }
+
+  // Partial-send crash point: deliver the sender's queued broadcast to only
+  // `recipients`, then disconnect the sender — the exact shape of "coordinator
+  // commits to one peer and dies" (09) and "send resolved ≠ everyone applied" (11).
+  deliverPartiallyThenCrash(sender: string, recipients: string[]) { /* ... */ }
+}
+```
+
+`TestTransport.getPeers()` consults the link layer (a peer only "sees" peers it has an up-link to), so **B and C can honestly observe different electorates** — the divergent-views election scenario (10) is now directly expressible. `send` resolves once deliveries are *enqueued*, deliberately reproducing "broadcast promise resolved but nobody applied yet" for the termination regression test (11). Acks are ordinary envelopes and can be dropped or delayed like anything else.
+
+Core `TestTransport` (per peer, unchanged shape plus the network hook):
 
 ```ts
 import type { DataPayload, MessageContext } from 'trystero'

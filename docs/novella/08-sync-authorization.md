@@ -1,6 +1,6 @@
 # 08 — Sync service: pre-dispatch gate and authorization matrix
 
-> **Revision 5 changes:** the tombstone/duplicate/epoch checks the Revision 4 matrix *promised* on every row now exist as **one pre-dispatch gate** the dispatcher (12) runs before any handler — previously the fresh-start path skipped them entirely, so a delayed `SESSION_STARTED` could resurrect an ended session and a retransmitted start could reopen arbitration. All cross-session ordering is by **`(sessionEpoch, revision)`**; `chooseElectionState` and controller-change adoption can no longer prefer a stale pre-switch session with a big revision number. Fresh starts moved to the coordinated round (09); elections freeze their electorate (10); termination rules are in 11.
+> **Revision 6 changes:** the gate is now **action-aware where Revision 5's wasn't**. (a) *Epoch staleness:* start actions are dropped at `embedded.sessionEpoch ≤ latestEpoch` — the strict `<` let a delayed epoch-1 `START_PROPOSE` survive after epoch 1 was decided (`1 < 1` is false) and get restamped into epoch 2 by a fresh round. Other state-carrying actions keep `<` (same-epoch traffic is legitimate). (b) *Tombstones:* start actions are checked against the **embedded candidate's `sessionId`** — their envelopes carry the bootstrap scope, so the old gate was testing whether the literal string `"bootstrap"` was tombstoned. (c) The service is **initialized from persisted `RoomMeta`** (15): `latestEpoch` and tombstones survive full-room reloads, or epoch monotonicity was a fiction. `SESSION_END_ACK` added to the matrix.
 
 `inspect*`/`authorize*` methods are pure; `commit(envelope)` records an action ID only after successful application/handling.
 
@@ -8,16 +8,41 @@
 
 ```ts
 // After structural validation + identity check, before dispatch:
-if (sync.isTombstoned(envelope.sessionId)) {
+if (sync.isTombstonedFor(envelope)) {
   // Exception: a peer that missed the end may still REQUEST state for a
-  // tombstoned session — answered with the persisted SESSION_ENDED (11).
+  // tombstoned session — answered with the retained SESSION_ENDED notice (11).
   if (envelope.actionType !== 'STATE_REQUEST') return
 }
 if (sync.isDuplicate(envelope.actionId)) return
-if (sync.isStaleEpoch(envelope)) return  // embedded state epoch < latestEpoch
+if (sync.isStaleEpoch(envelope)) return
 ```
 
-`isStaleEpoch` inspects the embedded state of state-carrying actions (`START_*`, `SESSION_STARTED`, snapshots, `ELECTION_ADVERTISE`, `CONTROLLER_CHANGED`): anything strictly below the peer's `latestEpoch` is dead by definition — decided start rounds, retired sessions, and pre-switch stragglers all fall out here. Non-state-carrying actions pass (their session/revision rules follow).
+```ts
+// Tombstone check against the session the envelope is actually ABOUT:
+// start actions carry the bootstrap outer scope, so envelope.sessionId is
+// the literal "bootstrap" — the embedded candidate is what matters.
+isTombstonedFor(envelope: VisualNovelActionEnvelope): boolean {
+  const embedded = this.embeddedState(envelope) // state ?? candidate ?? null
+  if (embedded && this.endedSessions.has(embedded.sessionId)) return true
+  return this.endedSessions.has(envelope.sessionId)
+}
+
+// Action-aware epoch staleness. Start actions: a decided epoch may NEVER
+// reopen, so ≤. Everything else: same-epoch traffic is normal, so <.
+isStaleEpoch(envelope: VisualNovelActionEnvelope): boolean {
+  const embedded = this.embeddedState(envelope)
+  if (!embedded) return false
+  const isStartAction = envelope.actionType === 'START_PROPOSE' ||
+    envelope.actionType === 'START_COMMITTED'
+  return isStartAction
+    ? embedded.sessionEpoch <= this.latestEpoch
+    : embedded.sessionEpoch < this.latestEpoch
+}
+```
+
+**Worked example (the Revision 5 hole):** epoch 1 committed → `latestEpoch = 1` → delayed epoch-1 `START_PROPOSE` arrives → `1 ≤ 1` → dropped at the gate. It can no longer reach `handleStartPropose`, so no round reopens and no stale candidate is restamped to epoch 2. (`handleStartPropose` additionally requires `candidate.sessionEpoch === latestEpoch + 1` and null local state — defense in depth, 09.)
+
+**Persistence:** the service constructor takes the persisted `RoomMeta` (15) — `latestEpoch = meta.highWaterEpoch`, `endedSessions` seeded from `meta.endedSessions` — and every `noteEpoch`/`tombstone` write-through updates the meta record. Without this, a full-room reload reset `latestEpoch` to 0, the next start received epoch 1, and any lagging peer's old epoch-5 state became "newer" while ended sessions were forgotten.
 
 Handlers therefore do **not** re-implement these checks; narrow exceptions are stated on the matrix row (only `STATE_REQUEST` has one).
 
@@ -27,8 +52,8 @@ Handlers therefore do **not** re-implement these checks; narrow exceptions are s
 
 | Action | Authorized sender | Preconditions | Effect |
 | --- | --- | --- | --- |
-| `START_PROPOSE` | any peer with null state | self is the start coordinator (09); candidate epoch = `latestEpoch + 1` | candidate collected for the round |
-| `START_COMMITTED` | the start coordinator only (09) | round open at this peer *or* state null; epoch = `latestEpoch + 1` | **install fresh session** |
+| `START_PROPOSE` | any peer with null state | self is the start coordinator (09); **self has null state**; candidate epoch = `latestEpoch + 1` (gate already dropped ≤) | candidate collected for the round |
+| `START_COMMITTED` | **sender == `coordinatorPeerId` (structural, 03) AND sender is an acceptable coordinator for this peer** (09) | null state: install. Non-null same-epoch state: **only while the start decision is unresolved and local revision === 0**, via the `(controllerPeerId, sessionId)` tie-break — a progressed session is never reset (09) | **install fresh session** / reconcile |
 | `STATE_REQUEST` | any peer | handled if self is controller — or if the session is tombstoned, answered with the persisted `SESSION_ENDED` (11); exempt from session match (bootstrap scope) | targeted snapshot / end notice |
 | `ADVANCE_REQUEST` / `CHOICE_REQUEST` / `RESTART_REQUEST` | any peer | self is controller; session/story match; `expectedRevision === revision` (else snapshot reply); **no pending termination** (11) | engine transition + canonical broadcast |
 | `CONTROL_REQUEST` | any peer | M3; until implemented: reject, no commit | `CONTROL_PASSED` |
@@ -36,10 +61,11 @@ Handlers therefore do **not** re-implement these checks; narrow exceptions are s
 | `SESSION_STARTED` | current controller only (**story switch**, 09) | `state.sessionEpoch === current.sessionEpoch + 1`; revision 0; old session tombstoned on apply | adopt switched session |
 | `RESTARTED` | current controller only | same session; `revision === current.revision + 1` | replace replica |
 | `ADVANCED` / `CHOICE_RESOLVED` | current controller only | same session/story; `revision === current.revision + 1`; **engine replay matches** | apply derived state |
-| `SESSION_ENDED` | current controller only | same session; `revision === current.revision + 1` | tombstone; clear replica + checkpoint; lobby (11) |
-| `CONTROLLER_CHANGED` | **frozen winner of the round** (10) | `roundId`/electorate match the replica's frozen round (or implicit open); departed absent; adopted `(epoch, revision) ≥` current; round-scoped supersession | apply adopted snapshot + controller atomically |
+| `SESSION_ENDED` | current controller only | same session; `revision === current.revision + 1` | tombstone (persisted, with retained notice); **ack the sender**; clear replica + checkpoint; lobby (11) |
+| `SESSION_END_ACK` | any frozen-set recipient, targeted at the ending controller | echoes the pending end envelope's `actionId`; ignored unless a termination round is pending (11) | recipient marked acked |
+| `CONTROLLER_CHANGED` | announced winner == sender == min of its own canonical electorate (structural + 10) | **internally consistent round fields + self-relevant conditions** — departed == my recorded controller and absent from my transport view; adopted `(epoch, revision)` not behind mine; **total supersession order across announcements**, not exact local-round equality (honest views may differ, 10) | apply adopted snapshot + controller atomically |
 | `CONTROL_PASSED` | current controller only | `revision === current.revision + 1` (M3) | set controller |
-| `ELECTION_ADVERTISE` | electorate member, targeted *(crash-fault concession, 00)* | self is the frozen winner; `roundId` matches; state epoch = round epoch | candidate for adoption |
+| `ELECTION_ADVERTISE` | any remaining peer, targeted *(crash-fault concession, 00)* | self is the **local round's** winner; `roundId` matches the local round; state epoch = round epoch | candidate for adoption |
 | `ERROR` | any peer | never mutates session state | surface to UI |
 | anything else / future | — | — | **reject; do not commit** |
 
@@ -69,36 +95,89 @@ const stateCarrying = new Set([
 export class VisualNovelSyncService {
   private readonly seen = new Map<string, number>()
   private readonly endedSessions = new Map<string, number>() // sessionId → epoch
-  private latestEpoch = 0 // highest epoch installed or tombstoned
+  private latestEpoch: number
+
+  // Initialized from persisted RoomMeta (15) — epoch monotonicity and
+  // tombstones are safety data that must survive full-room reloads. Every
+  // mutation below write-throughs via onMetaChange.
+  constructor(
+    meta: RoomMeta,
+    private readonly onMetaChange: (meta: RoomMeta) => void
+  ) {
+    this.latestEpoch = meta.highWaterEpoch
+    for (const ended of meta.endedSessions) {
+      this.endedSessions.set(ended.sessionId, ended.epoch)
+    }
+  }
 
   // ---------- gate primitives ----------
 
-  isTombstoned = (sessionId: string) => this.endedSessions.has(sessionId)
   isDuplicate = (actionId: string) => this.seen.has(actionId)
   getLatestEpoch = () => this.latestEpoch
 
-  noteEpoch(epoch: number) {
-    if (epoch > this.latestEpoch) this.latestEpoch = epoch
-  }
-
-  isStaleEpoch(envelope: VisualNovelActionEnvelope): boolean {
-    if (!stateCarrying.has(envelope.actionType)) return false
+  private embeddedState(
+    envelope: VisualNovelActionEnvelope
+  ): VisualNovelSessionState | null {
+    if (!stateCarrying.has(envelope.actionType)) return null
     const payload = envelope.payload as {
       state?: VisualNovelSessionState
       candidate?: VisualNovelSessionState
     }
-    const embedded = payload.state ?? payload.candidate
-    return embedded !== undefined && embedded.sessionEpoch < this.latestEpoch
+    return payload.state ?? payload.candidate ?? null
   }
 
-  tombstone(sessionId: string, epoch: number) {
+  // Start envelopes carry the bootstrap outer scope — check the session the
+  // envelope is actually ABOUT, not the literal "bootstrap".
+  isTombstonedFor(envelope: VisualNovelActionEnvelope): boolean {
+    const embedded = this.embeddedState(envelope)
+    if (embedded && this.endedSessions.has(embedded.sessionId)) return true
+    return this.endedSessions.has(envelope.sessionId)
+  }
+
+  // Action-aware: decided epochs may never reopen (≤ for start actions);
+  // same-epoch traffic is legitimate everywhere else (<).
+  isStaleEpoch(envelope: VisualNovelActionEnvelope): boolean {
+    const embedded = this.embeddedState(envelope)
+    if (!embedded) return false
+    const isStartAction = envelope.actionType === 'START_PROPOSE' ||
+      envelope.actionType === 'START_COMMITTED'
+    return isStartAction
+      ? embedded.sessionEpoch <= this.latestEpoch
+      : embedded.sessionEpoch < this.latestEpoch
+  }
+
+  noteEpoch(epoch: number) {
+    if (epoch <= this.latestEpoch) return
+    this.latestEpoch = epoch
+    this.persistMeta()
+  }
+
+  tombstone(sessionId: string, epoch: number, endEnvelope?: VisualNovelActionEnvelope) {
     this.endedSessions.set(sessionId, epoch)
-    this.noteEpoch(epoch)
+    if (endEnvelope) this.retainedEndNotices.set(sessionId, endEnvelope) // (11)
+    if (epoch > this.latestEpoch) this.latestEpoch = epoch
     while (this.endedSessions.size > maxTombstones) {
       const oldest = this.endedSessions.keys().next().value
       if (!oldest) break
       this.endedSessions.delete(oldest)
+      this.retainedEndNotices.delete(oldest)
     }
+    this.persistMeta()
+  }
+
+  private readonly retainedEndNotices = new Map<string, VisualNovelActionEnvelope>()
+  getRetainedEndNotice = (sessionId: string) =>
+    this.retainedEndNotices.get(sessionId) ?? null
+
+  private persistMeta() {
+    this.onMetaChange({
+      highWaterEpoch: this.latestEpoch,
+      endedSessions: [...this.endedSessions.entries()].map(([sessionId, epoch]) => ({
+        sessionId,
+        epoch,
+        endEnvelope: this.retainedEndNotices.get(sessionId)!,
+      })).filter(entry => entry.endEnvelope),
+    })
   }
 
   commit(envelope: VisualNovelActionEnvelope) {
@@ -223,7 +302,9 @@ export class VisualNovelSyncService {
 
 Full matrices in 16; the gate/ordering-specific cases:
 
-- **Gate:** a delayed `SESSION_STARTED`/`START_PROPOSE`/`RESTARTED` for a tombstoned session never reaches its handler; a retransmitted (already-committed) start proposal cannot reopen a round; a `STATE_REQUEST` for a tombstoned session *does* pass the gate and is answered with the persisted `SESSION_ENDED` (11).
-- **Epoch staleness:** an `ELECTION_ADVERTISE` or snapshot embedding epoch `n − 1` is dropped by the gate once `latestEpoch === n`, regardless of its revision.
+- **Gate:** a delayed `SESSION_STARTED`/`START_PROPOSE`/`RESTARTED` for a tombstoned session never reaches its handler — **including start actions whose outer scope is `"bootstrap"`** (the embedded candidate's session is what is checked); a `STATE_REQUEST` for a tombstoned session *does* pass and is answered with the retained end notice (11).
+- **Decided-epoch semantics:** with `latestEpoch = 1`, a delayed epoch-1 `START_PROPOSE`/`START_COMMITTED` is dropped (`≤`), while an epoch-1 snapshot or announcement still passes (`<`) — the exact Revision 5 counterexample, both directions.
+- **Meta persistence:** construct the service from `RoomMeta{highWaterEpoch: 5, endedSessions: [S5]}` after a simulated reload — a fresh start receives epoch 6, an old S5 snapshot is stale, and S5's `START_PROPOSE` resurrection is dropped; `noteEpoch`/`tombstone` invoke `onMetaChange` with the updated record.
+- **Epoch staleness:** an `ELECTION_ADVERTISE` or snapshot embedding epoch `n − 1` is dropped once `latestEpoch === n`, regardless of its revision.
 - **Ordering:** `chooseElectionState([S1@epoch1rev20, S2@epoch2rev0])` picks S2; `authorizeSnapshot` rejects a cross-session snapshot whose epoch is below current, even from the controller; `SESSION_STARTED` switch requires exactly `epoch + 1` and revision 0.
 - Progression, request, and solicited-snapshot cases carry over from Revision 4 (16).

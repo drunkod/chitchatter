@@ -1,6 +1,6 @@
 # 02 — Data models
 
-> **Revision 5 changes:** `sessionEpoch` added to `VisualNovelSessionState`; new actions `START_PROPOSE`/`START_COMMITTED` (coordinated start, 09); `CONTROLLER_CHANGED` payload gains the frozen `roundId` and `electorate` (10); round/termination bookkeeping types (`StartRound`, `ElectionRound`, `PendingTermination`) defined here so the service and hook docs share one shape.
+> **Revision 6 changes:** `START_COMMITTED` names its `coordinatorPeerId` (sender authorization, 09); new `SESSION_END_ACK` action for the termination round (11); `RoomMeta` persistence shape for epoch/tombstone safety data (15); round IDs are bounded digests (01); `ElectionRound`/`PendingTermination` bookkeeping updated for announcement-scoped acceptance and ack tracking.
 
 ## `src/models/visualNovel.ts`
 
@@ -117,6 +117,7 @@ export type VisualNovelActionType =
   | 'CHOICE_RESOLVED'
   | 'SESSION_STARTED'
   | 'SESSION_ENDED'
+  | 'SESSION_END_ACK'
   | 'ELECTION_ADVERTISE'
   | 'CONTROL_REQUEST'
   | 'CONTROL_PASSED'
@@ -147,8 +148,13 @@ export type VisualNovelPayloadByAction = {
   // candidate.controllerPeerId === sender. Envelope uses bootstrap scope.
   START_PROPOSE: { roundId: string; candidate: VisualNovelSessionState }
   // Commit: broadcast by the coordinator; the ONLY installer of fresh
-  // sessions. state.sessionEpoch === latestKnownEpoch + 1.
-  START_COMMITTED: { roundId: string; state: VisualNovelSessionState }
+  // sessions. coordinatorPeerId === senderPeerId (validator-enforced, 03) —
+  // sender authorization is ALWAYS applied, including at null-state peers.
+  START_COMMITTED: {
+    roundId: string
+    coordinatorPeerId: string
+    state: VisualNovelSessionState
+  }
 
   STATE_REQUEST: { knownRevision: number }
   STATE_SNAPSHOT: { state: VisualNovelSessionState; requestActionId?: string }
@@ -165,6 +171,9 @@ export type VisualNovelPayloadByAction = {
   // START_COMMITTED instead.
   SESSION_STARTED: { state: VisualNovelSessionState }
   SESSION_ENDED: Record<string, never>
+  // Targeted ack from a recipient that applied SESSION_ENDED; echoes the end
+  // envelope's actionId (termination round, 11).
+  SESSION_END_ACK: { endActionId: string }
   // Targeted at the FROZEN winner of an open election round (10).
   ELECTION_ADVERTISE: { roundId: string; state: VisualNovelSessionState }
   CONTROL_REQUEST: Record<string, never>
@@ -193,35 +202,58 @@ export type EnvelopeFor<T extends VisualNovelActionType> =
 
 ```ts
 // A start round exists at the coordinator while it collects proposals, and
-// at proposers while they await the commit (09).
+// at proposers while they await the commit (09). Commit holders additionally
+// retain the commit envelope for decision-recovery gossip.
 export interface StartRound {
-  roundId: string          // coordinator-generated
+  roundId: string          // coordinator-generated (bounded digest form, 01)
   coordinatorPeerId: string
   epoch: number            // latestKnownEpoch + 1 at open
   candidates: VisualNovelSessionState[] // at the coordinator
   openedAt: number
 }
 
-// An election round freezes its identity at open (10). roundId is derived
-// deterministically so all replicas that observed the same departure and
-// membership agree without extra messages:
-//   roundId = `${sessionEpoch}:${departedControllerPeerId}:${electorate.sort().join('|')}`
+// An election round freezes this replica's LOCAL view at open (10):
+//   roundId = deriveRoundId(`${sessionEpoch}:${departed}:${sortedUniqueElectorate.join(',')}`)
+// Honest replicas can legitimately freeze DIFFERENT rounds (they observed
+// different membership) — acceptance of announcements is therefore based on
+// the announcement's own internally consistent fields plus self-relevant
+// conditions, with a total supersession order across announcements (10).
 export interface ElectionRound {
   roundId: string
   sessionEpoch: number
   departedControllerPeerId: string
-  electorate: string[]     // FROZEN at open: [selfId, ...getPeers()] minus departed
-  winnerPeerId: string     // FROZEN: electController(electorate)
+  electorate: string[]     // frozen local view: sorted unique, departed excluded
+  winnerPeerId: string     // electController(electorate)
   openedAt: number
   advertised: VisualNovelSessionState[] // collected at the winner
-  applied: { sessionEpoch: number; revision: number; controllerPeerId: string } | null
+  applied: {               // last applied announcement, for supersession
+    sessionEpoch: number
+    revision: number
+    controllerPeerId: string
+  } | null
 }
 
-// Termination in flight (11): authority retained until dissemination.
+// Termination round (11): authority retained until the recipient set is
+// exhausted; the end envelope is retained PAST finalization inside the
+// persistent tombstone (RoomMeta below) for stale-peer replay.
 export interface PendingTermination {
   sessionId: string
   sessionEpoch: number
   envelope: EnvelopeFor<'SESSION_ENDED'> // resent verbatim (same actionId)
+  recipients: Set<string>  // FROZEN at initiation: getPeers()
+  acked: Set<string>       // grows via SESSION_END_ACK; leavers are removed
+}
+
+// Persistent room safety metadata (15). Survives checkpoint deletion and
+// full-room reloads — epoch monotonicity and tombstones are protocol safety
+// data, not story content.
+export interface RoomMeta {
+  highWaterEpoch: number
+  endedSessions: Array<{
+    sessionId: string
+    epoch: number
+    endEnvelope: VisualNovelActionEnvelope // retained end notice
+  }>
 }
 ```
 

@@ -1,6 +1,6 @@
 # 13 — React state, UI components, and room integration
 
-> **Revision 5 changes:** persistence is **actually wired** — `useVisualNovel` acquires `StorageContext.getPersistedStorage()`, derives a `roomScope`, instantiates `useVisualNovelCheckpoint`, calls `loadLatest()` on mount, renders provisional state read-only, and calls `clear(sessionId)` on end and stale-session replacement (the Revision 4 hook only left a comment). Story switching uses the dedicated `switchSession` API (09). Leave/rejoin delegates to the sync-owned participation ref (11). Start buttons reflect the start-round phase (09).
+> **Revision 6 changes:** the room-scope digest is computed **asynchronously in an effect** — `crypto.subtle` returns a promise, so the Revision 5 `useMemo(() => digestRoomId(roomId))` did not type-check; the checkpoint hook and sync mount now wait for `roomScope: string | null` to resolve. `canStartStory` additionally requires that checkpoint loading and any provisional-session recovery have **settled** (or the user explicitly discards the provisional session) — previously a user could open a fresh start round while canonical recovery for the provisional session was still outstanding. Room meta (persisted epochs/tombstones, 15) loads in the same effect, before the sync service processes any envelope.
 
 React owns rendering and user intent. It does not decide whether a remote transition is valid; that belongs to validators, the engine, and the sync service.
 
@@ -92,14 +92,31 @@ export const useVisualNovel = ({ transport, roomId }: Options) => {
   // ---- persistence wiring (15) — the integration contract, not a comment ----
   const { getPersistedStorage } = useContext(StorageContext)
   const storage = useMemo(() => getPersistedStorage(), [getPersistedStorage])
-  // One-way digest of the room identifier; never the raw private room URL.
-  const roomScope = useMemo(() => digestRoomId(roomId), [roomId])
-  const checkpoint = useVisualNovelCheckpoint({ storage, roomScope, state })
 
+  // crypto.subtle is ASYNC — a useMemo cannot produce the digest. Resolve it
+  // in an effect; everything downstream waits on roomScope !== null.
+  const [roomScope, setRoomScope] = useState<string | null>(null)
   useEffect(() => {
-    // Cold start: provisional read-only continuity until canonical arrives.
-    void checkpoint.loadLatest()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+    let cancelled = false
+    void digestRoomId(roomId).then(scope => { // SHA-256 hex, truncated
+      if (!cancelled) setRoomScope(scope)
+    })
+    return () => { cancelled = true }
+  }, [roomId])
+
+  // Checkpoint + room meta load once the scope exists. The hook no-ops while
+  // roomScope is null; the sync service is constructed only after RoomMeta
+  // has loaded (persisted epochs/tombstones, 08/15).
+  const checkpoint = useVisualNovelCheckpoint({ storage, roomScope, state })
+  const [persistenceSettled, setPersistenceSettled] = useState(false)
+  useEffect(() => {
+    if (roomScope === null) return
+    let cancelled = false
+    void checkpoint.loadLatest().finally(() => {
+      if (!cancelled) setPersistenceSettled(true)
+    })
+    return () => { cancelled = true }
+  }, [roomScope]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const story = useMemo(() => state
     ? getBundledStory(state.storyId, state.storyVersion) : null, [state])
@@ -132,10 +149,20 @@ export const useVisualNovel = ({ transport, roomId }: Options) => {
   })
 
   const isController = state?.controllerPeerId === selfPeerId
+  // Fresh start requires: persistence settled (checkpoint load finished) and
+  // no provisional session awaiting canonical recovery — unless the user
+  // explicitly discarded it (discardProvisional below). Otherwise a start
+  // round could race the recovery of the very session it would replace.
   const canStartStory =
     (state === null && sync.phase === 'idle' &&
-      participation.kind === 'joined') ||
+      participation.kind === 'joined' &&
+      persistenceSettled && checkpoint.provisional === null) ||
     (isController && sync.phase !== 'terminating')
+
+  const discardProvisional = useCallback(async () => {
+    const provisional = checkpoint.provisional
+    if (provisional) await checkpoint.clear(provisional.sessionId)
+  }, [checkpoint])
 
   const startStory = useCallback(async (storyId: string) => {
     if (!canStartStory) { setError('Cannot start a story right now'); return }
@@ -202,7 +229,7 @@ export const useVisualNovel = ({ transport, roomId }: Options) => {
 }
 ```
 
-`digestRoomId` = SHA-256 (hex, truncated) of the room ID via `crypto.subtle` — the storage key must not leak a private room URL (15).
+`digestRoomId(roomId): Promise<string>` = SHA-256 (hex, truncated) of the room ID via `crypto.subtle` — asynchronous by nature, hence the effect above; the storage key must not leak a private room URL (15). Expose `discardProvisional` through the context so the lobby's provisional preview offers "Discard saved progress" alongside "Waiting to reconnect…" — that is what re-enables fresh starts when the old session's peers are gone for good.
 
 ## Provider — one per group room
 

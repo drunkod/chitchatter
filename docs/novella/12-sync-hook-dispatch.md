@@ -1,6 +1,6 @@
 # 12 — Sync hook: pre-dispatch gate, handlers, send path, flows
 
-> **Revision 5 changes:** the tombstone/duplicate/epoch invariant now lives in **one pre-dispatch gate** ahead of every handler (the Revision 4 dispatcher only checked structure, identity, and participation — the fresh-start path could resurrect ended sessions and reopen arbitration from retransmits); fresh starts route to the start round (09); `SESSION_STARTED` is exclusively the controller switch; `CONTROLLER_CHANGED` uses frozen-round authorization (10); `SESSION_ENDED` uses the termination protocol (11); the participation guard reads the sync-owned ref (11).
+> **Revision 6 changes:** the gate uses the **action-aware** primitives (08): `isTombstonedFor` (embedded-session check — start envelopes carry the bootstrap scope) and `isStaleEpoch` with `≤` for start actions; one narrow duplicate exception re-acks duplicate `SESSION_ENDED` (11); `SESSION_END_ACK` dispatches to the termination round; the sync service is constructed from persisted `RoomMeta` before processing any envelope (08/15); commit-holder gossip hooks for start decision recovery (09).
 
 ## Hook shape
 
@@ -39,9 +39,17 @@ const onReceive = async (input: unknown, context: MessageContext) => {
   if (envelope.senderPeerId !== context.peerId) return
 
   // 3. PRE-DISPATCH GATE (08) — one place, every envelope, before handlers.
-  if (sync.isTombstoned(envelope.sessionId) &&
-      envelope.actionType !== 'STATE_REQUEST') return   // sole exception (11)
-  if (sync.isDuplicate(envelope.actionId)) return
+  //    isTombstonedFor checks the EMBEDDED session for start actions (their
+  //    outer scope is "bootstrap"); isStaleEpoch is ≤ for start actions, <
+  //    otherwise (decided epochs never reopen).
+  if (sync.isTombstonedFor(envelope) &&
+      envelope.actionType !== 'STATE_REQUEST') return   // sole tombstone exception (11)
+  if (sync.isDuplicate(envelope.actionId)) {
+    // Sole duplicate exception: a duplicate SESSION_ENDED means the sender
+    // has not recorded our ack — re-ack, still no re-application (11).
+    if (envelope.actionType === 'SESSION_ENDED') void resendEndAck(envelope, context)
+    return
+  }
   if (sync.isStaleEpoch(envelope)) return
 
   // 4. Durable participation guard — reads the REF (11), never React state.
@@ -61,6 +69,7 @@ const onReceive = async (input: unknown, context: MessageContext) => {
     case 'RESTARTED':        return applySnapshotClass(envelope, context)
     case 'SESSION_STARTED':  return applySwitch(envelope, context)          // 09
     case 'SESSION_ENDED':    return applySessionEnded(envelope, context)    // 11
+    case 'SESSION_END_ACK':  return handleSessionEndAck(envelope, context)  // 11
     case 'ADVANCED':
     case 'CHOICE_RESOLVED':  return applyProgression(envelope, context)
     case 'CONTROLLER_CHANGED':
@@ -80,7 +89,7 @@ Every handler ends with `sync.commit(envelope)` **only** on success. Handlers do
 
 ## Handlers (rules; round-specific code in 09/10/11)
 
-- **`handleRequest`** (controller, serialized): `inspectRequest` (08). If a termination is pending for the session → reply with the persisted end envelope (11). For advance/choice/restart: `expectedRevision !== current.revision` → targeted snapshot reply. Otherwise engine transition → apply locally → `broadcastCanonical`. `STATE_REQUEST` → `toSnapshotState(current)` with `requestActionId: envelope.actionId`; for a tombstoned session → end notice (11).
+- **`handleRequest`** (controller, serialized): `inspectRequest` (08). If a termination is pending for the session → reply with the pending end envelope (a per-request delivery retry, 11). For advance/choice/restart: `expectedRevision !== current.revision` → targeted snapshot reply. Otherwise engine transition → apply locally → `broadcastCanonical`. `STATE_REQUEST` → `toSnapshotState(current)` with `requestActionId: envelope.actionId`; for a tombstoned session → **retained end notice** (`sync.getRetainedEndNotice`, works after finalization and reload, 08/11); for a decided start epoch → the **held commit** (decision-recovery gossip, 09).
 - **`applySnapshotClass`**: resolve story from catalog → missing story is the recoverable "story unavailable" path (04/06) → `validateSessionAgainstStory` → `sync.authorizeSnapshot(…, outstandingRequestIdRef.current)` → `setState(snapshot)`; `sync.noteEpoch(snapshot.sessionEpoch)`; clear `outstandingRequestIdRef`.
 - **`applySwitch`** (`SESSION_STARTED`): semantic validation → `authorizeSnapshot` (controller-only, epoch exactly `+1`, revision 0 — 08) → tombstone the replaced session (`sync.tombstone(current.sessionId, current.sessionEpoch)`), clear its checkpoint (15) → `setState(next)`.
 - **`applyProgression`**: `inspectProgression` (08) → on `recover`: `STATE_REQUEST` to `recoveryTarget(...)`, remember `outstandingRequestIdRef`. On `apply`: **engine replay** —
