@@ -98,7 +98,7 @@ sequenceDiagram
 
 A `PeerRoom` instance wraps the underlying Trystero room. It multiplexes multiple join, leave, and stream handlers, caches named actions, and reports whether each WebRTC connection selected a direct or relay candidate.
 
-On group-room unmount, `useRoom` leaves the room, flushes handlers, clears the peer reference, resets the peer list, and clears the group message log. Direct-message views reuse the active room instead of leaving it.
+Public group rooms key `Room` by `roomId`; private group rooms key it by `roomId` plus the derived secret. Changing connection identity therefore unmounts the old room before mounting a new transport, even if throttle state updates are batched. On group-room unmount, `useRoom` leaves the room, flushes handlers, clears the peer reference, resets the peer list, and clears the group message log. Direct-message views reuse the active group-room transport instead of leaving it.
 
 ## 4. Peer action abstraction
 
@@ -151,7 +151,7 @@ sequenceDiagram
     Shell-->>UI: Render updated transcript
 ```
 
-The shell stores separate group and per-peer direct-message logs. Transcript updates use functional state updates so messages arriving while a send is awaiting network completion are preserved. Optimistic local entries are replaced by ID when their send completes rather than rebuilding the transcript from a captured array. Transcript size is bounded; evicted inline-media offers are rescinded when still active.
+The shell stores separate group and per-peer direct-message logs. Transcript updates use functional state updates so messages arriving while a send is awaiting network completion are preserved. Optimistic local entries are replaced by ID when their send completes rather than rebuilding the transcript from a captured array. If a text or inline-media action rejects, the optimistic entry is removed, an error alert is shown, and sending controls are re-enabled in `finally`. Transcript size is bounded; evicted inline-media offers are rescinded when still active.
 
 The receive handler currently clears only `isTypingGroupMessage`, even for the direct-message namespace. It does not clear `isTypingDirectMessage`. This diagram documents that current behavior; it should not be interpreted as namespace-aware typing cleanup.
 
@@ -258,7 +258,7 @@ flowchart TD
 
 The user's key pair is created in the browser. Each peer supplies an asserted user ID, its public key, and a signature produced by the corresponding private key over the room/user string. A successful check proves possession of that private key and detects inconsistency or tampering in the signed metadata. It does **not** authenticate a real-world identity or prove that the asserted user ID belongs to a previously known person: this flow has no certificate authority, pinned key, trust-on-first-use record, or out-of-band fingerprint comparison. The implementation's `VERIFIED` and `UNVERIFIED` labels should therefore be understood as cryptographic consistency states, not identity trust decisions.
 
-Fragment parameters are parsed before clearing. If advanced sharing is enabled for `BrowserRouter`, every non-empty fragment is then removed from the visible address bar before the parsed `secret` or legacy `pwd` branch is processed. Secret derivation runs in an effect keyed by the room ID and parsed fragment; changing rooms clears the previous secret immediately, and stale asynchronous derivations cannot update the new room. A legacy `pwd` value is encoded with the room ID automatically.
+Fragment parameters are snapshotted inside an effect keyed by `roomId` before the visible hash is cleared. Clearing the address bar therefore cannot retrigger the effect and erase the newly loaded secret. Changing rooms clears the previous secret immediately, and stale asynchronous derivations cannot update the new room. If advanced sharing is enabled for `BrowserRouter`, every non-empty fragment is removed before the snapshotted `secret` or legacy `pwd` branch is processed. A legacy `pwd` value is encoded with the room ID automatically.
 
 ## 9. Embedded SDK configuration
 

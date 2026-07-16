@@ -4,8 +4,8 @@ This directory explains how the Chitchatter UI is assembled and how the runtime 
 
 The diagrams were produced from:
 
-- source commit `c61fe6fefdd5c00db963ce20aad096d04422583d`;
-- a local offline Graphify graph in `graphify-out/graph.json` (`720` nodes and `1687` edges; SHA-256 `196252b6a7846999dcef6594cd4fecb522c99c5ac60224b37a1831f171697127`);
+- the current working tree based on source commit `6fb172a` (including the room-lifecycle and send-recovery fixes documented here);
+- a refreshed local offline Graphify graph in `graphify-out/graph.json` (`727` nodes and `1704` edges; SHA-256 `021dbcd007a0b40821dffcc28797dd249a95ec7061d6cbb8d25be02cded5fe09`);
 - `nix-config` flake commit `f4c0db2585f99b6ac729c3463c632f4490bab3df`;
 - Graphify source commit `75922443866244d4bb6a266b8e085aa82b10dbe7` with Nix hash `sha256-X2cgjPSNBD3F91x9VcQ0PGL7cOGHhniSdtUz+1kKakI=`;
 - targeted Graphify queries for the startup, shell, room, and `PeerRoom` subgraphs;
@@ -14,7 +14,7 @@ The diagrams were produced from:
 
 ## Reproducing the Graphify analysis
 
-`graphify-out/` is a local generated artifact and is not committed to this branch. To reproduce the graph at the documented source revision, check out the commit above and run from the repository root:
+`graphify-out/` is a local generated artifact and is not committed to this branch. The checksum above was generated from the current working tree based on `6fb172a`; after these fixes are committed, replace that base reference with the resulting commit SHA for exact source reproduction. Run from the repository root:
 
 ```bash
 nix run github:drunkod/nix-config-1/f4c0db2585f99b6ac729c3463c632f4490bab3df#graphify-extract -- .

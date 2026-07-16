@@ -101,7 +101,7 @@ flowchart TD
     Derive --> RoomB
 ```
 
-Private-room parameters are parsed from the URL fragment first. If the fragment is non-empty and `allowAdvancedRoomLinkSharing` is enabled—which occurs only with `BrowserRouter`—the entire fragment is cleared before either `secret` or legacy `pwd` is processed. Hash-routed builds do not use that clearing behavior. Secret state is reset whenever the room ID or parsed fragment changes, preventing a previous room's secret from carrying into the next route. A legacy `pwd` value is encoded with the room ID automatically. If neither parameter supplies a usable secret, the UI prompts for a password and derives the room secret locally.
+Private-room parameters are snapshotted from the URL fragment by an effect keyed to `roomId`. If the snapshot is non-empty and `allowAdvancedRoomLinkSharing` is enabled—which occurs only with `BrowserRouter`—the visible fragment is cleared without retriggering secret initialization. Hash-routed builds do not use that clearing behavior. Secret state resets whenever the room ID changes, preventing a previous room's secret from carrying into the next route. A legacy `pwd` value is encoded with the room ID automatically. If neither parameter supplies a usable secret, the UI prompts for a password and derives the room secret locally. The rendered group `Room` is keyed by room ID and secret so a connection-identity change always recreates the transport.
 
 ## 4. Room UI composition
 

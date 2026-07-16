@@ -413,7 +413,7 @@ export function useRoom(
       const userSettings = settingsContext.getUserSettings()
 
       if (!isShowingMessages) {
-        setUnreadMessages(unreadMessages + 1)
+        setUnreadMessages(previousUnreadMessages => previousUnreadMessages + 1)
       }
 
       if (!tabHasFocus || !isShowingMessages) {
@@ -485,19 +485,30 @@ export function useRoom(
       unsentMessage,
     ])
 
-    await sendPeerMessage(
-      unsentMessage,
-      targetPeerId ? { target: targetPeerId } : undefined
-    )
-
-    setMessageLog(previousMessageLog =>
-      previousMessageLog.map(messageLogEntry =>
-        messageLogEntry.id === unsentMessage.id
-          ? { ...unsentMessage, timeReceived: timeService.now() }
-          : messageLogEntry
+    try {
+      await sendPeerMessage(
+        unsentMessage,
+        targetPeerId ? { target: targetPeerId } : undefined
       )
-    )
-    setIsMessageSending(false)
+
+      setMessageLog(previousMessageLog =>
+        previousMessageLog.map(messageLogEntry =>
+          messageLogEntry.id === unsentMessage.id
+            ? { ...unsentMessage, timeReceived: timeService.now() }
+            : messageLogEntry
+        )
+      )
+    } catch (error) {
+      setMessageLog(previousMessageLog =>
+        previousMessageLog.filter(
+          messageLogEntry => messageLogEntry.id !== unsentMessage.id
+        )
+      )
+      showAlert('Message could not be sent', { severity: 'error' })
+      console.error(error)
+    } finally {
+      setIsMessageSending(false)
+    }
   }
 
   if (!isDirectMessageRoom) {
@@ -597,19 +608,30 @@ export function useRoom(
       unsentInlineMedia,
     ])
 
-    await sendPeerInlineMedia(
-      unsentInlineMedia,
-      targetPeerId ? { target: targetPeerId } : undefined
-    )
-
-    setMessageLog(previousMessageLog =>
-      previousMessageLog.map(messageLogEntry =>
-        messageLogEntry.id === unsentInlineMedia.id
-          ? { ...unsentInlineMedia, timeReceived: timeService.now() }
-          : messageLogEntry
+    try {
+      await sendPeerInlineMedia(
+        unsentInlineMedia,
+        targetPeerId ? { target: targetPeerId } : undefined
       )
-    )
-    setIsMessageSending(false)
+
+      setMessageLog(previousMessageLog =>
+        previousMessageLog.map(messageLogEntry =>
+          messageLogEntry.id === unsentInlineMedia.id
+            ? { ...unsentInlineMedia, timeReceived: timeService.now() }
+            : messageLogEntry
+        )
+      )
+    } catch (error) {
+      setMessageLog(previousMessageLog =>
+        previousMessageLog.filter(
+          messageLogEntry => messageLogEntry.id !== unsentInlineMedia.id
+        )
+      )
+      showAlert('Media could not be shared', { severity: 'error' })
+      console.error(error)
+    } finally {
+      setIsMessageSending(false)
+    }
   }
 
   const handleMessageChange = () => {

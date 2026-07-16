@@ -19,19 +19,19 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
   const { setTitle } = useContext(ShellContext)
   const canMount = useThrottledRoomMount(roomId)
 
-  const fragment = window.location.hash.substring(1)
-  const [secret, setSecret] = useState('')
+  const [secretState, setSecretState] = useState({ roomId, value: '' })
   const activeRoomIdRef = useRef(roomId)
 
   useEffect(() => {
     activeRoomIdRef.current = roomId
 
-    const urlParams = new URLSearchParams(fragment)
+    const fragmentSnapshot = window.location.hash.substring(1)
+    const urlParams = new URLSearchParams(fragmentSnapshot)
     let isCancelled = false
 
-    setSecret('')
+    setSecretState({ roomId, value: '' })
 
-    if (allowAdvancedRoomLinkSharing && fragment.length > 0) {
+    if (allowAdvancedRoomLinkSharing && fragmentSnapshot.length > 0) {
       // Clear secret from address bar
       window.history.replaceState(window.history.state, '', '#')
     }
@@ -39,7 +39,7 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
     const secretParam = urlParams.get('secret')
 
     if (secretParam) {
-      setSecret(secretParam)
+      setSecretState({ roomId, value: secretParam })
       return
     }
 
@@ -48,13 +48,13 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
     if (!legacyPassword) return
 
     encryption.encodePassword(roomId, legacyPassword).then(encodedPassword => {
-      if (!isCancelled) setSecret(encodedPassword)
+      if (!isCancelled) setSecretState({ roomId, value: encodedPassword })
     })
 
     return () => {
       isCancelled = true
     }
-  }, [fragment, roomId])
+  }, [roomId])
 
   useEffect(() => {
     notification.requestPermission()
@@ -70,10 +70,11 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
     const encodedPassword = await encryption.encodePassword(roomId, password)
 
     if (activeRoomIdRef.current === roomId) {
-      setSecret(encodedPassword)
+      setSecretState({ roomId, value: encodedPassword })
     }
   }
 
+  const secret = secretState.roomId === roomId ? secretState.value : ''
   const awaitingSecret = secret.length === 0
 
   if (!canMount) {
@@ -86,6 +87,11 @@ export function PrivateRoom({ userId }: PublicRoomProps) {
       onPasswordEntered={handlePasswordEntered}
     />
   ) : (
-    <Room userId={userId} roomId={roomId} password={secret} />
+    <Room
+      key={`${roomId}:${secret}`}
+      userId={userId}
+      roomId={roomId}
+      password={secret}
+    />
   )
 }

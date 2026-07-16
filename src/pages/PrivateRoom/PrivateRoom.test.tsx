@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { PropsWithChildren } from 'react'
 import {
@@ -71,6 +71,37 @@ describe('PrivateRoom', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     window.history.replaceState(window.history.state, '', '#secret=secret-a')
+  })
+
+  test('keeps the parsed secret after clearing it from the address bar', async () => {
+    render(
+      <TestProviders>
+        <MemoryRouter initialEntries={['/private/room-a']}>
+          <Routes>
+            <Route
+              path="/private/:roomId"
+              element={<PrivateRoom userId="user-id" />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </TestProviders>
+    )
+
+    expect(await screen.findByTestId('room')).toHaveAttribute(
+      'data-password',
+      'secret-a'
+    )
+    expect(window.location.hash).toBe('')
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByTestId('room')).toHaveAttribute(
+      'data-password',
+      'secret-a'
+    )
   })
 
   test('clears the previous secret when the room ID changes', async () => {

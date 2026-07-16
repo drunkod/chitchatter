@@ -25,7 +25,7 @@ export function PublicRoom({ userId }: PublicRoomProps) {
   }, [roomId, setTitle])
 
   return canMount ? (
-    <Room userId={userId} roomId={roomId} />
+    <Room key={roomId} userId={userId} roomId={roomId} />
   ) : (
     <WholePageLoading />
   )
