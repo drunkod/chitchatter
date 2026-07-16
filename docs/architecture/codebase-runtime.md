@@ -102,22 +102,29 @@ On group-room unmount, `useRoom` leaves the room, flushes handlers, clears the p
 
 ## 4. Peer action abstraction
 
-Features communicate through named actions. `usePeerAction` connects a React lifecycle to a cached `PeerRoom.makeAction` result.
+Features communicate through named actions. `usePeerAction` connects a React lifecycle to a cached `PeerRoom.makeAction` result, but the current receiver cleanup is not subscriber-specific.
 
 ```mermaid
-flowchart LR
-    Feature[Feature hook] --> UseAction[usePeerAction]
-    UseAction --> Make[PeerRoom.makeAction]
-    Make --> Name[Namespace plus PeerAction]
-    Name --> TrysteroAction[Trystero makeAction]
-    TrysteroAction --> Sender[Sender returned to feature]
-    TrysteroAction --> Receive[onMessage callback]
-    Receive --> Event[Local EventTarget dispatch]
-    Event --> ReactHandler[Feature receive handler]
-    UseAction --> Cleanup[Disconnect receiver on unmount]
+flowchart TD
+    FeatureA[Feature hook A] --> UseA[usePeerAction A]
+    FeatureB[Feature hook B] --> UseB[usePeerAction B]
+    UseA --> Cached[Cached PeerRoom action tuple]
+    UseB --> Cached
+    Cached --> Event[Shared EventTarget]
+    UseA --> ConnectA[connectReceiver creates listener A]
+    ConnectA --> HandlerA[Mutable handler variable becomes A]
+    UseB --> ConnectB[connectReceiver creates listener B]
+    ConnectB --> HandlerB[Same mutable handler variable becomes B]
+    Event --> ListenerA[Listener A may remain registered]
+    Event --> ListenerB[Listener B registered]
+    UseA --> CleanupA[Unmount A calls shared detach function]
+    CleanupA --> RemoveLatest[Removes current handler B, not necessarily A]
+    RemoveLatest --> Risk[Stale listener or wrong active listener removed]
 ```
 
-Group actions use the `g` namespace. Direct-message actions use `dm` and are sent with a target peer ID.
+Group actions use the `g` namespace. Direct-message actions use `dm` and are sent with a target peer ID. `PeerRoom.makeAction` caches one tuple per namespace/action, and that tuple's `connectReceiver` overwrites a single mutable `handler`. The shared detach function removes whichever handler was assigned most recently, rather than a closure capturing the caller's listener. Therefore `usePeerAction` cleanup only *intends* to disconnect its own receiver; with multiple subscribers it may leave a stale listener or remove another subscriber's listener.
+
+This is reachable in the current UI: each peer item contains a `keepMounted` dialog with a targeted direct-message `Room`, so multiple direct-message room instances can subscribe to the same cached `dm` action. A robust implementation would have `connectReceiver` return an unsubscribe closure that captures the exact handler it registered. This document describes the current behavior and does not claim subscriber-specific cleanup.
 
 ## 5. Text-message flow
 
@@ -185,7 +192,7 @@ flowchart TD
 
 ## 7. Inline media and file transfer
 
-File selection creates a general file offer for the full `FileList`. If any selected files are inline-compatible images, audio, or video, it also creates a second offer for only that inline subset. The two offers have different peer-action metadata and receiving UI paths.
+File selection creates a general file offer for the full `FileList`. If any files are inline-classified by MIME top-level type (`image`, `audio`, or `video`), it also starts a second offer for that subset. Inline classification is broader than preview support: the renderer currently supports selected image and audio filename extensions, while video files are classified for inline delivery but render “Media preview not supported.” The two offers have different peer-action metadata and receiving UI paths.
 
 ```mermaid
 sequenceDiagram
@@ -202,13 +209,17 @@ sequenceDiagram
     Controls->>Share: handleFileShareStart with full FileList
     Share->>Transfer: Offer all selected files
     Transfer-->>Share: General magnet URI
-    Share->>Actions: Broadcast FILE_OFFER metadata
+
+    opt At least one inline-classified file
+        Share->>Room: Start handleInlineMediaUpload without awaiting it
+        Room->>Transfer: Begin second offer for inline subset
+    end
+
+    Share->>Actions: Broadcast FILE_OFFER metadata while inline offer may be pending
     Actions->>Remote: General magnet URI and all-inline flag
     Remote->>Remote: Expose general offer in peer/file-download UI
 
-    opt At least one inline-compatible file
-        Share->>Room: handleInlineMediaUpload with inline subset
-        Room->>Transfer: Offer inline subset again
+    opt Inline subset offer completes
         Transfer-->>Room: Inline-preview magnet URI
         Room->>Actions: Broadcast MEDIA_MESSAGE
         Actions->>Remote: Author, inline magnet URI, ID, and time
@@ -218,7 +229,7 @@ sequenceDiagram
     end
 ```
 
-The general `FILE_OFFER` advertises the complete selected set through peer/file-download state. The second `MEDIA_MESSAGE` advertises only the inline subset in the chat transcript. On the receiving side, mounting `InlineMedia` automatically invokes `fileTransfer.download`; no explicit user retrieval step is required for the inline preview. `FileTransferService` configures `secure-file-transfer` with the same tracker list and current RTC configuration used by the room's connectivity layer.
+After the general offer resolves, `useRoomFileShare` starts `handleInlineMediaUpload` first and does not await its promise. It then broadcasts the general `FILE_OFFER`, so the inline subset offer may overlap the metadata broadcast. When that second offer eventually resolves, `MEDIA_MESSAGE` advertises its magnet URI in the chat transcript. On the receiving side, mounting `InlineMedia` automatically invokes `fileTransfer.download`; no explicit user retrieval step is required for the inline delivery, although unsupported extensions display a fallback instead of a preview. `FileTransferService` configures `secure-file-transfer` with the same tracker list and current RTC configuration used by the room's connectivity layer.
 
 ## 8. Private-room security flow
 
@@ -269,9 +280,13 @@ sequenceDiagram
     end
     Bootstrap->>Settings: Publish effective settings
     alt embed is present
-        Bootstrap->>Bootstrap: Do not persist settings
+        Bootstrap->>Bootstrap: Do not persist settings and install update listener
         Host-->>Bootstrap: Later configuration message
-        Bootstrap->>Settings: Apply in-memory override
+        alt parentDomain resolves, origin matches, and event shape is valid
+            Bootstrap->>Settings: Apply in-memory override
+        else validation fails
+            Bootstrap->>Bootstrap: Ignore message
+        end
     else embed is absent
         Bootstrap->>Bootstrap: Persist settings normally
         Bootstrap->>Bootstrap: Do not install embedded update listener
@@ -282,13 +297,16 @@ sequenceDiagram
 
 ## Source anchors
 
-- `src/Bootstrap.tsx`
-- `src/components/Shell/Shell.tsx`
-- `src/contexts/ShellContext.ts`
-- `src/components/Room/Room.tsx`
-- `src/components/Room/useRoom.ts`
-- `src/hooks/usePeerAction.ts`
-- `src/lib/PeerRoom/PeerRoom.ts`
-- `src/services/FileTransfer/FileTransfer.ts`
-- `src/pages/PublicRoom/PublicRoom.tsx`
-- `src/pages/PrivateRoom/PrivateRoom.tsx`
+- [`src/Bootstrap.tsx`](../../src/Bootstrap.tsx)
+- [`src/components/Shell/Shell.tsx`](../../src/components/Shell/Shell.tsx)
+- [`src/components/Shell/PeerListItem.tsx`](../../src/components/Shell/PeerListItem.tsx)
+- [`src/contexts/ShellContext.ts`](../../src/contexts/ShellContext.ts)
+- [`src/components/Room/Room.tsx`](../../src/components/Room/Room.tsx)
+- [`src/components/Room/useRoom.ts`](../../src/components/Room/useRoom.ts)
+- [`src/components/Room/useRoomFileShare.ts`](../../src/components/Room/useRoomFileShare.ts)
+- [`src/components/Message/InlineMedia.tsx`](../../src/components/Message/InlineMedia.tsx)
+- [`src/hooks/usePeerAction.ts`](../../src/hooks/usePeerAction.ts)
+- [`src/lib/PeerRoom/PeerRoom.ts`](../../src/lib/PeerRoom/PeerRoom.ts)
+- [`src/services/FileTransfer/FileTransfer.ts`](../../src/services/FileTransfer/FileTransfer.ts)
+- [`src/pages/PublicRoom/PublicRoom.tsx`](../../src/pages/PublicRoom/PublicRoom.tsx)
+- [`src/pages/PrivateRoom/PrivateRoom.tsx`](../../src/pages/PrivateRoom/PrivateRoom.tsx)

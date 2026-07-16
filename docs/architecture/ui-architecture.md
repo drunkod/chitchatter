@@ -4,27 +4,35 @@ This document explains how the visible application is created, how routes are pl
 
 ## 1. Browser startup and UI initialization
 
-`src/index.tsx` mounts `Init`. `Init` checks browser support, creates the user's cryptographic key pair and initial settings, and lazy-loads `Bootstrap`. `Bootstrap` merges initial, persisted, and optional SDK-provided settings before rendering the app.
+[`src/index.tsx`](../../src/index.tsx) mounts `Init`. On mount, `Init` both registers an unconditional key-generation effect and evaluates browser support during rendering. The support check controls what is rendered; it does not prevent the effect from attempting key generation. Once supported rendering and initialized settings are both available, `Init` lazy-loads `Bootstrap`. `Bootstrap` merges initial, persisted, and optional SDK-provided settings before rendering the app.
 
 ```mermaid
 flowchart TD
     Browser[Browser loads application] --> Index[src/index.tsx]
-    Index --> Init[Init]
-    Init --> Supported{Environment supported?}
-    Supported -- No --> Unsupported[EnvironmentUnsupportedDialog]
-    Supported -- Yes --> Keys[Generate public and private keys]
+    Index --> Init[Init mounts]
+
+    Init --> Effect[Register unconditional initialization effect]
+    Effect --> Keys[Attempt public and private key generation]
     Keys --> Initial[Create initial user settings and user ID]
-    Initial --> Lazy[Lazy-load Bootstrap]
+
+    Init --> Render[Evaluate render path]
+    Render --> Supported{Environment supported?}
+    Supported -- No --> Unsupported[Render EnvironmentUnsupportedDialog]
+    Supported -- Yes --> Ready{User settings initialized?}
+    Ready -- No --> Loading[Render WholePageLoading]
+    Initial --> Ready
+    Ready -- Yes --> Lazy[Lazy-load Bootstrap]
+
     Lazy --> Persisted[Load and migrate IndexedDB settings]
-    Persisted --> Embedded{SDK configuration requested?}
-    Embedded -- Yes --> Parent[Request configuration from parent frame]
+    Persisted --> SDK{SDK configuration path selected?}
+    SDK -- Yes --> Parent[Attempt validated parent-frame configuration]
     Parent --> Merge[Merge effective user settings]
-    Embedded -- No --> Merge
+    SDK -- No --> Merge
     Merge --> Providers[Query, router, storage, and settings providers]
     Providers --> Shell[Persistent Shell]
 ```
 
-While keys or settings are loading, the UI displays `WholePageLoading`. Embedded mode can override settings through `window.postMessage`; embedded settings are not persisted by `Bootstrap`.
+An unsupported environment can therefore render `EnvironmentUnsupportedDialog` while the mounted effect still attempts key generation. While a supported environment waits for keys or settings, the UI displays `WholePageLoading`. Embedded mode can override settings through validated `window.postMessage` events; embedded settings are not persisted by `Bootstrap`.
 
 ## 2. Route and shell composition
 
@@ -108,7 +116,7 @@ flowchart TD
     Core --> Hook[useRoom]
     Hook --> Context[RoomContext.Provider]
 
-    Context --> Controls{Group room and controls visible?}
+    Context --> Controls{Not direct-message room and room controls visible?}
     Controls -- Yes --> Audio[Audio controls]
     Controls -- Yes --> Video[Video controls]
     Controls -- Yes --> Screen[Screen-share controls]
@@ -116,11 +124,14 @@ flowchart TD
 
     Context --> Media{Any webcam or screen-share stream?}
     Media -- Yes --> Display[RoomVideoDisplay]
-    Media -- Yes --> Toggle[Message visibility control]
+    Context --> ToggleGate{Group controls visible and visual display exists?}
+    ToggleGate -- Yes --> Toggle[Message visibility control]
+
     Context --> Messages{Messages visible?}
     Messages -- Yes --> Transcript[ChatTranscript]
     Messages -- Yes --> Form[MessageForm]
-    Messages -- Yes --> Typing[TypingStatusBar]
+    Messages -- Yes --> TypingSetting{Active typing-status setting enabled?}
+    TypingSetting -- Yes --> Typing[TypingStatusBar]
 ```
 
 Direct-message rooms suppress the group-room media control strip. Webcam and screen-share streams are stored in `RoomContext` and determine whether `RoomVideoDisplay` appears. Microphone audio follows a separate path: incoming streams become autoplaying `HTMLAudioElement` instances stored in `ShellContext.peerAudioChannels`, where the peer and volume UI can manage them. Direct-message actions use a separate namespace and target a specific peer.
@@ -129,26 +140,28 @@ Direct-message rooms suppress the group-room media control strip. Webcam and scr
 
 ```mermaid
 flowchart TD
-    Size[Observe window width and height] --> Orientation{Width greater than height?}
-    Orientation -- Yes --> Landscape[Landscape]
-    Orientation -- No --> Portrait[Portrait]
-    Landscape --> SideBySide[Video fills flexible area; chat uses 400px column]
-    Portrait --> Stacked[Video and chat stack vertically]
-    Stacked --> Both{Video and messages visible?}
-    Both -- Yes --> Split[Video 60 percent; messages 40 percent]
-    Both -- No --> Full[Visible panel uses full height]
+    State{Visible panels} --> Both[Visual media and messages]
+    State --> MessagesOnly[Messages only]
+    State --> VideoOnly[Visual media only]
+
+    Both --> Orientation{Width greater than height?}
+    Orientation -- Yes --> Landscape[Side by side: video flexible, chat 400px wide]
+    Orientation -- No --> Portrait[Stacked: video 60 percent, chat 40 percent]
+
+    MessagesOnly --> ChatFull[Chat uses full width and available height]
+    VideoOnly --> VideoFull[Video uses full width and available height]
 ```
 
-When no webcam or screen-share streams exist, messages are forced visible so the room cannot become an empty screen. Microphone-only audio does not cause `RoomVideoDisplay` to appear.
+When no webcam or screen-share streams exist, messages are forced visible, producing the messages-only case rather than an empty screen. If messages are hidden while visual media exists, video occupies the full available area. Microphone-only audio does not cause `RoomVideoDisplay` to appear.
 
 ## Source anchors
 
-- `src/index.tsx`
-- `src/Init.tsx`
-- `src/Bootstrap.tsx`
-- `src/components/Shell/Shell.tsx`
-- `src/components/Shell/RouteContent.tsx`
-- `src/pages/Home/Home.tsx`
-- `src/pages/PublicRoom/PublicRoom.tsx`
-- `src/pages/PrivateRoom/PrivateRoom.tsx`
-- `src/components/Room/Room.tsx`
+- [`src/index.tsx`](../../src/index.tsx)
+- [`src/Init.tsx`](../../src/Init.tsx)
+- [`src/Bootstrap.tsx`](../../src/Bootstrap.tsx)
+- [`src/components/Shell/Shell.tsx`](../../src/components/Shell/Shell.tsx)
+- [`src/components/Shell/RouteContent.tsx`](../../src/components/Shell/RouteContent.tsx)
+- [`src/pages/Home/Home.tsx`](../../src/pages/Home/Home.tsx)
+- [`src/pages/PublicRoom/PublicRoom.tsx`](../../src/pages/PublicRoom/PublicRoom.tsx)
+- [`src/pages/PrivateRoom/PrivateRoom.tsx`](../../src/pages/PrivateRoom/PrivateRoom.tsx)
+- [`src/components/Room/Room.tsx`](../../src/components/Room/Room.tsx)
