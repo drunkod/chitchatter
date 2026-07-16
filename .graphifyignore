@@ -1,0 +1,61 @@
+# Keep first-time Graphify extraction strictly code-only/offline.
+# Exclude prose, office formats, and media that can trigger semantic pipelines.
+
+# Documentation / prose
+*.md
+*.mdx
+*.rst
+*.adoc
+*.asciidoc
+*.org
+*.txt
+*.html
+*.htm
+*.yml
+*.yaml
+/docs/
+.github/
+LICENSE
+FUNDING.yml
+
+# Office / paper / tabular exports
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+*.csv
+*.tsv
+
+# Images / media
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.svg
+*.ico
+*.mp3
+*.wav
+*.ogg
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Generated / local artifacts
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+graphify-out/
+
+# Local/secrets
+.env
+.env.*

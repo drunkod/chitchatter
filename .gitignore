@@ -33,3 +33,7 @@ Session.vim
 /playwright-report/
 /playwright/.cache/
 /e2e/screenshots/
+
+# Local Graphify artifacts
+/.graphifyignore
+/graphify-out/
