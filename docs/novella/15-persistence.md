@@ -1,10 +1,22 @@
-# 12 — Provisional persistence (checkpoints)
+# 15 — Provisional persistence (checkpoints)
 
-> **Revision 4 changes:** checkpoints are cleared when a session is **authoritatively ended** (`SESSION_ENDED` tombstone → `onSessionEnded`, 09); loaded checkpoints are validated **semantically against the currently bundled story** (04) before rendering; everything else (latest-session pointer, honest localforage typing, rejection handling) carries over from Revision 3.
+> **Revision 5 changes:** the **integration contract** is now explicit and implemented in `useVisualNovel` (13) — Revision 4 described the hook but never instantiated it, so `loadLatest`, `acceptCanonical`, and `clear` were dead API. Checkpoints also store and respect `sessionEpoch`, and clearing happens on both authoritative end (11) and stale-session replacement (switch/adoption).
+
+## Integration contract (implemented in 13)
+
+| Obligation | Where |
+| --- | --- |
+| Acquire `getPersistedStorage()` from `StorageContext` | `useVisualNovel` |
+| Derive `roomScope` as a one-way digest of the room ID | `useVisualNovel` (`digestRoomId`) |
+| Call `loadLatest()` on mount | `useVisualNovel` effect |
+| Render provisional state **read-only** until canonical arrives | `VisualNovel` → `ProvisionalStagePreview` |
+| Call `acceptCanonical()` when canonical state installs | `setState` wrapper in `useVisualNovel` |
+| Call `clear(sessionId)` on authoritative end | `onSessionEnded` (11 → 13) |
+| Call `clear(sessionId)` on stale-session replacement (switch, adoption, commit of a new epoch) | `setState` wrapper in `useVisualNovel` |
 
 ## Storage layout
 
-Adapter: `StorageContext.getPersistedStorage()` (localforage; `setItem` resolves to the stored value, not `void`). Two keys per room scope:
+Adapter: localforage (`setItem` resolves to the stored value, not `void`). Two keys per room scope:
 
 ```text
 visual-novel:v1:<roomScope>:latest        → sessionId (pointer)
@@ -58,10 +70,10 @@ export const useVisualNovelCheckpoint = ({
     ]).catch(() => console.warn('Novella checkpoint write failed'))
   }, [roomScope, state, storage])
 
-  // Cold start: discover the last session via the pointer, then load and
-  // validate it structurally (03) AND semantically against the currently
-  // bundled story (04) — a story updated between visits invalidates the
-  // checkpoint instead of throwing at render time.
+  // Cold start: discover the last session via the pointer, then validate it
+  // structurally (03) AND semantically against the currently bundled story
+  // (04) — a story updated between visits invalidates the checkpoint instead
+  // of throwing at render time.
   const loadLatest = async (): Promise<VisualNovelSessionState | null> => {
     try {
       const sessionId = await storage.getItem(latestKey(roomScope))
@@ -83,12 +95,11 @@ export const useVisualNovelCheckpoint = ({
 
   const acceptCanonical = (canonical: VisualNovelSessionState) => {
     // A local checkpoint never overrides canonical peer state, regardless of
-    // its revision. It is provisional UI continuity only.
+    // its epoch or revision. It is provisional UI continuity only.
     setProvisional(null)
     return canonical
   }
 
-  // Called from onSessionEnded (09) and from "Reset local novella data".
   const clear = async (sessionId: string) => {
     try {
       await storage.removeItem(checkpointKey(roomScope, sessionId))
@@ -106,12 +117,11 @@ export const useVisualNovelCheckpoint = ({
 
 ## Rules
 
-- The provisional state renders read-only continuity while a bootstrap `STATE_REQUEST` is outstanding; the first authorized snapshot or `SESSION_STARTED` replaces it via `acceptCanonical`.
-- **Authoritative session end clears persistence:** `onSessionEnded(sessionId)` (09) must call `clear(sessionId)` — a tombstoned session cannot be resurrected from disk on the next visit.
-- If the room has moved to a different session, `clear` the stale checkpoint after adopting the canonical one.
-- Derive `roomScope` with a one-way digest of the room identifier if the storage key is inspectable.
-- Never store the room password, invite URL, crypto keys, transport SDP, peer metadata, or chat messages in the checkpoint.
-- A checkpoint can never become controller authority merely because it has a higher local revision.
+- The provisional state renders read-only continuity while a bootstrap `STATE_REQUEST` is outstanding; the first authorized canonical state replaces it via `acceptCanonical`.
+- **Authoritative session end clears persistence** (11 → `onSessionEnded` → `clear`); a tombstoned session cannot resurrect from disk on the next visit. The loaded checkpoint's `sessionEpoch` also passes through the pre-dispatch gate logic on the sync side: if the room has moved to a higher epoch, canonical traffic replaces the provisional view immediately and the stale checkpoint is cleared.
+- Story switch and election adoption of a new session clear the replaced session's checkpoint (13 `setState` wrapper).
+- Derive `roomScope` with a one-way digest; never store the room password, invite URL, crypto keys, transport SDP, peer metadata, or chat messages.
+- A checkpoint can never become controller authority.
 - Provide "Reset local novella data" in story settings.
 
 ## Optional custom story packages after MVP

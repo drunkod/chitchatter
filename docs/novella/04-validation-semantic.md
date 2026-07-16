@@ -1,6 +1,6 @@
 # 04 — Semantic validation: stories and sessions against stories
 
-> **Revision 4 changes:** new `validateSessionAgainstStory(state, manifest)`. Structural validation proves IDs *look like* IDs; it cannot prove `sceneId` exists in the story, `dialogueEntryId` exists in that scene, or that history is coherent. Previously a structurally valid bad snapshot was installed directly and then threw inside `engine.getScene`/`getEntry` **during rendering**. Semantic validation now runs before every snapshot/checkpoint application.
+> **Revision 5 changes:** story validation gains the **effect-reachable variable bound** (rule 13): the distinct variable names across all effects must not exceed `maxEffectVariables`, and the worst-case reachable variable map must fit `maxVariablesBytes`. Together with the engine's own limit enforcement (05) this closes the engine-vs-validator deadlock: a validated story cannot drive a controller into a transport-illegal state during normal play. `validateSessionAgainstStory` carries over from Revision 4 unchanged.
 
 ## `validateSessionAgainstStory`
 
@@ -65,10 +65,11 @@ Semantic validation runs at **every** point a full state enters the replica:
 
 | Entry point | Doc | Rule |
 | --- | --- | --- |
-| `STATE_SNAPSHOT` / `SESSION_STARTED` / `RESTARTED` application | 09 | structural (03) → resolve story from the catalog (`getBundledStory(state.storyId, state.storyVersion)`) → **story must exist** → `validateSessionAgainstStory` → authorization (08) → apply |
-| `CONTROLLER_CHANGED` adopted state | 09 | same chain; the round rules (08) come after semantic validity |
-| `ELECTION_ADVERTISE` collection at the winner | 09 | advertisements failing semantic validation are discarded, never adopted |
-| Checkpoint load | 12 | a checkpoint that fails against the *currently bundled* story (e.g. story updated between visits) is discarded, not rendered |
+| `STATE_SNAPSHOT` / `SESSION_STARTED` / `RESTARTED` application | 12 | structural (03) → resolve story from the catalog (`getBundledStory(state.storyId, state.storyVersion)`) → **story must exist** → `validateSessionAgainstStory` → authorization (08) → apply |
+| `START_PROPOSE` candidates at the coordinator / `START_COMMITTED` at every peer | 09 | same chain before collection/installation |
+| `CONTROLLER_CHANGED` adopted state | 10/12 | same chain; the round rules (10) come after semantic validity |
+| `ELECTION_ADVERTISE` collection at the winner | 10 | advertisements failing semantic validation are discarded, never adopted |
+| Checkpoint load | 15 | a checkpoint that fails against the *currently bundled* story (e.g. story updated between visits) is discarded, not rendered |
 
 A snapshot whose story is not in the local catalog is a **recoverable condition**, not an error loop: surface "story unavailable in this build" and stay in the lobby.
 
@@ -88,6 +89,7 @@ Same file. Deep, normalizing (fresh object graph — same rule as 03), and the s
 10. Accept only declared condition operators and effect types.
 11. Warn (build-time) about entries whose choices can *all* be condition-gated off with no `next` fallback — the runtime `CHOICE_DEAD_END` (05) makes this an authoring error, never a silent skip.
 12. Return a normalized fresh manifest; never the untrusted reference.
+13. **Bound effect-reachable variables:** collect the distinct `variable` names across every effect in the story; reject if they exceed `maxEffectVariables`. Compute the worst-case reachable variable map (each `set` at its authored value size, each `increment` as a full-width finite number) and reject if its `utf8Bytes` exceeds `maxVariablesBytes`. This guarantees the engine's transport-limit enforcement (05) can never fire on a validated story in normal play.
 
 ## `validateAssetPath`
 
@@ -119,5 +121,5 @@ export const validateAssetPath = (
 - Unknown dialogue entry in a known scene; unknown scene/entry/choice inside history; non-increasing history revisions; last history revision ≥ state revision.
 - Snapshot for a story/version not in the catalog → recoverable "story unavailable", no state change, no error loop.
 - Checkpoint that no longer matches the bundled story is discarded on load.
-- Story validation: all rules 1–12, including the dead-end authoring warning and asset-path traversal/cross-origin/extension rejections.
+- Story validation: all rules 1–13, including the dead-end authoring warning, asset-path traversal/cross-origin/extension rejections, and the effect-reachable variable bound (a story with 200 distinct effect variables, or with reachable worst-case variables exceeding `maxVariablesBytes`, is rejected at load).
 - Normalization: mutating the input story object after `validateStory` does not affect the returned manifest.

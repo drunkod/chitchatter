@@ -1,6 +1,6 @@
 # 05 — Pure engine
 
-> **Revision 4 changes:** none functional — the engine is stable since Revision 3. Its determinism and immutability are load-bearing protocol properties: replicas replay canonical deltas through it (09), and semantic session validation (04) guarantees `getScene`/`getEntry` cannot throw on replicated state.
+> **Revision 5 changes:** the engine now **enforces transport limits on its own output** — resulting variable maps are checked against `maxVariables`/`maxVariablesBytes` and increment results must be finite (`VARIABLES_LIMIT` / `INVALID_INCREMENT` errors). Previously the controller could legally apply an authored effect, exceed the network validator's limits, and strand the whole room: replicas rejected the delta *and* every recovery snapshot, with no path back to a transmissible state. `start` now takes the `sessionEpoch` (02). Determinism and immutability remain load-bearing: replicas replay deltas (12), and semantic validation (04) guarantees `getScene`/`getEntry` cannot throw on replicated state.
 
 The engine owns legal story transitions. It receives a validated manifest, explicit dependencies, and an immutable session. It never imports React, storage, WebRTC, DOM APIs, or global time/randomness.
 
@@ -8,6 +8,7 @@ The engine owns legal story transitions. It receives a validated manifest, expli
 
 ```ts
 import { visualNovelLimits, visualNovelProtocolVersion } from 'config/visualNovel'
+import { utf8Bytes } from 'services/visualNovel/VisualNovelValidator' // pure helper
 import type {
   VisualNovelChoice,
   VisualNovelCondition,
@@ -36,7 +37,11 @@ export class VisualNovelEngine {
     private readonly dependencies: VisualNovelEngineDependencies
   ) {}
 
-  start(sessionId: string, controllerPeerId: string): VisualNovelSessionState {
+  start(
+    sessionId: string,
+    controllerPeerId: string,
+    sessionEpoch: number
+  ): VisualNovelSessionState {
     const scene = this.requireScene(this.story.startSceneId)
     const entry = scene.dialogue[0]
     if (!entry) throw new VisualNovelEngineError('EMPTY_START_SCENE', 'Start scene has no dialogue')
@@ -46,6 +51,7 @@ export class VisualNovelEngine {
       storyId: this.story.id,
       storyVersion: this.story.version,
       sessionId,
+      sessionEpoch,
       sceneId: scene.id,
       dialogueEntryId: entry.id,
       variables: {},
@@ -126,12 +132,19 @@ export class VisualNovelEngine {
       (current, effect) => this.applyEffect(current, effect),
       { ...state.variables }
     )
+    // TRANSPORT-LIMIT ENFORCEMENT: the engine may never emit a state the
+    // network validator (03) would reject — otherwise the controller applies
+    // locally, every replica rejects the delta AND the recovery snapshots,
+    // and the room deadlocks. Story validation (04, rule 13) makes this
+    // unreachable for validated stories; this is the defense in depth.
+    this.assertVariablesWithinLimits(variables)
     return this.commit(state, nextScene.id, firstEntry.id, { choiceId, variables })
   }
 
   restart(state: VisualNovelSessionState): VisualNovelSessionState {
     this.assertCompatible(state)
-    const initial = this.start(state.sessionId, state.controllerPeerId)
+    const initial = this.start(
+      state.sessionId, state.controllerPeerId, state.sessionEpoch)
     return {
       ...initial,
       revision: state.revision + 1,
@@ -225,7 +238,22 @@ export class VisualNovelEngine {
     if (current !== undefined && typeof current !== 'number') {
       throw new VisualNovelEngineError('INVALID_INCREMENT', 'Increment target is not numeric')
     }
-    return { ...variables, [effect.variable]: (current ?? 0) + effect.amount }
+    const result = (current ?? 0) + effect.amount
+    if (!Number.isFinite(result)) {
+      throw new VisualNovelEngineError('INVALID_INCREMENT', 'Increment result is not finite')
+    }
+    return { ...variables, [effect.variable]: result }
+  }
+
+  private assertVariablesWithinLimits(
+    variables: Record<string, VisualNovelValue>
+  ) {
+    if (Object.keys(variables).length > visualNovelLimits.maxVariables) {
+      throw new VisualNovelEngineError('VARIABLES_LIMIT', 'Too many variables')
+    }
+    if (utf8Bytes(variables) > visualNovelLimits.maxVariablesBytes) {
+      throw new VisualNovelEngineError('VARIABLES_LIMIT', 'Variables exceed the transport budget')
+    }
   }
 }
 ```
@@ -243,22 +271,24 @@ const makeEngine = () => new VisualNovelEngine(story, { now: () => 1000 })
 
 it('starts and reaches the beacon ending', () => {
   const engine = makeEngine()
-  const start = engine.start('session-1', 'peer-a')
+  const start = engine.start('session-1', 'peer-a', 1)
   const atChoice = engine.advance(start)
   const ending = engine.choose(atChoice, 'light-beacon')
   expect(ending).toMatchObject({
     sceneId: 'beacon-ending',
     dialogueEntryId: 'beacon-1',
     variables: { usedBeacon: true, courage: 1 },
+    sessionEpoch: 1,
     revision: 2,
   })
 })
 
-it('restarts without changing session/controller', () => {
+it('restarts without changing session/controller/epoch', () => {
   const engine = makeEngine()
-  const progressed = engine.advance(engine.start('session-1', 'peer-a'))
+  const progressed = engine.advance(engine.start('session-1', 'peer-a', 3))
   expect(engine.restart(progressed)).toMatchObject({
     sessionId: 'session-1',
+    sessionEpoch: 3,
     controllerPeerId: 'peer-a',
     sceneId: 'pier',
     dialogueEntryId: 'pier-1',
@@ -266,16 +296,31 @@ it('restarts without changing session/controller', () => {
   })
 })
 
+it('refuses transitions that violate transport limits', () => {
+  // Fixture story whose single choice sets a 129th variable / a value pushing
+  // utf8Bytes(variables) over maxVariablesBytes.
+  const engine = new VisualNovelEngine(overLimitStory, { now: () => 1000 })
+  const atChoice = engine.advance(engine.start('session-1', 'peer-a', 1))
+  expect(() => engine.choose(atChoice, 'overflow')).toThrow('VARIABLES_LIMIT')
+  // State unchanged — the controller never leaves a transmissible state.
+})
+
+it('rejects non-finite increment results', () => {
+  const engine = new VisualNovelEngine(hugeIncrementStory, { now: () => 1000 })
+  const atChoice = engine.advance(engine.start('session-1', 'peer-a', 1))
+  expect(() => engine.choose(atChoice, 'to-infinity')).toThrow('not finite')
+})
+
 it('treats all-unavailable choices as a dead end, not a skip', () => {
   const gated = new VisualNovelEngine(gatedStory, { now: () => 1000 })
-  const state = gated.start('session-1', 'peer-a')
+  const state = gated.start('session-1', 'peer-a', 1)
   expect(gated.canAdvance(state)).toBe(false)
   expect(() => gated.advance(state)).toThrow('unavailable')
 })
 
 it('is deterministic and immutable', () => {
   const engine = makeEngine()
-  const start = engine.start('session-1', 'peer-a')
+  const start = engine.start('session-1', 'peer-a', 1)
   const frozen = JSON.parse(JSON.stringify(start))
   const a = engine.advance(start)
   const b = engine.advance(start)

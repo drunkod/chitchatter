@@ -1,35 +1,51 @@
-# 08 — Sync service: authorization matrix and election rounds
+# 08 — Sync service: pre-dispatch gate and authorization matrix
 
-> **Revision 4 changes:**
->
-> 1. **Election rounds.** `CONTROLLER_CHANGED` is authorized against an explicit round object keyed by the **departed** controller, carries the **full adopted snapshot**, and is applied atomically. This fixes both Revision 3 defects: a replica can no longer accept a bare controller/revision jump while keeping stale scene/variables, and supersession now works after the first application (the old check "reject if `state.controllerPeerId` is connected" started failing the moment the first announcement installed a connected controller — round-scoped comparison replaces it).
-> 2. **Start arbitration.** The revision-0 collision rule is replaced by a bounded arbitration phase with the total order `(controllerPeerId, sessionId)` (the second key also resolves duplicate starts by the same controller). The old rule split the room whenever one starter advanced before the competing start arrived.
-> 3. **Session tombstones.** `SESSION_ENDED` requires exactly `current.revision + 1` and tombstones the session, so a delayed old end event cannot clear a newer restarted session, and late events for ended sessions are ignored.
-> 4. Provenance caveats from the threat model (00) are stated inline where they apply.
+> **Revision 5 changes:** the tombstone/duplicate/epoch checks the Revision 4 matrix *promised* on every row now exist as **one pre-dispatch gate** the dispatcher (12) runs before any handler — previously the fresh-start path skipped them entirely, so a delayed `SESSION_STARTED` could resurrect an ended session and a retransmitted start could reopen arbitration. All cross-session ordering is by **`(sessionEpoch, revision)`**; `chooseElectionState` and controller-change adoption can no longer prefer a stale pre-switch session with a big revision number. Fresh starts moved to the coordinated round (09); elections freeze their electorate (10); termination rules are in 11.
 
-`inspect*`/`authorize*` methods are pure (no seen-set mutation); `commit(envelope)` records an action ID only after successful application/handling.
+`inspect*`/`authorize*` methods are pure; `commit(envelope)` records an action ID only after successful application/handling.
+
+## Pre-dispatch gate (run once, in 12, before any handler)
+
+```ts
+// After structural validation + identity check, before dispatch:
+if (sync.isTombstoned(envelope.sessionId)) {
+  // Exception: a peer that missed the end may still REQUEST state for a
+  // tombstoned session — answered with the persisted SESSION_ENDED (11).
+  if (envelope.actionType !== 'STATE_REQUEST') return
+}
+if (sync.isDuplicate(envelope.actionId)) return
+if (sync.isStaleEpoch(envelope)) return  // embedded state epoch < latestEpoch
+```
+
+`isStaleEpoch` inspects the embedded state of state-carrying actions (`START_*`, `SESSION_STARTED`, snapshots, `ELECTION_ADVERTISE`, `CONTROLLER_CHANGED`): anything strictly below the peer's `latestEpoch` is dead by definition — decided start rounds, retired sessions, and pre-switch stragglers all fall out here. Non-state-carrying actions pass (their session/revision rules follow).
+
+Handlers therefore do **not** re-implement these checks; narrow exceptions are stated on the matrix row (only `STATE_REQUEST` has one).
 
 ## Authorization matrix
 
-`sender` always means the transport-verified `context.peerId` (already cross-checked against `senderPeerId`). Structural + semantic validation (03/04) have already passed. **Row order:** tombstone check → duplicate check → row rule.
+`sender` = transport-verified `context.peerId`. Structural (03) + semantic (04) validation and the gate have already passed.
 
 | Action | Authorized sender | Preconditions | Effect |
 | --- | --- | --- | --- |
-| `STATE_REQUEST` | any peer | handled only if self is controller; exempt from session match (bootstrap scope) | targeted `STATE_SNAPSHOT` echoing `requestActionId` |
-| `ADVANCE_REQUEST` / `CHOICE_REQUEST` / `RESTART_REQUEST` | any peer | self is controller; session/story match; `expectedRevision === revision` (else snapshot reply) | one engine transition + canonical broadcast |
-| `CONTROL_REQUEST` | any peer | M3: controller decides; until implemented: reject, no commit | `CONTROL_PASSED` |
-| `STATE_SNAPSHOT` | current controller; **or** any peer iff it echoes our outstanding `requestActionId` *(crash-fault concession — see 00)* | same session: `state.revision >= current.revision`; cross-session: controller only; null state: solicited only | replace replica (atomic) |
-| `SESSION_STARTED` | null/rev-0 local state: any peer, **into the arbitration phase**; existing progressed state: current controller only (story switch) | validator enforced rev 0 + controller == sender | candidate for arbitration / adopt switch |
+| `START_PROPOSE` | any peer with null state | self is the start coordinator (09); candidate epoch = `latestEpoch + 1` | candidate collected for the round |
+| `START_COMMITTED` | the start coordinator only (09) | round open at this peer *or* state null; epoch = `latestEpoch + 1` | **install fresh session** |
+| `STATE_REQUEST` | any peer | handled if self is controller — or if the session is tombstoned, answered with the persisted `SESSION_ENDED` (11); exempt from session match (bootstrap scope) | targeted snapshot / end notice |
+| `ADVANCE_REQUEST` / `CHOICE_REQUEST` / `RESTART_REQUEST` | any peer | self is controller; session/story match; `expectedRevision === revision` (else snapshot reply); **no pending termination** (11) | engine transition + canonical broadcast |
+| `CONTROL_REQUEST` | any peer | M3; until implemented: reject, no commit | `CONTROL_PASSED` |
+| `STATE_SNAPSHOT` | current controller; **or** any peer iff it echoes our outstanding `requestActionId` *(crash-fault concession, 00)* | same session: `(epoch, revision) ≥` current; cross-session: controller only, epoch ≥ current | replace replica (atomic) |
+| `SESSION_STARTED` | current controller only (**story switch**, 09) | `state.sessionEpoch === current.sessionEpoch + 1`; revision 0; old session tombstoned on apply | adopt switched session |
 | `RESTARTED` | current controller only | same session; `revision === current.revision + 1` | replace replica |
 | `ADVANCED` / `CHOICE_RESOLVED` | current controller only | same session/story; `revision === current.revision + 1`; **engine replay matches** | apply derived state |
-| `SESSION_ENDED` | current controller only | same session; **`revision === current.revision + 1`** | tombstone session; clear replica + checkpoint; lobby |
-| `CONTROLLER_CHANGED` | locally computed winner only | open (or openable) election round for `payload.departedControllerPeerId`; departed controller absent; adopted `state.revision >= current.revision`; round-scoped supersession | **apply adopted snapshot + controller atomically** |
+| `SESSION_ENDED` | current controller only | same session; `revision === current.revision + 1` | tombstone; clear replica + checkpoint; lobby (11) |
+| `CONTROLLER_CHANGED` | **frozen winner of the round** (10) | `roundId`/electorate match the replica's frozen round (or implicit open); departed absent; adopted `(epoch, revision) ≥` current; round-scoped supersession | apply adopted snapshot + controller atomically |
 | `CONTROL_PASSED` | current controller only | `revision === current.revision + 1` (M3) | set controller |
-| `ELECTION_ADVERTISE` | any remaining peer, targeted *(crash-fault concession — see 00)* | self is the computed winner; round open; state semantically valid | candidate for `chooseElectionState` |
+| `ELECTION_ADVERTISE` | electorate member, targeted *(crash-fault concession, 00)* | self is the frozen winner; `roundId` matches; state epoch = round epoch | candidate for adoption |
 | `ERROR` | any peer | never mutates session state | surface to UI |
 | anything else / future | — | — | **reject; do not commit** |
 
-## `src/services/visualNovel/VisualNovelSyncService.ts`
+## `src/services/visualNovel/VisualNovelSyncService.ts` (core)
+
+Round-specific logic lives with its protocol: start rounds in 09, election rounds in 10, termination in 11. The shared service:
 
 ```ts
 import { visualNovelLimits } from 'config/visualNovel'
@@ -44,37 +60,46 @@ export type CanonicalDecision =
   | { kind: 'recover'; reason: 'missing-state' | 'session-mismatch' | 'revision-gap' }
   | { kind: 'reject'; reason: string }
 
-export interface ElectionRound {
-  departedControllerPeerId: string
-  openedAt: number
-  // Advertised states collected at the winner.
-  advertised: VisualNovelSessionState[]
-  // Last announcement applied by this replica, for round-scoped supersession.
-  applied: { revision: number; controllerPeerId: string } | null
-}
-
 const maxTombstones = 64
+const stateCarrying = new Set([
+  'START_PROPOSE', 'START_COMMITTED', 'STATE_SNAPSHOT', 'SESSION_STARTED',
+  'RESTARTED', 'ELECTION_ADVERTISE', 'CONTROLLER_CHANGED',
+])
 
 export class VisualNovelSyncService {
   private readonly seen = new Map<string, number>()
-  private readonly endedSessions = new Map<string, number>() // sessionId → endedAt
+  private readonly endedSessions = new Map<string, number>() // sessionId → epoch
+  private latestEpoch = 0 // highest epoch installed or tombstoned
 
-  // ---------- tombstones ----------
+  // ---------- gate primitives ----------
 
   isTombstoned = (sessionId: string) => this.endedSessions.has(sessionId)
+  isDuplicate = (actionId: string) => this.seen.has(actionId)
+  getLatestEpoch = () => this.latestEpoch
 
-  tombstone(sessionId: string, endedAt: number) {
-    this.endedSessions.set(sessionId, endedAt)
+  noteEpoch(epoch: number) {
+    if (epoch > this.latestEpoch) this.latestEpoch = epoch
+  }
+
+  isStaleEpoch(envelope: VisualNovelActionEnvelope): boolean {
+    if (!stateCarrying.has(envelope.actionType)) return false
+    const payload = envelope.payload as {
+      state?: VisualNovelSessionState
+      candidate?: VisualNovelSessionState
+    }
+    const embedded = payload.state ?? payload.candidate
+    return embedded !== undefined && embedded.sessionEpoch < this.latestEpoch
+  }
+
+  tombstone(sessionId: string, epoch: number) {
+    this.endedSessions.set(sessionId, epoch)
+    this.noteEpoch(epoch)
     while (this.endedSessions.size > maxTombstones) {
       const oldest = this.endedSessions.keys().next().value
       if (!oldest) break
       this.endedSessions.delete(oldest)
     }
   }
-
-  // ---------- duplicate tracking (commit-after-apply) ----------
-
-  isDuplicate = (actionId: string) => this.seen.has(actionId)
 
   commit(envelope: VisualNovelActionEnvelope) {
     this.seen.set(envelope.actionId, envelope.timestamp)
@@ -85,30 +110,32 @@ export class VisualNovelSyncService {
     }
   }
 
-  // ---------- progression (ADVANCED / CHOICE_RESOLVED / RESTARTED / CONTROL_PASSED) ----------
+  // ---------- progression ----------
+  // (ADVANCED / CHOICE_RESOLVED / RESTARTED / SESSION_ENDED / CONTROL_PASSED)
+  // Gate has already handled tombstone/duplicate/epoch.
 
   inspectProgression(
     envelope: VisualNovelActionEnvelope,
     state: VisualNovelSessionState | null,
     transportPeerId: string
   ): CanonicalDecision {
-    if (this.isTombstoned(envelope.sessionId)) return { kind: 'ignore', reason: 'tombstoned' }
-    if (envelope.senderPeerId !== transportPeerId) return { kind: 'reject', reason: 'sender-mismatch' }
-    if (this.isDuplicate(envelope.actionId)) return { kind: 'ignore', reason: 'duplicate' }
     if (!state) return { kind: 'recover', reason: 'missing-state' }
-    if (transportPeerId !== state.controllerPeerId) return { kind: 'reject', reason: 'not-controller' }
+    if (transportPeerId !== state.controllerPeerId) {
+      return { kind: 'reject', reason: 'not-controller' }
+    }
     if (envelope.storyId !== state.storyId ||
         envelope.storyVersion !== state.storyVersion) {
       return { kind: 'reject', reason: 'story-mismatch' }
     }
-    if (envelope.sessionId !== state.sessionId) return { kind: 'recover', reason: 'session-mismatch' }
+    if (envelope.sessionId !== state.sessionId) {
+      return { kind: 'recover', reason: 'session-mismatch' }
+    }
     if (envelope.revision <= state.revision) return { kind: 'ignore', reason: 'stale' }
-    if (envelope.revision !== state.revision + 1) return { kind: 'recover', reason: 'revision-gap' }
+    if (envelope.revision !== state.revision + 1) {
+      return { kind: 'recover', reason: 'revision-gap' }
+    }
     return { kind: 'apply' }
   }
-
-  // SESSION_ENDED shares progression rules (controller-only, exact next
-  // revision) — dispatch reuses inspectProgression, then tombstones.
 
   // ---------- requests (controller side) ----------
 
@@ -118,26 +145,20 @@ export class VisualNovelSyncService {
     transportPeerId: string,
     selfPeerId: string
   ): CanonicalDecision {
-    if (this.isTombstoned(envelope.sessionId) &&
-        envelope.actionType !== 'STATE_REQUEST') {
-      return { kind: 'ignore', reason: 'tombstoned' }
+    if (state.controllerPeerId !== selfPeerId) {
+      return { kind: 'reject', reason: 'not-controller' }
     }
-    if (envelope.senderPeerId !== transportPeerId) return { kind: 'reject', reason: 'sender-mismatch' }
-    if (state.controllerPeerId !== selfPeerId) return { kind: 'reject', reason: 'not-controller' }
     if (envelope.actionType !== 'STATE_REQUEST' &&
         (envelope.storyId !== state.storyId ||
          envelope.storyVersion !== state.storyVersion ||
          envelope.sessionId !== state.sessionId)) {
       return { kind: 'reject', reason: 'session-mismatch' }
     }
-    if (this.isDuplicate(envelope.actionId)) return { kind: 'ignore', reason: 'duplicate' }
     return { kind: 'apply' }
   }
 
   // ---------- snapshots ----------
 
-  // Provenance caveat (00): solicited acceptance trusts the responder under
-  // the crash-fault model. The post-MVP hardening adds controller signatures.
   authorizeSnapshot(
     envelope: VisualNovelActionEnvelope,
     snapshot: VisualNovelSessionState,
@@ -145,17 +166,20 @@ export class VisualNovelSyncService {
     transportPeerId: string,
     outstandingRequestId: string | null
   ): boolean {
-    if (this.isTombstoned(snapshot.sessionId)) return false
     if (envelope.actionType === 'STATE_SNAPSHOT') {
       const solicited = outstandingRequestId !== null &&
         (envelope.payload as { requestActionId?: string }).requestActionId ===
           outstandingRequestId
       if (!current) return solicited
       const fromController = transportPeerId === current.controllerPeerId
+      const notBehind =
+        snapshot.sessionEpoch > current.sessionEpoch ||
+        (snapshot.sessionEpoch === current.sessionEpoch &&
+          snapshot.revision >= current.revision)
       if (snapshot.sessionId === current.sessionId) {
-        return (fromController || solicited) && snapshot.revision >= current.revision
+        return (fromController || solicited) && notBehind
       }
-      return fromController
+      return fromController && notBehind // cross-session: controller + epoch order
     }
     if (envelope.actionType === 'RESTARTED') {
       return current !== null &&
@@ -164,30 +188,16 @@ export class VisualNovelSyncService {
         snapshot.revision === current.revision + 1
     }
     if (envelope.actionType === 'SESSION_STARTED') {
-      // Arbitration-phase candidates are collected by the dispatcher (09);
-      // this method authorizes only the story-switch case.
-      return current !== null && current.revision > 0 &&
-        transportPeerId === current.controllerPeerId
+      // Story switch only (fresh starts are START_COMMITTED, 09).
+      return current !== null &&
+        transportPeerId === current.controllerPeerId &&
+        snapshot.sessionEpoch === current.sessionEpoch + 1 &&
+        snapshot.revision === 0
     }
     return false
   }
 
-  // ---------- start arbitration ----------
-
-  // Total order over revision-0 candidates. The sessionId tie-break also
-  // resolves duplicate starts from the same controller.
-  chooseStartCandidate(
-    candidates: VisualNovelSessionState[]
-  ): VisualNovelSessionState {
-    const sorted = [...candidates].sort((a, b) =>
-      a.controllerPeerId.localeCompare(b.controllerPeerId) ||
-      a.sessionId.localeCompare(b.sessionId)
-    )
-    if (!sorted[0]) throw new Error('No start candidate')
-    return sorted[0]
-  }
-
-  // ---------- election ----------
+  // ---------- election ordering (rounds themselves in 10) ----------
 
   electController(peerIds: string[]): string {
     const unique = [...new Set(peerIds)].sort((a, b) => a.localeCompare(b))
@@ -195,83 +205,25 @@ export class VisualNovelSyncService {
     return unique[0]
   }
 
+  // (sessionEpoch, revision) ordering: a stale pre-switch session with a huge
+  // revision can never beat any current-epoch state.
   chooseElectionState(states: VisualNovelSessionState[]): VisualNovelSessionState {
     const candidates = [...states].sort((a, b) =>
-      b.revision - a.revision || a.controllerPeerId.localeCompare(b.controllerPeerId)
+      b.sessionEpoch - a.sessionEpoch ||
+      b.revision - a.revision ||
+      a.controllerPeerId.localeCompare(b.controllerPeerId)
     )
     if (!candidates[0]) throw new Error('No election state available')
     return candidates[0]
   }
-
-  // CONTROLLER_CHANGED acceptance, round-scoped. `round` is the replica's
-  // open election round or null; `now` from injected clock.
-  authorizeControllerChange(
-    envelope: VisualNovelActionEnvelope,
-    current: VisualNovelSessionState,
-    transportPeerId: string,
-    selfPeerId: string,
-    connectedTransportPeerIds: string[],
-    round: ElectionRound | null,
-    now: number
-  ): { ok: true } | { ok: false; reason: string } {
-    const payload = envelope.payload as {
-      departedControllerPeerId: string
-      controllerPeerId: string
-      state: VisualNovelSessionState
-    }
-    // Validator (03) already guaranteed: controllerPeerId === state.controllerPeerId
-    // === senderPeerId, and envelope/state field consistency.
-    if (payload.controllerPeerId !== transportPeerId) {
-      return { ok: false, reason: 'sender-mismatch' }
-    }
-    // Round key must be THIS replica's departed controller. The connectivity
-    // check applies to the departed peer, not the announced one — this is
-    // what makes post-application supersession possible.
-    const openRound = round && now - round.openedAt <= visualNovelLimits.electionRoundMs
-      ? round
-      : null
-    const departedMatches = openRound
-      ? payload.departedControllerPeerId === openRound.departedControllerPeerId
-      : payload.departedControllerPeerId === current.controllerPeerId
-    if (!departedMatches) return { ok: false, reason: 'wrong-round' }
-    if (connectedTransportPeerIds.includes(payload.departedControllerPeerId)) {
-      return { ok: false, reason: 'departed-still-connected' }
-    }
-    const expectedWinner = this.electController([selfPeerId, ...connectedTransportPeerIds])
-    if (payload.controllerPeerId !== expectedWinner) {
-      return { ok: false, reason: 'not-elected-winner' }
-    }
-    if (payload.state.revision < current.revision) {
-      return { ok: false, reason: 'adopted-state-regresses' }
-    }
-    if (openRound?.applied) {
-      const better =
-        payload.state.revision > openRound.applied.revision ||
-        (payload.state.revision === openRound.applied.revision &&
-          payload.controllerPeerId < openRound.applied.controllerPeerId)
-      if (!better) return { ok: false, reason: 'superseded' }
-    }
-    return { ok: true }
-  }
 }
 ```
 
-## Why the round object fixes Revision 3
-
-- **Content transfer:** the announcement *is* a snapshot. Applying it atomically replaces scene, variables, history, revision, and controller together. A replica behind by any number of revisions converges in one step — no fake-revision/stale-content divergence, and no snapshot round-trip needed on the happy path.
-- **Supersession:** comparisons are made against `round.applied` for the round keyed by the departed controller, for `electionRoundMs` after opening. The first applied announcement no longer terminates the round: a later announcement with higher adopted revision (or equal revision and lower winner ID) still passes, because the "is the departed controller absent" check names the round's departed peer — not whoever is currently installed as controller.
-- **Missed leave events:** a replica that never saw the departure can still authorize: when no round is open, the payload's `departedControllerPeerId` must equal the replica's recorded controller and that peer must be absent from the transport — which implicitly opens the round.
-- **Gap-free:** since the full state travels, the old "replica one revision behind treats the announcement as a gap and asks the departed controller" deadlock is structurally impossible.
-
 ## Tests for this step
 
-See 13 for the complete matrix; the round-specific cases are:
+Full matrices in 16; the gate/ordering-specific cases:
 
-- announcement from a non-winner rejected (`not-elected-winner`), including self-nomination;
-- announcement rejected while the departed controller is still connected;
-- announcement whose adopted state regresses below the replica's revision rejected;
-- **post-application supersession**: apply winner B at revision 6, then within the round accept winner A at revision 6 (A < B), and reject a further B re-announcement (`superseded`);
-- announcement for a stale round (`departedControllerPeerId` ≠ recorded controller, no open round) rejected;
-- replica that missed the leave event still converges (implicit round opening);
-- `SESSION_ENDED` at `current.revision + 5` rejected; at `+1` applied and tombstoned; a subsequent `RESTARTED` for the tombstoned session ignored;
-- start arbitration total order: `(controllerPeerId, sessionId)` picks one winner for duplicate starts from the same controller and for A/B collisions regardless of arrival order.
+- **Gate:** a delayed `SESSION_STARTED`/`START_PROPOSE`/`RESTARTED` for a tombstoned session never reaches its handler; a retransmitted (already-committed) start proposal cannot reopen a round; a `STATE_REQUEST` for a tombstoned session *does* pass the gate and is answered with the persisted `SESSION_ENDED` (11).
+- **Epoch staleness:** an `ELECTION_ADVERTISE` or snapshot embedding epoch `n − 1` is dropped by the gate once `latestEpoch === n`, regardless of its revision.
+- **Ordering:** `chooseElectionState([S1@epoch1rev20, S2@epoch2rev0])` picks S2; `authorizeSnapshot` rejects a cross-session snapshot whose epoch is below current, even from the controller; `SESSION_STARTED` switch requires exactly `epoch + 1` and revision 0.
+- Progression, request, and solicited-snapshot cases carry over from Revision 4 (16).

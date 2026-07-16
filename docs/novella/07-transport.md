@@ -1,6 +1,6 @@
 # 07 — Transport: network action, PeerRoom additions, interface
 
-> **Revision 4 changes:** none functional since Revision 3; kept as its own step so transport work can merge independently. The test-mesh defects called out in review are fixed in 13.
+> **Revision 5 changes:** none functional; step numbers updated for the new layout. The test mesh (with the corrected `<T extends DataPayload>` generic) lives in 16.
 
 ## Extend `src/models/network.ts`
 
@@ -79,7 +79,7 @@ export interface VisualNovelTransport {
 
 Notes:
 
-- `PeerRoomAction<T>` is the repository's **mutable** 3-tuple `[sender, connectReceiver, progress]`, where `connectReceiver(cb)` returns its own unsubscribe function. Test doubles must return exactly this type — not a readonly `as const` tuple (13).
+- `PeerRoomAction<T>` is the repository's **mutable** 3-tuple `[sender, connectReceiver, progress]`, where `connectReceiver(cb)` returns its own unsubscribe function. Test doubles must return exactly this type — not a readonly `as const` tuple (16).
 - `usePeerAction` currently takes a `PeerRoom`. Either widen its prop type to `VisualNovelTransport` (it only calls `makeAction`) or call `transport.makeAction` directly inside the sync hook. Pick one and keep it consistent; the docs assume the direct call.
 
 ## Envelope factory

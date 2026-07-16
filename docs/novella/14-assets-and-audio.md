@@ -1,6 +1,6 @@
-# 11 — Assets and local story audio
+# 14 — Assets and local story audio
 
-> **Revision 4 changes:** none functional since Revision 3 (local failure collection, absolute-URL music compare). Split into its own step.
+> **Revision 5 changes:** none functional; renumbered (was 11). Local failure collection and the absolute-URL music compare carry over from Revision 4.
 
 Story assets are bundled or statically hosted by the same application. Only state identifiers travel through the novella protocol.
 
