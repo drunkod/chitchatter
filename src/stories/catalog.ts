@@ -1,25 +1,38 @@
-import type { VisualNovelManifest } from "../models/visualNovel";
-import { validateStory } from "../services/visualNovel/VisualNovelValidator";
-import harbourLightsData from "./harbour-lights/story.json";
+import type { VisualNovelManifest } from '../models/visualNovel'
+import { validateStory } from '../services/visualNovel/VisualNovelValidator'
+import harbourLightsData from './harbour-lights/story.json'
 
 const applicationOrigin =
-  typeof window === "undefined"
-    ? "https://chitchatter.invalid"
-    : window.location.origin;
+  typeof window === 'undefined'
+    ? 'https://chitchatter.invalid'
+    : window.location.origin
 
 const loadBundledStory = (input: unknown): VisualNovelManifest => {
-  const result = validateStory(input, applicationOrigin);
+  const result = validateStory(input, applicationOrigin)
   if (!result.ok) {
-    throw new Error(`Invalid bundled story: ${result.errors.join(", ")}`);
+    throw new Error(`Invalid bundled story: ${result.errors.join(', ')}`)
   }
-  return result.value;
-};
+  return result.value
+}
 
-export const bundledStories = [loadBundledStory(harbourLightsData)];
+let bundledStoriesCache: VisualNovelManifest[] | null = null
+
+export const getBundledStories = (): VisualNovelManifest[] => {
+  if (bundledStoriesCache !== null) return bundledStoriesCache
+
+  try {
+    bundledStoriesCache = [loadBundledStory(harbourLightsData)]
+  } catch (error) {
+    console.error(error)
+    bundledStoriesCache = []
+  }
+
+  return bundledStoriesCache
+}
 
 export const getBundledStory = (storyId: string, storyVersion?: string) =>
-  bundledStories.find(
-    (story) =>
+  getBundledStories().find(
+    story =>
       story.id === storyId &&
-      (storyVersion === undefined || story.version === storyVersion),
-  ) ?? null;
+      (storyVersion === undefined || story.version === storyVersion)
+  ) ?? null

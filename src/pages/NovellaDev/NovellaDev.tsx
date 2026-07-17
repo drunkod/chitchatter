@@ -1,73 +1,102 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState } from 'react'
 
-import Box from "@mui/material/Box";
-import Button from "@mui/material/Button";
-import Chip from "@mui/material/Chip";
-import Container from "@mui/material/Container";
-import Paper from "@mui/material/Paper";
-import Stack from "@mui/material/Stack";
-import Typography from "@mui/material/Typography";
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Chip from '@mui/material/Chip'
+import Container from '@mui/material/Container'
+import Paper from '@mui/material/Paper'
+import Stack from '@mui/material/Stack'
+import Typography from '@mui/material/Typography'
 
-import type { VisualNovelSessionState } from "../../models/visualNovel";
-import { VisualNovelEngine } from "../../services/visualNovel";
-import { bundledStories } from "../../stories/catalog";
+import type { VisualNovelSessionState } from '../../models/visualNovel'
+import { VisualNovelEngine } from '../../services/visualNovel'
+import { getBundledStories } from '../../stories/catalog'
 
-const localControllerId = "local-dev";
+const localControllerId = 'local-dev'
 
 const sceneBackgrounds: Record<string, string> = {
-  pier: "linear-gradient(145deg, #081b2b 0%, #102f47 55%, #8c704e 140%)",
-  "beacon-ending":
-    "radial-gradient(circle at 70% 25%, #ffd978 0%, #9a6637 18%, #10263c 55%, #06111e 100%)",
-  "dawn-ending":
-    "linear-gradient(155deg, #f7c68a 0%, #d88974 35%, #597594 70%, #152b42 100%)",
-};
+  pier: 'linear-gradient(145deg, #081b2b 0%, #102f47 55%, #8c704e 140%)',
+  'beacon-ending':
+    'radial-gradient(circle at 70% 25%, #ffd978 0%, #9a6637 18%, #10263c 55%, #06111e 100%)',
+  'dawn-ending':
+    'linear-gradient(155deg, #f7c68a 0%, #d88974 35%, #597594 70%, #152b42 100%)',
+}
 
 const createSessionId = () => {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return `local-${crypto.randomUUID()}`;
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return `local-${crypto.randomUUID()}`
   }
-  return `local-${Date.now()}`;
-};
+  return `local-${Date.now()}`
+}
 
 export const NovellaDev = () => {
-  const story = bundledStories[0];
+  const story = getBundledStories()[0] ?? null
   const engine = useMemo(
-    () => new VisualNovelEngine(story, { now: () => Date.now() }),
-    [story],
-  );
-  const [state, setState] = useState<VisualNovelSessionState | null>(null);
-  const [error, setError] = useState<string | null>(null);
+    () =>
+      story ? new VisualNovelEngine(story, { now: () => Date.now() }) : null,
+    [story]
+  )
+  const [state, setState] = useState<VisualNovelSessionState | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
   const start = () => {
-    setError(null);
-    setState(engine.start(createSessionId(), localControllerId));
-  };
+    if (!engine) return
+    setError(null)
+    setState(engine.start(createSessionId(), localControllerId))
+  }
 
-  const apply = (operation: () => VisualNovelSessionState) => {
-    try {
-      setError(null);
-      setState(operation());
-    } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "The story could not continue",
-      );
-    }
-  };
+  const apply = (
+    operation: (current: VisualNovelSessionState) => VisualNovelSessionState
+  ) => {
+    setError(null)
+    setState(current => {
+      if (!current) return current
+
+      try {
+        return operation(current)
+      } catch (caught) {
+        queueMicrotask(() =>
+          setError(
+            caught instanceof Error
+              ? caught.message
+              : 'The story could not continue'
+          )
+        )
+        return current
+      }
+    })
+  }
+
+  if (!story || !engine) {
+    return (
+      <Container maxWidth="sm" sx={{ py: { xs: 4, sm: 8 } }}>
+        <Paper elevation={8} sx={{ p: { xs: 3, sm: 4 } }}>
+          <Stack spacing={2} alignItems="center">
+            <Typography variant="h4" component="h1">
+              Novella preview unavailable
+            </Typography>
+            <Typography color="text.secondary" textAlign="center">
+              The bundled story failed validation. Check the browser console for
+              details.
+            </Typography>
+          </Stack>
+        </Paper>
+      </Container>
+    )
+  }
 
   if (!state) {
     return (
       <Container maxWidth="sm" sx={{ py: { xs: 4, sm: 8 } }}>
-        <Paper elevation={8} sx={{ overflow: "hidden" }}>
+        <Paper elevation={8} sx={{ overflow: 'hidden' }}>
           <Box
             sx={{
               minHeight: 240,
               p: { xs: 3, sm: 5 },
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "flex-end",
-              color: "common.white",
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'flex-end',
+              color: 'common.white',
               background: sceneBackgrounds.pier,
             }}
           >
@@ -90,25 +119,26 @@ export const NovellaDev = () => {
           </Stack>
         </Paper>
       </Container>
-    );
+    )
   }
 
-  const scene = engine.getScene(state);
-  const entry = engine.getEntry(state);
-  const choices = engine.getAvailableChoices(state);
-  const ended = engine.isAtEnd(state);
+  const scene = engine.getScene(state)
+  const entry = engine.getEntry(state)
+  const choices = engine.getAvailableChoices(state)
+  const choiceDeadEnd = engine.isChoiceDeadEnd(state)
+  const ended = engine.isAtEnd(state)
 
   return (
     <Container maxWidth="md" sx={{ py: { xs: 2, sm: 4 } }}>
-      <Paper elevation={10} sx={{ overflow: "hidden" }}>
+      <Paper elevation={10} sx={{ overflow: 'hidden' }}>
         <Box
           sx={{
             minHeight: { xs: 300, sm: 430 },
             p: { xs: 3, sm: 5 },
-            display: "flex",
-            flexDirection: "column",
-            justifyContent: "space-between",
-            color: "common.white",
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            color: 'common.white',
             background: sceneBackgrounds[scene.id] ?? sceneBackgrounds.pier,
           }}
         >
@@ -123,9 +153,9 @@ export const NovellaDev = () => {
             sx={{
               mt: 8,
               p: { xs: 2.5, sm: 3.5 },
-              color: "text.primary",
-              backgroundColor: "rgba(255, 255, 255, 0.94)",
-              backdropFilter: "blur(8px)",
+              color: 'text.primary',
+              backgroundColor: 'rgba(255, 255, 255, 0.94)',
+              backdropFilter: 'blur(8px)',
             }}
           >
             {entry.speaker && (
@@ -144,12 +174,14 @@ export const NovellaDev = () => {
         </Box>
 
         <Stack spacing={2} sx={{ p: { xs: 2.5, sm: 3.5 } }}>
-          {choices.map((choice) => (
+          {choices.map(choice => (
             <Button
               key={choice.id}
               variant="contained"
               size="large"
-              onClick={() => apply(() => engine.choose(state, choice.id))}
+              onClick={() =>
+                apply(current => engine.choose(current, choice.id))
+              }
             >
               {choice.label}
             </Button>
@@ -159,10 +191,25 @@ export const NovellaDev = () => {
             <Button
               variant="contained"
               size="large"
-              onClick={() => apply(() => engine.advance(state))}
+              onClick={() => apply(current => engine.advance(current))}
             >
               Continue
             </Button>
+          )}
+
+          {choiceDeadEnd && (
+            <Stack spacing={1.5} alignItems="center">
+              <Typography color="error" textAlign="center">
+                No choices are available here — this is a story authoring dead
+                end.
+              </Typography>
+              <Button
+                variant="contained"
+                onClick={() => apply(current => engine.restart(current))}
+              >
+                Restart
+              </Button>
+            </Stack>
           )}
 
           {ended && (
@@ -173,7 +220,7 @@ export const NovellaDev = () => {
               </Typography>
               <Button
                 variant="contained"
-                onClick={() => apply(() => engine.restart(state))}
+                onClick={() => apply(current => engine.restart(current))}
               >
                 Read again
               </Button>
@@ -182,7 +229,7 @@ export const NovellaDev = () => {
 
           {error && <Typography color="error">{error}</Typography>}
 
-          <Stack direction={{ xs: "column", sm: "row" }} spacing={1}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
             <Button variant="text" onClick={() => setState(null)}>
               Back to lobby
             </Button>
@@ -194,5 +241,5 @@ export const NovellaDev = () => {
         </Stack>
       </Paper>
     </Container>
-  );
-};
+  )
+}

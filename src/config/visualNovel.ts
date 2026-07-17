@@ -1,4 +1,4 @@
-export const visualNovelProtocolVersion = 1 as const;
+export const visualNovelProtocolVersion = 1 as const
 
 export const visualNovelLimits = {
   maxStoryBytes: 512 * 1024,
@@ -15,16 +15,16 @@ export const visualNovelLimits = {
   maxIdLength: 128,
   maxLabelLength: 256,
   maxTextLength: 8 * 1024,
-} as const;
+} as const
 
 export const allowedVisualNovelAssetExtensions = new Set([
-  ".avif",
-  ".gif",
-  ".jpeg",
-  ".jpg",
-  ".mp3",
-  ".ogg",
-  ".png",
-  ".webp",
-  ".wav",
-]);
+  '.avif',
+  '.gif',
+  '.jpeg',
+  '.jpg',
+  '.mp3',
+  '.ogg',
+  '.png',
+  '.webp',
+  '.wav',
+])

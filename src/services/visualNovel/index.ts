@@ -1,2 +1,2 @@
-export * from "./VisualNovelEngine";
-export * from "./VisualNovelValidator";
+export * from './VisualNovelEngine'
+export * from './VisualNovelValidator'
