@@ -1,46 +1,42 @@
-# 05 — Pure transport-safe engine
+# 05 — Pure deterministic transport-safe engine
 
-> **Revision 11 changes:** engine semantics remain pure; the plan now makes digest computation an explicit post-engine validation step and requires every exposed transition to advance the persisted digest floor atomically.
+> **Revision 12 changes:** engine semantics remain pure; surrounding code now serializes validated output with RFC 8785 and generation-fences checkpoint publication.
 
-The engine imports no React, storage, transport, DOM, global clock, randomness, or hashing API. It receives a validated story and explicit dependencies and never mutates input.
+The engine imports no React, storage, transport, DOM, global randomness, hashing API, or implicit clock. It receives a validated story and explicit dependencies and never mutates input.
 
 ## Operations
 
 - `start(sessionId, controllerPeerId, epoch)` creates revision 0 at the manifest start entry;
-- `advance` follows explicit/implicit transitions and refuses required or fully gated choices;
-- `choose` validates choice availability, applies immutable effects, and moves to target;
+- `advance` follows explicit/implicit transitions and refuses unresolved required choices;
+- `choose` validates availability, applies immutable effects, and moves to target;
 - `restart` preserves session/controller/epoch and increments revision;
-- `changeController` preserves story content and increments revision;
-- getters assert exact story compatibility and referenced scene/entry existence.
+- `changeController` preserves story/session/epoch and increments revision;
+- getters assert exact story compatibility and referenced content.
 
-## Transport safety
+## Guard order
 
-Before returning changed state, enforce variable count/bytes, finite numbers, bounded strings, bounded history, and safe revisions. A failed guard throws before mutation. Snapshot conversion later truncates history and final validators enforce aggregate budgets.
+Before exposing changed state, enforce variable count/bytes, finite numbers, safe integers, bounded strings/history, and valid story references. Failed guards throw before mutation.
 
-## Digest boundary
-
-The engine does not decide distributed priority. After engine output:
+## Distributed boundary
 
 ```text
-normalize returned state
+engine output
+→ fresh structural normalization
 → semantic validation
-→ canonicalStateBytes
-→ SHA-256 state digest
-→ lock-scoped floor/state transaction
+→ RFC 8785 canonical bytes
+→ domain-separated SHA-256 digest
+→ lock-scoped metadata/floor/store install
+→ generation-fenced checkpoint side effect
 ```
 
-`updatedAt` remains diagnostic and is excluded from semantic bytes. The canonical event envelope still provides one shared timestamp during normal progression.
+`updatedAt` remains diagnostic and is absent from the semantic object.
 
-## Determinism
+## Determinism tests
 
-Given identical normalized manifest, input state, requested action, and injected clock, the engine returns byte-identical semantic state. Replicas replay progression and compare scene/entry/variables plus computed digest before application.
-
-## Tests
-
-- starts, endings, explicit next, restart, controller change;
-- gated/unavailable/dead-end choices;
-- string/boolean/numeric effects and nonfinite rejection;
-- variable/history/byte overflow leaves state unchanged;
-- deterministic random walks produce equal canonical bytes and SHA-256 digests;
-- every accepted engine transition advances outcome floor in its surrounding transaction;
-- collision-test hook never causes arbitrary state selection.
+- starts, endings, restart, controller change, explicit and implicit next;
+- gated/dead-end choices and effect failures;
+- overflow leaves input unchanged;
+- random walks yield identical RFC 8785 bytes and digests;
+- browser and Node JCS fixtures match;
+- every accepted transition advances floor in its transaction;
+- old generation checkpoint publication is rejected.

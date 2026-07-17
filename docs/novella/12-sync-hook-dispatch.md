@@ -1,6 +1,6 @@
-# 12 — Sync runtime, dispatch, coherent recovery, and lifecycle refresh
+# 12 — Sync runtime, dispatch, refresh, and safety recovery
 
-> **Revision 11 changes:** runtime boots from a stable-generation snapshot, supports conflict rebasing, refreshes generations on focus and before actions, and separates observe-only capability failure from installing operation.
+> **Revision 12 changes:** adds dedicated supersession/floor/safety-recovery dispatch, generation-fenced checkpoints, and explicit local versus durable lock handling.
 
 ## Ready inputs
 
@@ -15,72 +15,56 @@ interface Options {
 }
 ```
 
-No installing receiver exists before coherent bootstrap classification, stories, floor, origin, and strongest full-state baseline are ready.
-
-## Canonical store
-
-The sync service owns canonical state. `transactAndInstall` updates metadata and store synchronously under the room lock. React uses `useSyncExternalStore`. No handler retains deferred `setState` after persistence.
+No installing receiver exists before emergency-lock check, coherent bootstrap classification, transition validation, stories, floor, and strongest baseline are ready.
 
 ## Receive path
 
 ```text
-normalize → outer identity → gate → participation
-→ semantic validation/digest → authorization or rebase
-→ lock-scoped metadata/store transaction
-→ duplicate commit → checkpoint side effects
+normalize → identity → pre-gate safety recovery/supersession gate
+→ participation → semantic validation/JCS digest
+→ authorization or rebase → room-lock transaction
+→ duplicate commit → generation-fenced checkpoint side effect
 ```
 
-Dispatch is exhaustive for all 22 actions.
+Dispatch is exhaustive for all actions, including `STATE_FLOOR_GOSSIP`, `SESSION_SUPERSESSION_GOSSIP`, and both safety-recovery actions.
 
 ## Recovery map
 
-Records are keyed by action ID and bind target, kind, epoch/session, expected floor digest, conflict/migration identity, and expiry.
+Records bind target, request ID, kind, epoch/session, expected floor digest, conflict/migration identity, and expiry. Response processing re-reads latest metadata.
 
-At response time:
+- changed floor → exact rebase;
+- floor-only winner → floor gossip and canonical recovery;
+- ended/higher epoch → cancel matching records;
+- capacity lock → only safety-recovery record remains active;
+- runtime capability/storage failure → no network install recovery.
 
-- refresh/re-read latest metadata inside executor;
-- reject closed/safety-locked outcome;
-- if floor changed, apply kind-specific rebase rather than trusting stale expected floor;
-- success removes only that request;
-- end/higher epoch cancels all matching records.
+## Stale-peer response priority
 
-## Conflict handling
+1. exact completed-end certificate when current subject ended;
+2. generic supersession evidence for any subject below high water;
+3. active-epoch reconciled history plus complete/floor evidence;
+4. pending end;
+5. current transition origin/start decision;
+6. snapshot/progression response.
 
-Exact descriptor and stale descriptor share one handler. Stale descriptor does not fail merely because local state advanced. It compares incoming with latest state/floor and emits/applies a fresh descriptor.
-
-## Request response priority
-
-1. completed end certificate;
-2. switched/older-epoch disposition with successor evidence;
-3. active-epoch reconciled history plus current canonical full-state evidence when recovery requested;
-4. pending original termination;
-5. active origin/start decision gossip;
-6. controller snapshot/progression response.
-
-A disposition never hides stronger recovery evidence.
+No stale authenticated request is silently dropped merely because historical disposition history was compacted.
 
 ## External generation repair
 
-Metadata notifications queue on the same executor. Additionally call `ensureLatestGeneration()`:
+Call `ensureLatestGeneration()` on notifications, focus, visibility, before every state-changing UI action/send, and before start/migration rounds. Advanced generation triggers null/recovery/safety phase as appropriate.
 
-- when document becomes visible;
-- when window regains focus;
-- before every novella state-changing UI action or controller send;
-- before opening migration/start rounds.
+## Lock handling
 
-If generation advanced:
+- durable capacity/digest locks come from RoomMeta;
+- lock-unavailable/storage-failure are runtime states;
+- generic gate rejects installs while locked;
+- capacity recovery gossip is processed by the dedicated pre-gate path;
+- capability reprobe or storage repair performs a fresh coherent bootstrap before re-enabling receiver.
 
-- ended/switched live session → null/recovery transition;
-- changed outcome or floor above local state → read-only exact recovery;
-- safety lock → persistent error phase;
-- older/equal generation → ignore.
+## Checkpoint publication
 
-This repairs a sibling tab crash after durable write but before generation publication.
+After transaction success, call `publishCheckpoint(token, state)`. The service writes the session blob, then under the room lock rechecks generation, outcome session, and floor digest before replacing the latest pointer. Stale tokens leave the blob unreferenced and cannot overwrite a newer pointer.
 
-## Lock capability
+## Cleanup
 
-If room-scoped Web Locks are unavailable/denied, do not attach an installing receiver. Render a read-only capability state and leave chat/media/files active. Never use an unlocked mutation fallback.
-
-## Lifecycle
-
-Peer events append/retry migration lineage but never expire it. Joins receive snapshot, pending end, end certificate, or disposition plus successor as applicable. Cleanup removes only novella handlers/timers, closes subscriptions, and invalidates pending operations. Room-key change unmounts old runtime before new bootstrap.
+Cancel timers, recoveries, safety requests, focus listeners, generation subscriptions, and store subscriptions. Room-key change unmounts the old runtime before the new bootstrap.

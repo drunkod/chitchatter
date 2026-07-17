@@ -1,16 +1,14 @@
-# 10 — Session-bound migration lineage, supersession, and rebasing
+# 10 — Lineage-bound controller migration and rebasing
 
-> **Revision 11 changes:** migration uses the unified SHA-256 comparator, rebases stale migration descriptors, refreshes generation before election sends, and enters room-wide safety lock on lineage exhaustion.
+> **Revision 12 changes:** advertisements identify exact migration records, retained authority survives controller rejoin, and floor-only migration conflicts return floor evidence.
 
-## Opening authority
+## Opening migration authority
 
-On current-controller departure, after `ensureLatestGeneration()`, append:
+After `ensureLatestGeneration()`, current-controller absence may append:
 
 ```ts
 const record: MigrationRecord = {
-  migrationId: deriveRoundId(
-    `migration:${state.sessionEpoch}:${state.sessionId}:` +
-    `${departedPeerId}:${state.revision}`),
+  migrationId: deriveRoundId(rawEpochSessionDepartedRevisionFields),
   sessionEpoch: state.sessionEpoch,
   sessionId: state.sessionId,
   departedControllerPeerId: departedPeerId,
@@ -19,63 +17,55 @@ const record: MigrationRecord = {
 }
 ```
 
-The transaction requires active unclosed outcome, matching story/session/epoch, no terminal disposition, and no safety lock.
+Absence is checked here. Once persisted, later peer rejoin does not revoke the record.
 
 ## Lineage
 
-Each later controller departure appends. Entries remain until exact-session terminal disposition, higher epoch, or reset. Current-epoch lineage never trims.
+Sequential departures append records and never replace older unresolved authority. Records remain until terminal disposition, higher epoch, or reset. Lineage-capacity exhaustion writes the durable capacity lock using reserved headroom.
 
-At `maxMigrationLineage`, atomically set capacity safety lock and keep all existing authority. Do not discard an older record and do not continue novella controls.
+## Advertisement
 
-## Announcement authorization
+```ts
+ELECTION_ADVERTISE {
+  roundId,
+  migrationId,
+  departedControllerPeerId,
+  openedAtRevision,
+  state,
+}
+```
 
-Require selected migration ID in lineage; outer sender = announced/state controller; state session/epoch/story matches active outcome; canonical electorate and round ID; departed controller absent from current transport view; epoch installable; incoming equal to or above floor and able to beat strongest complete baseline.
+Validator selects the exact lineage record and recomputes round ID from migration ID, epoch/session, departed controller, opening revision, sender, and state digest. Interleaved advertisements for different lineage records cannot share one round.
 
-Delayed announcements from earlier lineage entries remain admissible.
+## Controller changed
 
-## Application
+`CONTROLLER_CHANGED` repeats migration ID and departed-controller identity, includes canonical electorate/controller, and carries complete state. Authorization requires the selected lineage record but does **not** require the departed peer to remain absent.
 
 Inside `transactAndInstall`:
 
 - re-read latest outcome/floor/origin/lineage;
-- reselect migration entry;
-- recheck generation-independent authorization and closed/safety-lock state;
-- compare SHA-256 priority against latest state/floor;
-- update selected record’s `lastAppliedState`;
-- advance floor;
-- synchronously install incoming state.
+- reselect record;
+- recheck closed/safety state;
+- compare against latest full state/floor;
+- update selected record’s last-applied state;
+- advance floor and install.
 
-## Migration reconciliation rebase
+## Migration rebase
 
-If announcement loses, send `SESSION_RECONCILE` with kind `migration`, selected migration ID, latest winner state, and descriptor for the actual pair.
+A weaker announcement receives a migration-kind reconcile descriptor. On stale delivery:
 
-On receipt:
-
-- exact descriptor applies when receiver baseline is the other digest;
-- if receiver progressed, rebase incoming against latest baseline;
 - incoming winner applies with fresh descriptor;
-- incoming loser receives latest winner/fresh descriptor;
-- equal digest is idempotent with collision check.
-
-This prevents a rev10 descriptor from becoming unusable after rev11 progress.
-
-## Interaction with session conflicts
-
-Cross-session controller changes reject. A different-session start reconciliation replaces active origin/outcome and clears old lineage. If the new canonical controller is absent, append a new lineage record before election traffic.
-
-## Generation repair
-
-Before advertisements or controller-change sends, refresh latest metadata generation. Focus/visibility refresh also catches a sibling-tab commit whose generation publication was lost.
+- complete local winner is returned with fresh descriptor;
+- floor-only local winner returns `STATE_FLOOR_GOSSIP` and starts recovery;
+- equal digest is idempotent subject to collision checks.
 
 ## Tests
 
-- two/three sequential departures retain earlier IDs;
-- delayed earlier-lineage winner converges;
-- rev10 descriptor arriving at rev11 rebases;
-- delayed weaker announcement receives fresh descriptor;
-- full-state and floor digest ordering agree;
-- lineage overflow enters safety lock;
-- lock-unavailable browser never opens election authority;
-- reload/focus refresh preserves lineage;
-- cross-session announcement rejects;
+- two/three lineage records and interleaved advertisements;
+- advertisement missing/wrong migration ID rejects;
+- departed controller rejoins before delayed earlier-lineage announcement;
+- delayed earlier-lineage stronger state converges;
+- descriptor rev10→rev11 rebase with full and floor-only receiver;
+- lineage overflow persists capacity lock;
+- lock-unavailable browser opens no authority;
 - end/higher epoch clears lineage.

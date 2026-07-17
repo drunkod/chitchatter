@@ -1,95 +1,61 @@
-# 09 — Coordinated starts, rebasing reconciliation, and story switch
+# 09 — Coordinated starts, reconciliation, and epoch transitions
 
-> **Revision 11 changes:** uses the SHA-256 comparator everywhere, persists generalized active origin, rebases stale descriptors, deterministically upserts reconciliation history, and gives switched notices complete successor evidence.
+> **Revision 12 changes:** every new epoch persists a transition certificate, switch recovery uses a retained chain rather than only current origin, and floor-only losers receive floor evidence.
 
-## Normal start
+## Initial start
 
-Coordinator collects revision-0 proposals and selects deterministically. One `transactAndInstall` operation:
+Coordinator selects revision-0 proposal deterministically. One transaction:
 
-- requires candidate epoch `highWater + 1`;
+- requires `highWaterEpoch === 0`;
+- creates the epoch-1 `initial-start` transition;
 - creates active outcome/floor;
-- stores `activeOrigin = { kind: 'start-decision', decision }`;
-- clears old lineage/conflicts/recovery;
-- installs exact validated state.
+- stores active origin referencing the transition/start decision;
+- installs exact state;
+- clears obsolete runtime operations.
 
-Broadcast and duplicate commit follow transaction success.
+Broadcast follows success.
 
-## Baselines
+## Start after ended epoch
 
-Complete-state comparison considers current canonical store, coherent boot checkpoint, every lineage last state, active-origin revision-0 state, and durable floor. All use the same SHA-256 final tie-break.
+A fresh start after an ended outcome creates exactly `highWater + 1` and an `EpochTransitionCertificate(kind: 'start-after-ended')` whose predecessor is the exact ended outcome. The transition and new state install atomically.
 
-A floor-only peer cannot reverse the winner selected by a full-state peer.
+## Reconciliation
 
-## Decision/gossip acceptance
+Complete-state baselines include canonical store, coherent checkpoint, lineage states, active-origin state where available, and floor. All use the RFC 8785 SHA-256 comparator.
 
-- reject below high water or at ended high water;
-- require immutable story identity for same session;
-- compare incoming against strongest complete baseline and floor;
-- digest equality is idempotent only when complete-state canonical bytes also match;
-- winning different session requires matching origin;
-- transaction replaces outcome/floor/origin, upserts one reconciled disposition for loser, and installs;
-- winning same-session state advances floor/state only.
+- exact descriptor path applies normally;
+- stale descriptor path rebases;
+- different-session winner carries origin/transition evidence;
+- logical reconciled disposition upserts by `(epoch, losingSession, reconciled)`;
+- former loser remains eligible while epoch active;
+- floor-only local winner returns floor evidence and begins full-state recovery.
 
-Disposition upsert key is `(epoch, losingSessionId, 'reconciled')`; canonical informational `evidenceId` is the bytewise minimum conflict ID seen for that logical record.
+## Controller story switch
 
-## Exact and stale conflict descriptors
+`SESSION_STARTED` payload contains predecessor subject/revision and revision-0 successor state. The transaction:
 
-```text
-incoming digest belongs to descriptor
-latest baseline digest == other digest → exact path
-latest baseline digest changed          → rebase path
-```
+1. verifies sender controls the predecessor;
+2. creates one `switch` transition certificate;
+3. upserts switched disposition with `evidenceId = transitionId`;
+4. raises high water exactly one;
+5. stores successor outcome/floor and active origin;
+6. installs successor state;
+7. clears predecessor lineage/conflicts/recovery.
 
-Rebase path compares incoming with latest baseline/floor, then:
+## Supersession chain
 
-- incoming wins: derive a fresh descriptor from latest+incoming and apply;
-- incoming loses: return latest state with fresh descriptor;
-- equal: idempotent commit.
+For stale session A after A→B→C, holder sends both retained transitions A→B and B→C plus current C outcome/origin/state. If C ended, current origin is null and C’s completed-end certificate is included. The A disposition’s evidence ID remains the A→B transition ID.
 
-The response’s new descriptor supersedes runtime records for the stale conflict ID. Repeated stale deliveries therefore converge instead of looping.
-
-## Former loser
-
-A current-epoch reconciled timeline may later present stronger complete state. It remains eligible. If it wins, the former winner receives its own reconciled disposition and the outcome/origin/floor switch atomically.
-
-## Ended epoch
-
-Ending canonical outcome preserves final floor, clears active origin/lineage, cancels conflicts/recoveries, and blocks every same-epoch install path.
-
-## Story switch and successor evidence
-
-Controller-authorized switch creates exact next epoch with a revision-0 `SESSION_STARTED` state. The transaction:
-
-- adds switched disposition for old session with `evidenceId = newOrigin.actionId`;
-- raises high water;
-- creates active outcome/floor;
-- stores `activeOrigin = { kind: 'session-started', ... }`;
-- installs new state;
-- clears old lineage/conflicts/recovery.
-
-A holder replying about the switched session sends:
-
-```ts
-SESSION_RETIREMENT_GOSSIP {
-  disposition,
-  successor: {
-    outcome: currentOutcome,
-    origin: currentOrigin,
-    knownState: currentStateOrNull,
-  },
-}
-```
-
-The stale receiver merges disposition and successor atomically. Full known state installs if it exactly matches floor; otherwise floor-only recovery starts.
+Every below-high-water subject receives a chain beginning after its epoch, even if its exact disposition was compacted.
 
 ## Tests
 
-- full-state/floor digest tie picks same winner;
-- former loser later wins and reversed delivery converges;
-- exact descriptor and rev10→rev11 rebase;
-- repeated logical reconciliation uses one disposition slot;
-- different-session reconcile accepts either origin type;
-- same-session story mismatch rejects;
-- switched notice before successor snapshot raises high water and enters recovery;
-- ended epoch rejects queued decision/snapshot/reconcile;
-- transaction failure exposes no replacement.
+- RFC 8785/full-floor winner equivalence;
+- initial and start-after-ended transitions;
+- A→B→C delayed A recovery;
+- A→B then B ended delayed A recovery;
+- stale descriptor exact/full-state/floor-only paths;
+- former loser later wins;
+- repeated reconciliation uses one slot;
+- switch envelope action/state/predecessor mismatch rejects;
+- ended high-water rejects queued installs.

@@ -1,6 +1,6 @@
-# 01 — Protocol constants, digest ordering, terminality, and safety capacity
+# 01 — Protocol constants, RFC 8785 ordering, epochs, and safety locks
 
-> **Revision 11 changes:** specifies the exact canonical-state SHA-256 function, makes that digest the global final tie-break, corrects ended/switched terminality, and defines the room-wide safety lock used for capacity or lock-capability failures.
+> **Revision 12 changes:** replaces the custom JSON wording with exact RFC 8785/JCS bytes, adds retained transition-chain and emergency-reserve limits, and defines a complete safety-lock recovery matrix.
 
 ## Limits
 
@@ -12,7 +12,10 @@ export const visualNovelLimits = {
   maxSnapshotBytes: 64 * 1024,
   maxVariablesBytes: 24 * 1024,
   maxHistoryBytes: 16 * 1024,
+
   maxRoomMetaBytes: 2 * 1024 * 1024,
+  roomMetaEmergencyReserveBytes: 4096,
+  maxOperationalRoomMetaBytes: 2 * 1024 * 1024 - 4096,
 
   maxHistoryEntries: 256,
   maxSnapshotHistoryEntries: 32,
@@ -23,7 +26,6 @@ export const visualNovelLimits = {
   maxDialogueEntriesPerScene: 512,
   maxChoicesPerEntry: 16,
   maxIdLength: 128,
-  maxLabelLength: 256,
   maxTextLength: 8 * 1024,
 
   maxSeenActionIds: 2048,
@@ -31,9 +33,11 @@ export const visualNovelLimits = {
   maxHistoricalEndCertificates: 24,
   maxCurrentEpochDispositions: 16,
   maxCurrentEpochEndCertificates: 16,
+  maxEpochTransitions: 64,
   maxMigrationLineage: 8,
   maxOutstandingRecoveries: 16,
   maxOpenConflicts: 16,
+  maxSupersessionChain: 64,
 
   requestTimeoutMs: 10_000,
   recoveryRecordTtlMs: 30_000,
@@ -46,11 +50,11 @@ export const visualNovelLimits = {
 } as const
 ```
 
-Timers govern retry activity only. They never expire durable authority.
+Normal metadata mutations must remain below `maxOperationalRoomMetaBytes`. The reserved bytes are available only for the compact durable safety lock and its generation update.
 
-## Exact semantic bytes
+## Semantic state object
 
-Construct a new semantic object with only these normalized fields, in this order-independent schema:
+Construct a fresh object containing exactly:
 
 ```ts
 {
@@ -68,20 +72,26 @@ Construct a new semantic object with only these normalized fields, in this order
 }
 ```
 
-`updatedAt` is omitted only at the top-level state schema. Do not recursively delete arbitrary properties named `updatedAt`.
+`updatedAt` and unknown fields are excluded only because they are absent from this semantic schema.
 
-Canonical JSON rules:
+## Exact RFC 8785/JCS serialization
 
-- strings use JSON escaping and Unicode scalar values as normalized input already accepted by validators;
-- object keys are sorted by unsigned UTF-8 bytes, not locale or UTF-16 collation;
-- arrays preserve order;
-- numbers are finite safe JSON numbers and use the implementation’s validated canonical JSON number encoder;
-- no whitespace;
-- unknown fields were already dropped by normalization.
+`canonicalStateBytes` is UTF-8 of the RFC 8785 JSON Canonicalization Scheme serialization of the semantic object.
 
-`canonicalStateBytes` is UTF-8 of that canonical JSON.
+Required profile:
 
-## Exact state digest
+- input is I-JSON-compatible; reject lone UTF-16 surrogates and nonfinite numbers;
+- object property names sort lexicographically by UTF-16 code units exactly as RFC 8785 specifies;
+- strings use the RFC 8785 escaping rules: escape control characters, quote, and backslash only; do not escape `/` or ordinary non-ASCII characters;
+- hexadecimal escape digits are lowercase;
+- numbers use the ECMAScript/IEEE-754 shortest round-trippable serialization required by RFC 8785;
+- `-0` serializes as `0`;
+- no whitespace is emitted;
+- arrays retain their validated order.
+
+Do not substitute locale order, UTF-8 key order, insertion order, ordinary `JSON.stringify` over unsorted objects, or a third-party “stable JSON” package without RFC 8785 conformance fixtures.
+
+## Exact state digest and ordering
 
 ```text
 stateDigest = lowercaseHex(
@@ -92,18 +102,7 @@ stateDigest = lowercaseHex(
 )
 ```
 
-Requirements:
-
-- exactly 64 lowercase hexadecimal characters;
-- Web Crypto SHA-256 in browsers and the corresponding Node SHA-256 in tests;
-- digest computed and cached after structural/semantic validation, before authorization;
-- FNV-derived IDs remain bookkeeping only and are never used for state equality or ordering.
-
-If two complete normalized states produce the same digest but different canonical bytes, enter a persistent protocol-collision safety error. Never choose one arbitrarily.
-
-## One total ordering
-
-Use relational comparisons rather than integer subtraction:
+The digest is exactly 64 lowercase hexadecimal characters. Browser code uses Web Crypto SHA-256; Node tests use the corresponding SHA-256 implementation.
 
 ```ts
 const compareStatePriority = (a: ValidatedState, b: ValidatedState): number =>
@@ -114,66 +113,43 @@ const compareStatePriority = (a: ValidatedState, b: ValidatedState): number =>
   -compareDigestBytes(a.digest, b.digest)
 ```
 
-Positive means `a` wins. Lower controller ID, session ID, and digest win ties. `compareStateToFloor` uses exactly the same tuple. This is the only distributed ordering.
+`compareStateToFloor` uses the identical tuple. Equal digest with unequal canonical bytes enters a digest-collision safety lock.
 
-## Canonical comparator floor
+## Epoch transition rules
 
-```ts
-interface CanonicalStateFloor {
-  sessionId: string
-  sessionEpoch: number
-  storyId: string
-  storyVersion: string
-  controllerPeerId: string
-  revision: number
-  stateDigest: string
-}
-```
+- Epoch 1 has an `initial-start` transition with no predecessor.
+- Every later epoch has exactly one transition whose predecessor epoch is `epoch - 1`.
+- Transition kinds are `start-after-ended` and `switch`.
+- Transition successor state is revision 0 and exactly matches the successor floor.
+- `epochTransitions` is contiguous, canonically ordered, and never trimmed before explicit reset.
+- Transition-capacity exhaustion enters the durable capacity lock rather than discarding provenance.
 
-A state below the floor is stale. Equal priority requires exact digest equality. A higher state installs only through an authorized complete-state path. Every canonical exposure advances the floor transactionally.
-
-## Epoch and terminality rules
-
-- first committed session is epoch 1;
-- fresh start/switch creates `highWaterEpoch + 1`;
-- every durable record epoch is `<= highWaterEpoch`;
-- ended high-water outcome blocks every same-epoch state-installing action;
-- higher epoch supersedes every older epoch;
-- current-high-water safety evidence never trims.
+## Terminality
 
 ```ts
-const dispositionIsTerminal = (
-  disposition: SessionDisposition,
-  meta: RoomMeta,
-): boolean => {
-  if (disposition.sessionEpoch < meta.highWaterEpoch) return true
-  if (disposition.reason === 'ended') {
-    return hasExactCompletedEndCertificate(meta, disposition)
-  }
-  // A valid switched disposition is merged only with successor evidence,
-  // which raises high water above its epoch.
+const dispositionIsTerminal = (d: SessionDisposition, meta: RoomMeta): boolean => {
+  if (d.sessionEpoch < meta.highWaterEpoch) return true
+  if (d.reason === 'ended') return hasExactCompletedEndCertificate(meta, d)
   return false
 }
 ```
 
-`reconciled` is nonterminal at active high water. `SESSION_RETIREMENT_GOSSIP` never authoritatively carries `ended`; completed-end gossip carries certificate and disposition together.
+A `switched` record is persisted only as historical evidence below high water in the same transaction as its transition. `reconciled` remains nonterminal at active high water.
 
-## Safety lock
+## Safety-lock matrix
 
-`RoomMeta` or runtime may enter:
+Durable metadata lock kinds:
 
-```ts
-type NovellaSafetyLock =
-  | { kind: 'capacity'; code: string }
-  | { kind: 'lock-unavailable'; code: string }
-  | { kind: 'digest-collision'; code: string }
-  | { kind: 'storage-failure'; code: string }
-```
+| Kind | Entry | Permitted clearing |
+| --- | --- | --- |
+| `capacity` | current evidence/transition/lineage or operational byte limit reached | verified higher-epoch safety recovery chain, or explicit reset |
+| `digest-collision` | same digest, unequal RFC 8785 bytes | explicit reset after protocol upgrade only |
 
-While locked:
+Runtime-only states:
 
-- disable all novella state-changing controls and outgoing state requests;
-- reject state-installing network actions;
-- retain chat/media/file functionality;
-- permit only verified higher-epoch successor recovery or explicit user-confirmed reset when the lock kind allows it;
-- show a persistent actionable error.
+| Kind | Entry | Permitted clearing |
+| --- | --- | --- |
+| `lock-unavailable` | Web Lock missing/denied/probe failure | successful local capability reprobe and coherent bootstrap |
+| `storage-failure` | read/write/transaction/store failure | successful local storage repair, emergency-marker check, and coherent bootstrap |
+
+The generic gate rejects installs while locked, except the dedicated pre-gate `SAFETY_RECOVERY_GOSSIP` path for a durable `capacity` lock. Same-epoch evidence never clears a lock.

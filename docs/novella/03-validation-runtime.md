@@ -1,121 +1,114 @@
 # 03 — Runtime structural validation and normalization
 
-> **Revision 11 changes:** validates the exact SHA-256 digest format, generalized session origins, successor evidence, deterministic disposition upserts, stale-conflict rebasing inputs, and coherent bootstrap snapshots.
+> **Revision 12 changes:** validates RFC 8785 inputs, contiguous transition certificates, supersession chains, safety-recovery exceptions, lineage-bound advertisements, and generation-fenced checkpoints.
 
-## Envelope order
+## Envelope pipeline
 
-1. reject over-budget encoded input before deep traversal;
-2. validate protocol, action, primitive fields, timestamp, and revision;
-3. normalize the selected discriminated payload into fresh objects;
-4. cross-check outer scope with embedded subject scope;
+1. reject encoded input above the envelope budget before deep traversal;
+2. validate protocol/action/primitive fields;
+3. normalize the discriminated payload into fresh objects;
+4. cross-check outer subject scope and transport sender identity;
 5. drop unknown fields and MVP `proof`;
-6. resolve semantic story validation;
-7. compute/cache exact canonical bytes and SHA-256 digest for complete states.
+6. run semantic story/state validation;
+7. serialize complete states with RFC 8785 and compute the exact SHA-256 digest.
 
-## Digest and comparator inputs
+## RFC 8785 prerequisites
 
-- `stateDigest` is exactly 64 lowercase hex characters;
-- recompute it from the Revision 11 domain-separated canonical bytes;
-- do not trust supplied digest values;
-- complete-state comparison consumes `ValidatedState` wrappers;
-- equal digest with different canonical bytes triggers the digest-collision safety lock.
+Reject complete states containing:
 
-## Session origins
+- lone UTF-16 surrogates;
+- nonfinite numeric values;
+- unsafe integer fields;
+- unsupported value types;
+- unknown semantic-state properties after normalization.
 
-`start-decision` origin validation recomputes the start decision ID and requires revision 0.
+Tests must include official-style JCS fixtures plus project fixtures for control escapes, non-ASCII strings, `-0`, exponent thresholds, and property order.
 
-`session-started` origin validation requires:
+## Transition certificates
 
-- bounded action/controller IDs;
-- embedded state revision 0;
-- embedded controller equals the origin controller;
-- exact story/session/epoch scope;
-- state semantically valid for the bundled story.
+Validate every `EpochTransitionCertificate`:
 
-`activeOrigin` must match the active outcome. A different-session reconcile carries the incoming origin, whether start decision or switched-session origin.
+- `initial-start` is epoch 1 with `predecessorOutcome: null`;
+- later transitions have predecessor epoch exactly `successor.epoch - 1`;
+- transition array is contiguous from epoch 1 through `highWaterEpoch`;
+- successor outcome is active and its floor revision is 0;
+- start-decision origin exactly matches successor floor/session/story;
+- session-started certificate contains the full normalized original envelope;
+- `SESSION_STARTED` outer sender equals the predecessor controller and payload predecessor subject/revision matches the prior outcome/state authorization;
+- transition ID recomputes from all normalized raw fields;
+- switch disposition evidence ID equals its transition ID.
 
-## Conflict descriptors and rebasing
+## Supersession chains
 
-Validate:
+For `SESSION_SUPERSESSION_GOSSIP` and `SAFETY_RECOVERY_GOSSIP`:
 
-- canonical bytewise order of session IDs and SHA-256 digests;
-- recomputed `conflictId` from kind, epoch, ordered IDs, optional migration ID, and ordered digests;
-- incoming state digest equals one descriptor digest;
-- start conflicts have no migration ID;
-- migration conflicts select an ID in retained lineage;
-- same-session conflict has exact story identity;
-- different-session conflict has valid incoming origin.
+- requested subject matches the stale envelope/request being answered;
+- transition list is nonempty, bounded, contiguous, and begins after the requested epoch;
+- every certificate validates independently;
+- final transition successor equals `currentOutcome`;
+- active current outcome has matching `currentOrigin` and no end certificate;
+- ended current outcome has null origin and exact end certificate;
+- current known state, when present, exactly matches floor priority and digest.
 
-Two authorization modes exist:
+A chain may advance over several switches or a start-after-ended transition. It never rewrites historical transition IDs.
 
-1. **Exact descriptor:** receiver’s latest baseline digest is the other descriptor digest.
-2. **Stale descriptor:** receiver’s baseline advanced. The descriptor is accepted only as correlation; authorization rebases incoming against the latest baseline and derives a fresh descriptor if needed.
+## Conflict descriptor modes
 
-A pre-existing runtime conflict record is not required.
+- descriptor IDs and digests are canonically ordered and recomputed;
+- incoming digest belongs to the descriptor;
+- migration kind selects a retained lineage record;
+- exact mode requires latest baseline digest to be the other digest;
+- stale mode accepts the descriptor only as correlation and rebases against latest state/floor;
+- floor-only stale mode may return `STATE_FLOOR_GOSSIP` instead of a complete winner.
 
-## Completed-end certificate
+## Migration envelopes
 
-Require certificate session, epoch, story ID/version to equal the embedded original `SESSION_ENDED` envelope and:
+`ELECTION_ADVERTISE` and `CONTROLLER_CHANGED` both require:
 
-```ts
-end.payload.sessionEpoch === certificate.sessionEpoch
-```
+- `migrationId`, departed controller, and opening revision matching one retained record;
+- round ID recomputed from migration ID, epoch/session, departed controller, opening revision, electorate where applicable, controller, and state digest;
+- same session/epoch/story as lineage and active outcome;
+- current peer presence does not invalidate an already-retained migration record.
 
-The original end is exact-next revision from the then-current controller. End gossip is bootstrap-scoped/revision 0 and identifies the holder.
+Transport absence is checked only when opening a new migration record.
 
-## Disposition and successor evidence
+## Dispositions and end evidence
 
-Disposition key is `(sessionEpoch, sessionId, reason)`.
-
-- `ended` disposition is persisted only through completed-end certificate processing; retirement gossip carrying `ended` is rejected;
-- `switched` retirement gossip requires non-null successor evidence whose outcome epoch is greater than the disposed epoch;
-- successor origin exactly matches successor outcome session/epoch/story;
-- successor known state, when present, exactly matches the outcome floor digest and priority fields;
-- `reconciled` may omit successor; if successor is present, it must describe the current canonical outcome;
-- duplicate logical disposition keys merge deterministically:
-  - ended/switched conflicting evidence IDs are a blocking contradiction;
-  - reconciled uses the bytewise smaller conflict ID as canonical informational evidence.
-
-A switched disposition is never stored at the current active high-water epoch. It is merged in the same transaction that raises the receiver to successor high water.
-
-## Migration lineage
-
-- entries sorted/unique by `(openedAtRevision, migrationId)`;
-- migration ID binds epoch, session, departed controller, and opening revision;
-- every entry shares lineage session/epoch;
-- `lastAppliedState`, when present, shares session/epoch/story;
-- controller-changed payload selects one retained migration ID;
-- electorate remains sorted, unique, bounded, excludes departed controller, and elects minimum ID.
+- ended disposition enters RoomMeta only atomically with its exact completed certificate;
+- retirement gossip carrying ended is rejected;
+- switched disposition must match one retained transition certificate;
+- reconciled logical key is `(epoch, sessionId, reason)` and merges by bytewise-minimum conflict ID;
+- ended/switched conflicting evidence IDs are blocking contradictions.
 
 ## RoomMeta normalization
 
 Reject:
 
-- any durable epoch greater than high water;
-- high water 0 with protocol evidence;
-- nonzero high water without matching outcome;
-- outcome/floor mismatch;
-- ended outcome with active origin or lineage;
-- active origin or lineage inconsistent with outcome;
-- certificate without exact ended disposition or ended disposition without certificate;
-- switched disposition at high water;
-- active canonical session with a terminal disposition;
-- duplicate/noncanonical evidence after deterministic upsert;
-- current-epoch bound overflow unless the metadata is already in the corresponding safety-lock state;
-- malformed safety-lock code;
-- invalid generation/byte budget.
+- nonzero high water without exactly `highWaterEpoch` contiguous transition certificates;
+- transition predecessor/successor discontinuity;
+- outcome/floor/current-origin mismatch;
+- switched disposition with missing/mismatched transition;
+- ended disposition/certificate mismatch;
+- lineage inconsistent with active outcome;
+- migration advertisements referring to no lineage record;
+- any durable epoch above high water;
+- operational metadata above `maxOperationalRoomMetaBytes` without a durable safety lock;
+- total metadata above `maxRoomMetaBytes`;
+- malformed or impermissibly cleared durable safety lock;
+- duplicate/noncanonical evidence;
+- invalid generation or checkpoint token fields.
 
-Malformed RoomMeta blocks receiver attachment. A valid stale checkpoint does not.
+Malformed RoomMeta blocks receiver attachment. Runtime capability/storage states are separate from RoomMeta validation.
 
 ## Required tests
 
-- exact digest domain/encoding and lowercase-hex validation;
-- canonical-byte/digest collision hook enters safety lock;
-- both origin variants and successor consistency;
-- switched notice without successor rejects;
-- ended retirement gossip rejects;
-- deterministic disposition upsert under opposite delivery order;
-- exact and stale conflict descriptor paths;
-- high-water and terminality contradictions;
-- current-epoch overflow requires safety lock;
+- RFC 8785 string/number/property fixtures in browser and Node;
+- A→B→C transition chain and A→B then B ended;
+- transition ID/action-state mix-and-match rejection;
+- interleaved advertisements for two migration IDs;
+- controller rejoin does not invalidate retained lineage;
+- stale below-high-water supersession chain validation;
+- capacity lock fits reserved metadata headroom;
+- checkpoint pointer generation/floor mismatch rejection;
+- exact, stale-full-state, and stale-floor-only conflict modes;
 - alias-free normalization for every action and record.

@@ -1,6 +1,6 @@
-# 08 — Sync service, gate, transactions, recovery, and conflict rebasing
+# 08 — Sync gate, supersession, safety recovery, and conflict rebasing
 
-> **Revision 11 changes:** fixes terminality, carries switched successor evidence, defines stale-descriptor rebasing, adds coherent bootstrap/freshness APIs, and forbids unsafe operation without Web Locks.
+> **Revision 12 changes:** replaces below-high-water drops with supersession replies, adds a pre-gate capacity-recovery path, defines floor-only conflict responses, and binds election advertisements to lineage.
 
 ## Gate decisions
 
@@ -10,32 +10,29 @@ type GateDecision =
   | { kind: 'drop'; reason: string }
   | { kind: 'reack-end' }
   | { kind: 'reply-ended'; certificate: CompletedEndCertificate }
-  | { kind: 'reply-disposed'; disposition: SessionDisposition; successor: SuccessorEvidence | null }
+  | { kind: 'reply-disposed'; disposition: SessionDisposition }
+  | { kind: 'reply-superseded'; evidence: SupersessionEvidence }
+  | { kind: 'reply-floor'; outcome: EpochOutcome; origin: SessionOriginEvidence | null }
+  | { kind: 'safety-recovery' }
 ```
 
-Order after normalization and outer identity:
+## Gate order
 
-1. original end action ID matching retained certificate → `reack-end`;
-2. duplicate original end → `reack-end`;
-3. duplicate other action → drop;
-4. exact terminal disposition:
-   - ended with certificate → `reply-ended`;
-   - switched/older epoch → `reply-disposed` with successor evidence when the receiver may still be stale;
-5. active-epoch reconciled disposition:
-   - request/progression confusion may receive informational disposition;
-   - complete-state evidence continues to authorization;
-6. stale proposal/epoch checks;
-7. ended high-water state-install action → drop;
-8. safety lock → reject every state-installing action;
+After normalization and outer identity:
+
+1. exact resent original end matching a retained certificate → re-ACK;
+2. duplicate handling;
+3. `SAFETY_RECOVERY_GOSSIP` against a durable capacity lock → dedicated pre-gate verification;
+4. exact completed end/switched evidence replies;
+5. any authenticated subject epoch below high water → `reply-superseded` using retained transition chain/current evidence;
+6. active-epoch reconciled confusion may receive informational disposition while complete evidence proceeds;
+7. ended high-water install path → drop;
+8. remaining durable/runtime safety lock → reject install/request mutation;
 9. dispatch.
 
-An ended disposition without certificate is never terminal and is not accepted through retirement gossip.
+Historical-disposition trimming never changes step 5 because transition certificates, outcome, origin/end evidence are separate durable records.
 
-## State-installing set
-
-Central closed/safety-lock guards cover start decision/gossip, reconcile, snapshot, session-started, restart, controller change, and every progression event that installs derived state. They run at gate, authorization, and inside transaction.
-
-## Transaction and bootstrap API
+## Transaction/bootstrap API
 
 ```ts
 interface MetaStateTransaction {
@@ -47,55 +44,49 @@ interface MetaStateTransaction {
   mutate(change: (current: RoomMeta) => RoomMeta): Promise<RoomMeta>
   readConsistentBootstrap(roomScope: string): Promise<ConsistentBootstrapSnapshot>
   ensureLatestGeneration(): Promise<RoomMeta>
+  publishCheckpoint(token: AppliedGenerationToken, state: ValidatedState): Promise<void>
   subscribe(listener: (meta: RoomMeta) => void): () => void
 }
 ```
 
-Critical methods require a room-scoped Web Lock. If unavailable/denied, set `lock-unavailable` safety state and do not attach an installing receiver or perform writes. Never fall back to unlocked IndexedDB/localStorage mutation.
+All critical methods require the room Web Lock.
 
-`transactAndInstall` holds the lock through metadata write and synchronous canonical-store install. Checkpoint side effects happen afterward.
-
-## Conflict authorization and rebasing
+## Conflict rebase
 
 For `SESSION_RECONCILE`:
 
-1. validate incoming state, origin, descriptor syntax, kind, epoch, session pair, and optional lineage ID;
-2. require incoming digest to be one descriptor digest;
-3. get latest complete baseline and floor inside the transaction;
-4. if baseline digest equals the other descriptor digest, process exact descriptor;
-5. otherwise treat descriptor as stale correlation:
-   - compare incoming against latest baseline/floor;
-   - if incoming wins, derive a new descriptor from incoming/latest and apply atomically;
-   - if incoming loses, reply with latest state and a newly derived descriptor;
-   - if equal, commit idempotently;
-6. different-session incoming still requires valid origin; migration kind still requires retained lineage ID.
+- validate incoming state/origin/descriptor and optional migration ID;
+- compare inside the transaction against latest complete state and floor;
+- exact other digest → exact path;
+- changed baseline → rebase;
+- incoming wins → fresh descriptor and atomic apply;
+- incoming loses with complete local winner → return winner plus fresh descriptor;
+- incoming loses while floor-only → return `STATE_FLOOR_GOSSIP`, initiate canonical-state recovery, and do not invent a complete winner;
+- equal digest → idempotent only after collision check where both bytes exist.
 
-A stale descriptor never permanently rejects valid complete-state evidence.
+## Safety recovery
 
-## Recovery authorization
+Only durable `capacity` lock accepts remote recovery:
 
-Records bind exact target, request ID, kind, epoch/session, expected floor digest, optional conflict/migration ID, and expiry.
+1. requester sends `SAFETY_RECOVERY_REQUEST` without enabling other outgoing state requests;
+2. holder sends `SAFETY_RECOVERY_GOSSIP` containing a transition chain whose final epoch is strictly greater than `lockedAtEpoch`;
+3. pre-gate validator checks chain, current outcome/origin/end evidence, known state, and byte limits;
+4. one room-lock transaction rechecks the lock, merges transitions/evidence, clears capacity lock, advances high water, and installs exact state or floor-only recovery;
+5. same/lower epoch never clears the lock.
 
-- revision gap: exact canonical session and not below latest floor;
-- bootstrap: exact outcome session unless authorized different-session reconciliation;
-- start reconcile: exact or rebasable descriptor plus incoming origin when session changes;
-- migration reconcile: retained lineage ID and exact/rebasable same-session descriptor.
-
-Outcome end/higher epoch cancels matching recovery/conflict records synchronously.
+Digest-collision locks require reset/protocol upgrade. Lock-unavailable and storage-failure are local capability states and never clear from network input.
 
 ## Authorization summary
 
-| Action | Required authority |
+| Action | Authority |
 | --- | --- |
-| start proposal | proposer owns revision-0 candidate; local coordinator; next epoch |
-| start commit/gossip | valid decision; active/unclosed outcome; compare digest floor/current state |
-| reconcile | valid incoming state/origin; exact or rebased descriptor; incoming wins |
-| snapshot | current controller or exact recovery target; generation/floor/closed checks |
-| requests/progression | current controller; exact session/revision; fresh generation; no termination |
-| switch/session started | current controller; exact next epoch; create successor origin/outcome |
-| original end | current controller; exact next revision; payload epoch |
-| end ACK | frozen recipient and exact end action |
-| end gossip | holder identity; exact certificate |
-| retirement gossip | holder identity; ended forbidden; switched requires successor evidence |
-| controller change | retained migration ID; same session/story; exact/rebased comparator |
-| control actions | reject until implemented |
+| start proposal/commit | coordinator, next epoch, valid transition/origin |
+| reconcile | valid exact/rebased descriptor; origin on session change |
+| snapshot | current controller or exact recovery target; floor/closed checks |
+| floor gossip | current outcome/floor evidence; noninstalling |
+| progression | current controller, exact revision/session, fresh generation |
+| session started | predecessor controller; exact next epoch; full transition certificate |
+| end/ACK/gossip | exact controller/action/certificate rules |
+| supersession | holder identity; contiguous retained transition chain |
+| safety recovery | capacity lock only; strictly higher verified chain |
+| election advertise/change | selected retained migration record and bound round fields |

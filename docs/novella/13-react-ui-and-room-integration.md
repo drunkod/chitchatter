@@ -1,6 +1,6 @@
-# 13 — Stable-generation bootstrap, canonical-store UI, and room integration
+# 13 — Coherent bootstrap, canonical-store UI, and safety states
 
-> **Revision 11 changes:** bootstrap now reads metadata/checkpoint coherently, exposes Web Lock and safety-capacity states, and refreshes generation before user actions.
+> **Revision 12 changes:** bootstrap reads durable emergency/safety state first, exposes supersession and floor-only recovery, and follows the explicit lock recovery matrix.
 
 ## Keyed provider
 
@@ -10,67 +10,53 @@ export const VisualNovelProvider = (props: Props) => (
 )
 ```
 
-Room navigation immediately unmounts the old receiver/store subscription.
+Room navigation immediately removes old receiver and subscriptions.
 
-## Consistent bootstrap
+## Bootstrap
 
 1. derive room scope;
-2. establish generation notification listener/buffer;
-3. call `readConsistentBootstrap` under room lock;
-4. validate RoomMeta and checkpoint from that snapshot;
-5. classify checkpoint;
-6. initialize canonical store/floor-only recovery;
-7. recheck latest generation before receiver attachment;
-8. retry whole bootstrap if generation changed;
-9. attach receiver only after stable result.
+2. probe required Web Lock/storage capability;
+3. establish generation notification buffer;
+4. read durable safety lock and coherent metadata/pointer/checkpoint snapshot under lock;
+5. validate transitions, outcome, origin, evidence, and story versions;
+6. classify checkpoint;
+7. initialize canonical store, lobby, or floor-only/safety recovery;
+8. recheck latest generation;
+9. retry on change;
+10. attach installing receiver only when permitted.
 
-No false “checkpoint above floor” error can arise from mixing generations.
+## Floor-only and supersession recovery
 
-## Floor-only recovery
+Floor-only UI disables controls, displays current story/session identity, requests complete canonical state, and can send/consume floor evidence. A stale session receiving a transition chain visibly moves to current active recovery or current ended lobby.
 
-If outcome is active but no full state exactly matches floor:
+## Safety phases
 
-- render read-only recovery message;
-- block fresh start/controller actions;
-- request exact canonical session from floor controller/known holders;
-- reject below-floor states;
-- accept equal only with exact digest;
-- allow higher authorized state using the same digest comparator and transaction.
+Include:
+
+- `safety-capacity`: network higher-epoch recovery or explicit reset;
+- `safety-digest-collision`: protocol upgrade/reset only;
+- `capability-lock-unavailable`: local reprobe only;
+- `storage-failure`: local repair/reload only.
+
+The UI never suggests a recovery mechanism that the gate will reject.
 
 ## Canonical store
 
-```tsx
-const state = useSyncExternalStore(
-  canonicalStore.subscribe,
-  canonicalStore.getSnapshot,
-  canonicalStore.getServerSnapshot,
-)
-```
-
-React never mirrors origin, lineage, dispositions, certificates, generation, or floor in independent mutable refs.
+React subscribes via `useSyncExternalStore`. It does not mirror outcome, origin, transitions, lineage, dispositions, certificates, generation, or safety lock in independent refs.
 
 ## User-action freshness
 
-Every novella button calls a service command that runs `ensureLatestGeneration()` before checking controller/participation/revision authority. A stale tab cannot enqueue one last action after missing a notification.
-
-## Phases
-
-Include `bootstrapping`, `recovering`, `lobby`, `starting`, `syncing`, `ready`, `waiting`, `reconciling`, `ending`, `safety-locked`, `capability-error`, and `error`.
-
-Apply modes include normal, timeline rollback, ended certificate, switched successor, reconciled history, external-generation recovery, and floor-only recovery.
+Every novella command refreshes latest generation before authority checks. Stale or safety-locked tabs cannot enqueue one last action.
 
 ## Messages
 
-- rollback: room selected another timeline; local novella actions rolled back;
-- completed end: room had already ended this exact novella;
-- switched successor: old session was replaced and current room story is being restored;
-- reconciled history: timeline previously lost but newer valid progress may still compete;
-- floor-only: latest state is being recovered before controls enable;
-- safety capacity: safety evidence limit reached; novella is read-only until higher epoch/reset;
-- lock unavailable: this browser cannot provide required cross-tab locking; novella sync is read-only.
+- rollback: another valid timeline won and local actions rolled back;
+- superseded: this older session was replaced; current room story is being restored;
+- completed end: current exact session already ended;
+- floor-only: latest canonical state is being recovered;
+- capacity: safety evidence limit reached; only newer verified epoch/reset may continue;
+- digest collision: protocol safety conflict requires reset/upgrade;
+- lock unavailable: browser cannot provide required cross-tab locking;
+- storage failure: local persistence must recover before novella sync resumes.
 
-Chat, media, screen share, and files remain mounted in every novella phase.
-
-## Cleanup
-
-Cancel stale bootstrap retries, exact recoveries, timers, focus listeners, generation subscriptions, and canonical-store subscriptions. Keep real `RoomVideoDisplay userId width height` props and transport identity from `peerRoom.getSelfId()`.
+Chat, voice, video, screen share, and files remain available in every novella phase.

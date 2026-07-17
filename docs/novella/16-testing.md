@@ -1,89 +1,80 @@
 # 16 — Regression, property, and failure-injection matrices
 
-> **Revision 11 changes:** adds digest-order equivalence, successor notice coherence, ended-certificate terminality, descriptor rebasing, stable-generation bootstrap, disposition upsert, global safety-lock, Web Lock capability, and lost-notification recovery tests.
+> **Revision 12 changes:** adds exact RFC 8785 fixtures, multi-hop transition recovery, safety-lock recovery policy, lineage-bound advertisements, stale-peer supersession after trimming, and checkpoint token fencing.
 
-## Validation and digest
+## Canonicalization and validation
 
-- exact canonical semantic object excludes only top-level `updatedAt`;
-- object keys sort by unsigned UTF-8 bytes;
-- exact SHA-256 domain separator and lowercase hex fixture;
-- full-state comparator and floor comparator return identical ordering;
-- digest collision test hook enters safety lock;
-- same session/epoch different story rejects;
-- both active-origin variants normalize alias-free;
-- successor known state exactly matches advertised floor.
+- RFC 8785 fixtures for property order, control escaping, non-ASCII, lone-surrogate rejection, `-0`, exponent boundaries, and shortest numbers;
+- browser and Node canonical bytes/digest equality;
+- full-state/floor order equivalence;
+- digest collision hook enters durable lock;
+- transition ID/action/state/predecessor mix-and-match rejects;
+- contiguous transition array required through high water.
 
-## Start, reconciliation, switch
+## Start, transition, reconciliation
 
-- rev0 origin + rev10 floor/checkpoint + rev1 competitor keeps rev10;
-- former loser progresses farther and becomes canonical;
-- opposite delivery orders converge;
-- exact conflict descriptor applies;
-- descriptor made at rev10 arrives after receiver rev11 and rebases;
-- stale incoming loses and receives fresh descriptor/latest state;
-- repeated stale envelope does not loop on old conflict ID;
+- initial and start-after-ended transition certificates;
+- A→B→C stale-A recovery;
+- A→B then B ended stale-A recovery;
+- delayed old successor evidence at peer already beyond it is idempotent/current-wins;
+- exact descriptor and rev10→rev11 rebase;
+- complete-state local winner and floor-only local winner responses;
 - repeated logical reconciliation consumes one disposition slot;
-- different-session reconcile accepts start or session-started origin;
-- switched notice arriving before successor state raises high water and enters floor-only recovery;
-- switched notice without successor rejects.
+- former loser later wins;
+- same-session changed story rejects.
 
 ## Migration
 
-- sequential two/three departures retain earlier IDs;
-- delayed earlier-lineage stronger state converges;
-- migration descriptor rev10→rev11 rebases;
-- weaker announcement receives fresh descriptor;
-- lineage overflow enters safety lock without trimming;
-- generation refresh occurs before advertisements;
-- cross-session controller change rejects;
-- end/higher epoch clears lineage.
+- two and three lineage records retain earlier authority;
+- interleaved advertisements select exact migration IDs;
+- missing/wrong advertisement migration ID rejects;
+- departed controller rejoins before delayed earlier-lineage announcement;
+- stronger delayed state converges despite rejoin;
+- migration rebase with full and floor-only receiver;
+- lineage overflow persists capacity lock.
 
-## Termination/disposition
+## Termination and supersession
 
-- dropped ACK + reload + original resend re-ACKs;
-- ended disposition without certificate is nonterminal and not persisted via retirement gossip;
-- certificate tampering rejects;
-- end cancels every same-epoch recovery/conflict/install path;
-- switched successor notice merges coherently;
-- reconciled notice does not hide later full-state evidence;
-- concurrent duplicate disposition merge is deterministic;
-- certificate/disposition overflow enters room-wide safety lock.
+- dropped ACK/reload/resend re-ACK;
+- ended without certificate never terminal;
+- certificate binding/tampering;
+- every below-high-water message receives supersession evidence;
+- exact disposition trimmed plus missed lifecycle callback still converges;
+- active and ended current-outcome supersession responses;
+- transition-capacity and certificate-byte overflow enter durable lock.
 
-## Cross-tab/bootstrap
+## Safety-lock matrix
 
-- metadata changes between initial meta and checkpoint reads → retry, not contradiction;
-- stable snapshot checkpoint above same-generation floor blocks;
-- tab A cannot install after tab B newer generation;
-- store update happens before lock release;
-- external notification queues behind local transaction;
-- crash after metadata write before publish repaired on focus;
-- stale tab refreshes before controller/progression send;
-- Web Lock unavailable/denied performs no protocol write or state install;
-- stale checkpoint pointer deletion failure remains nonblocking.
+- capacity lock accepts strictly higher verified transition chain and rejects same/lower epoch;
+- digest-collision lock rejects all remote recovery;
+- lock-unavailable clears only after successful reprobe/bootstrap;
+- storage-failure clears only after local repair/bootstrap;
+- generic gate blocks installs while locked, but pre-gate capacity recovery works;
+- safety recovery atomically clears lock and installs outcome/floor/state or floor-only mode;
+- chat/media/files remain usable.
 
-## Safety-lock behavior
+## Cross-tab and checkpoint
 
-- capacity/lock/digest/storage lock disables all novella controls and installs;
-- chat, media, screen share, and files remain usable;
-- same-epoch network state cannot clear lock;
-- verified higher epoch clears only allowed lock kinds by explicit rule;
-- reset requires user confirmation and clears metadata/checkpoints.
+- metadata/checkpoint mixed-generation read retries;
+- transaction holds lock through canonical-store install;
+- crash after write before notification repaired on focus/action;
+- generation-10 checkpoint side effect runs after generation 11 and cannot replace latest pointer;
+- stale token blob remains unreferenced;
+- operational metadata reserve always fits compact lock;
+- concurrent evidence merges preserve invariants or lock safely.
 
-## Link-aware mesh
+## Property/fuzz
 
-Each transport owns directional `knownPeers`. Send resolves on enqueue. Tests pump, reorder, delay, duplicate, or drop deliveries. Lifecycle notifications derive from view changes and may be suppressed. Default crash removes all undelivered items from/to the peer; buffered delivery is explicit opt-in.
-
-## Property/fuzz tests
-
-- comparator totality/transitivity over validated state+digest wrappers;
-- floor/full-state order equivalence;
-- conflict ID symmetry and rebase convergence;
+- RFC 8785 serializer agrees with fixtures and reference implementation;
+- comparator totality/transitivity;
+- transition-chain validation and concatenation;
 - arbitrary delivery order converges while active;
-- no trace installs after ended outcome;
-- every exposed state equals persisted floor digest;
-- disposition merge is associative/commutative/idempotent for valid records;
-- arbitrary metadata interleavings preserve invariants or enter safety lock.
+- no same-epoch install after end;
+- every exposed state equals floor digest;
+- disposition merge ACI properties;
+- stale below-high-water traffic always produces bounded current evidence;
+- arbitrary metadata interleavings preserve invariants or enter durable lock.
 
-## CI
+## Failure mesh and CI
 
-Implementation PRs must show unit, type, lint, build, and focused E2E checks. Documentation-only plan commits may have no workflow run.
+Transport supports directional links, delay, reorder, duplicate, drop, suppressed lifecycle callbacks, partial delivery/crash, and lost generation publication. Implementation PRs must run unit, type, lint, build, and focused E2E checks. Documentation-only commits may have no workflow run.

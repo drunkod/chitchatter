@@ -1,8 +1,8 @@
-# 02 — Data models, origins, successor evidence, conflicts, and lineage
+# 02 — Data models, transition certificates, supersession, and recovery
 
-> **Revision 11 changes:** generalizes persisted session provenance to `activeOrigin`, adds successor evidence for switched notices, makes disposition identity deterministic, and binds recoveries to the expected floor digest.
+> **Revision 12 changes:** stores full epoch-transition provenance, adds generic supersession and safety-recovery actions, binds election advertisements to migration records, and generation-fences checkpoints.
 
-## Core state and envelope
+## Core state
 
 ```ts
 export type VisualNovelValue = string | number | boolean
@@ -34,7 +34,11 @@ export interface ValidatedState {
   digest: string
   canonicalBytes: Uint8Array
 }
+```
 
+## Envelope and actions
+
+```ts
 export interface VisualNovelActionEnvelope<T = unknown> extends Record<string, unknown> {
   protocol: 'visual-novel'
   protocolVersion: 1
@@ -49,26 +53,23 @@ export interface VisualNovelActionEnvelope<T = unknown> extends Record<string, u
   payload: T
   proof?: string
 }
-```
 
-## Actions
-
-```ts
 export type VisualNovelActionType =
   | 'START_PROPOSE' | 'START_COMMITTED' | 'START_DECISION_GOSSIP'
   | 'SESSION_RECONCILE'
-  | 'STATE_REQUEST' | 'STATE_SNAPSHOT'
+  | 'STATE_REQUEST' | 'STATE_SNAPSHOT' | 'STATE_FLOOR_GOSSIP'
   | 'ADVANCE_REQUEST' | 'ADVANCED'
   | 'CHOICE_REQUEST' | 'CHOICE_RESOLVED'
   | 'SESSION_STARTED'
   | 'SESSION_ENDED' | 'SESSION_END_ACK' | 'SESSION_END_NOTICE_GOSSIP'
-  | 'SESSION_RETIREMENT_GOSSIP'
+  | 'SESSION_RETIREMENT_GOSSIP' | 'SESSION_SUPERSESSION_GOSSIP'
+  | 'SAFETY_RECOVERY_REQUEST' | 'SAFETY_RECOVERY_GOSSIP'
   | 'ELECTION_ADVERTISE' | 'CONTROLLER_CHANGED'
   | 'CONTROL_REQUEST' | 'CONTROL_PASSED'
   | 'RESTART_REQUEST' | 'RESTARTED' | 'ERROR'
 ```
 
-## Origin and durable evidence
+## Origin and transition evidence
 
 ```ts
 export interface StartDecisionRecord extends Record<string, unknown> {
@@ -79,24 +80,45 @@ export interface StartDecisionRecord extends Record<string, unknown> {
 }
 
 export type SessionOriginEvidence =
-  | {
-      kind: 'start-decision'
-      decision: StartDecisionRecord
-    }
-  | {
-      kind: 'session-started'
-      actionId: string
-      controllerPeerId: string
-      state: VisualNovelSessionState // revision 0 for the new epoch
-    }
+  | { kind: 'start-decision'; decision: StartDecisionRecord }
+  | { kind: 'epoch-transition'; transitionId: string }
 
+export interface SessionSubject {
+  sessionId: string
+  sessionEpoch: number
+  storyId: string
+  storyVersion: string
+}
+
+export interface SessionStartedCertificate extends Record<string, unknown> {
+  envelope: EnvelopeFor<'SESSION_STARTED'>
+  predecessor: SessionSubject
+  predecessorRevision: number
+}
+
+export interface EpochTransitionCertificate extends Record<string, unknown> {
+  transitionId: string
+  kind: 'initial-start' | 'start-after-ended' | 'switch'
+  predecessorOutcome: EpochOutcome | null
+  successorOutcome: EpochOutcome // active, revision-0 floor
+  successorOrigin:
+    | { kind: 'start-decision'; decision: StartDecisionRecord }
+    | { kind: 'session-started'; certificate: SessionStartedCertificate }
+}
+```
+
+`transitionId` is recomputed from the normalized raw certificate fields. `SESSION_STARTED` payload binds predecessor subject/revision and successor state so the action ID cannot be mixed with another state.
+
+## Durable evidence
+
+```ts
 export interface SessionDisposition extends Record<string, unknown> {
   sessionId: string
   sessionEpoch: number
   storyId: string
   storyVersion: string
   reason: 'ended' | 'switched' | 'reconciled'
-  evidenceId: string // end action, successor-origin ID, or conflict ID
+  evidenceId: string // end action ID, transition ID, or conflict ID
 }
 
 export interface CompletedEndCertificate extends Record<string, unknown> {
@@ -123,17 +145,24 @@ export interface EpochOutcome extends Record<string, unknown> {
   status: 'active' | 'ended'
   floor: CanonicalStateFloor
 }
+```
 
-export interface SuccessorEvidence extends Record<string, unknown> {
-  outcome: EpochOutcome
-  origin: SessionOriginEvidence
-  knownState: VisualNovelSessionState | null
+## Supersession evidence
+
+```ts
+export interface SupersessionEvidence extends Record<string, unknown> {
+  requestedSession: SessionSubject
+  transitions: EpochTransitionCertificate[] // contiguous after requested epoch
+  currentOutcome: EpochOutcome
+  currentOrigin: SessionOriginEvidence | null
+  currentKnownState: VisualNovelSessionState | null
+  currentEndCertificate: CompletedEndCertificate | null
 }
 ```
 
-`knownState`, when present, exactly matches the successor outcome floor digest. When absent, the receiver enters floor-only exact recovery.
+The chain’s final successor equals `currentOutcome`. Active outcome requires matching origin; ended outcome requires matching end certificate. Known state, when present, exactly matches the final floor.
 
-## Symmetric, rebasable conflicts
+## Conflicts and migration
 
 ```ts
 export type ConflictKind = 'start' | 'migration'
@@ -149,20 +178,6 @@ export interface ConflictDescriptor extends Record<string, unknown> {
   conflictId: string
 }
 
-export interface StateConflict {
-  descriptor: ConflictDescriptor
-  localState: VisualNovelSessionState
-  remoteState: VisualNovelSessionState
-  localOrigin: SessionOriginEvidence | null
-  remoteOrigin: SessionOriginEvidence | null
-}
-```
-
-Session IDs and digests are independently sorted by unsigned bytes before deriving `conflictId`. The descriptor correlates prior evidence; it is not frozen authorization. A receiver whose baseline advanced rebases against the latest state.
-
-## Migration lineage
-
-```ts
 export interface MigrationRecord extends Record<string, unknown> {
   migrationId: string
   sessionEpoch: number
@@ -179,9 +194,7 @@ export interface MigrationLineage extends Record<string, unknown> {
 }
 ```
 
-Records are canonical by `(openedAtRevision, migrationId)`. Current-epoch lineage never trims.
-
-## Payloads
+## Payload map
 
 ```ts
 export type EnvelopeFor<T extends VisualNovelActionType> =
@@ -190,10 +203,7 @@ export type EnvelopeFor<T extends VisualNovelActionType> =
 export type VisualNovelPayloadByAction = {
   START_PROPOSE: { proposalId: string; candidate: VisualNovelSessionState }
   START_COMMITTED: { decision: StartDecisionRecord }
-  START_DECISION_GOSSIP: {
-    decision: StartDecisionRecord
-    knownState: VisualNovelSessionState
-  }
+  START_DECISION_GOSSIP: { decision: StartDecisionRecord; knownState: VisualNovelSessionState }
   SESSION_RECONCILE: {
     descriptor: ConflictDescriptor
     state: VisualNovelSessionState
@@ -202,6 +212,13 @@ export type VisualNovelPayloadByAction = {
 
   STATE_REQUEST: { knownRevision: number; recoveryKind: RecoveryKind }
   STATE_SNAPSHOT: { state: VisualNovelSessionState; requestActionId?: string }
+  STATE_FLOOR_GOSSIP: {
+    outcome: EpochOutcome
+    origin: SessionOriginEvidence | null
+    requestActionId?: string
+    recoveryTargets: string[]
+  }
+
   ADVANCE_REQUEST: { expectedRevision: number }
   ADVANCED: { sceneId: string; dialogueEntryId: string }
   CHOICE_REQUEST: { choiceId: string; expectedRevision: number }
@@ -211,17 +228,28 @@ export type VisualNovelPayloadByAction = {
     dialogueEntryId: string
     variables: Record<string, VisualNovelValue>
   }
-  SESSION_STARTED: { state: VisualNovelSessionState }
 
+  SESSION_STARTED: {
+    predecessor: SessionSubject
+    predecessorRevision: number
+    state: VisualNovelSessionState
+  }
   SESSION_ENDED: { sessionEpoch: number }
   SESSION_END_ACK: { endActionId: string }
   SESSION_END_NOTICE_GOSSIP: { certificate: CompletedEndCertificate }
-  SESSION_RETIREMENT_GOSSIP: {
-    disposition: SessionDisposition
-    successor: SuccessorEvidence | null
-  }
+  SESSION_RETIREMENT_GOSSIP: { disposition: SessionDisposition }
+  SESSION_SUPERSESSION_GOSSIP: { evidence: SupersessionEvidence }
 
-  ELECTION_ADVERTISE: { roundId: string; state: VisualNovelSessionState }
+  SAFETY_RECOVERY_REQUEST: { lockKind: 'capacity'; knownEpoch: number; knownGeneration: number }
+  SAFETY_RECOVERY_GOSSIP: { evidence: SupersessionEvidence }
+
+  ELECTION_ADVERTISE: {
+    roundId: string
+    migrationId: string
+    departedControllerPeerId: string
+    openedAtRevision: number
+    state: VisualNovelSessionState
+  }
   CONTROLLER_CHANGED: {
     roundId: string
     migrationId: string
@@ -239,11 +267,12 @@ export type VisualNovelPayloadByAction = {
 }
 ```
 
-## Runtime records
+## Runtime and persistence records
 
 ```ts
 export type RecoveryKind =
-  | 'bootstrap' | 'revision-gap' | 'start-reconcile' | 'migration-reconcile'
+  | 'bootstrap' | 'revision-gap' | 'start-reconcile'
+  | 'migration-reconcile' | 'supersession' | 'safety-recovery'
 
 export interface OutstandingRecovery {
   actionId: string
@@ -258,57 +287,42 @@ export interface OutstandingRecovery {
   expiresAt: number
 }
 
-export interface PendingTermination {
+export interface DurableSafetyLock {
+  kind: 'capacity' | 'digest-collision'
+  code: string
+  lockedAtEpoch: number
+  lockedAtGeneration: number
+}
+
+export interface RuntimeSafetyState {
+  kind: 'lock-unavailable' | 'storage-failure'
+  code: string
+}
+
+export interface CheckpointRecord {
+  sourceGeneration: number
+  floorDigest: string
+  state: VisualNovelSessionState
+}
+
+export interface LatestCheckpointPointer {
   sessionId: string
-  sessionEpoch: number
-  envelope: EnvelopeFor<'SESSION_ENDED'>
-  recipients: Set<string>
-  acked: Set<string>
+  sourceGeneration: number
+  floorDigest: string
 }
 
-export interface AppliedGenerationToken {
-  roomScope: string
-  generation: number
-  outcomeFloorDigest: string
-}
-
-export interface ConsistentBootstrapSnapshot {
-  roomScope: string
-  generation: number
-  meta: RoomMeta
-  checkpoint: VisualNovelSessionState | null
-}
-```
-
-## Persistent RoomMeta
-
-```ts
 export interface RoomMeta {
   version: 1
   generation: number
   highWaterEpoch: number
   epochOutcome: EpochOutcome | null
+  epochTransitions: EpochTransitionCertificate[]
   dispositions: SessionDisposition[]
   completedEndCertificates: CompletedEndCertificate[]
   activeOrigin: SessionOriginEvidence | null
   migrationLineage: MigrationLineage | null
-  safetyLock: NovellaSafetyLock | null
+  safetyLock: DurableSafetyLock | null
 }
 ```
 
-Cross-field invariants:
-
-- high water 0 iff there is no outcome, origin, lineage, historical evidence, or safety lock tied to protocol state;
-- nonzero high water has an outcome at exactly high water;
-- every record epoch is `<= highWaterEpoch`;
-- outcome floor exactly matches outcome epoch/session/story;
-- ended outcome has no active origin or migration lineage;
-- active origin matches active outcome session/epoch/story and starts at revision 0;
-- migration lineage matches active outcome session/epoch/story;
-- every certificate has one exact ended disposition and vice versa;
-- switched disposition is historical below high water and its `evidenceId` identifies the successor origin;
-- reconciled disposition at active high water is nonterminal;
-- disposition logical key is `(epoch, sessionId, reason)`;
-- duplicate logical keys are merged deterministically rather than appended;
-- current-epoch evidence obeys non-trimming limits;
-- safety-lock state is structurally bounded and blocks state installation.
+Cross-field invariants include contiguous transitions through high water, transition successor/origin/floor agreement, switched disposition evidence matching one transition, ended disposition/certificate bijection, current origin matching the final transition, and reserved-capacity lock validity.
