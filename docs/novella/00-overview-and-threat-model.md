@@ -1,89 +1,89 @@
 # 00 — Architecture, threat model, and delivery plan
 
-> **Revision 10 (2026-07-17).** Resolves the remaining Revision 9 convergence gaps: reconciliation history no longer terminally suppresses later stronger evidence; an ended epoch blocks every state-installing path and cancels matching recovery; high water dominates every durable historical record; metadata and canonical state are committed through one lock-scoped transaction; sequential controller departures retain a bounded migration lineage; conflict IDs are symmetric and self-verifying; the epoch outcome carries a durable comparator floor; current-epoch safety records are never trimmed; story identity is immutable within a session; stale retired checkpoints are discarded rather than blocking bootstrap; and retirement travels in an identity-safe structured notice.
+> **Revision 11 (2026-07-17).** Resolves the remaining Revision 10 gaps: canonical full-state and floor ordering now use the same explicitly specified SHA-256 digest; switched-session notices carry validated successor outcome/origin evidence; an ended disposition is terminal only with its exact certificate; stale conflict descriptors rebase against the receiver’s latest canonical baseline; bootstrap reads metadata and checkpoint from one stable generation; disposition records upsert by deterministic logical key; current-epoch capacity exhaustion enters a room-wide novella safety lock; Web Lock unavailability never falls back to unsafe writes; and lost generation notifications are repaired on focus and before every state-changing action.
 
 ## Step index
 
 | Step | File | Contents |
 | --- | --- | --- |
 | 00 | this file | Guarantees, invariants, lifecycle, milestones |
-| 01 | `01-config-and-limits.md` | Limits, epoch rules, canonical ordering and floors |
-| 02 | `02-data-models.md` | Envelopes and durable/runtime records |
+| 01 | `01-config-and-limits.md` | Limits, digest, ordering, terminality, safety lock |
+| 02 | `02-data-models.md` | Envelopes, origins, evidence, conflicts, lineage |
 | 03 | `03-validation-runtime.md` | Structural and cross-record normalization |
-| 04 | `04-validation-semantic.md` | Story/state semantic boundaries |
+| 04 | `04-validation-semantic.md` | Story, state, floor, checkpoint semantics |
 | 05 | `05-engine.md` | Pure transport-safe engine |
 | 06 | `06-example-story.md` | Bundled example and catalog |
 | 07 | `07-transport.md` | Existing-room transport adapter |
-| 08 | `08-sync-authorization.md` | Gate, transactions, recovery authorization |
-| 09 | `09-start-round.md` | Starts and symmetric reconciliation |
+| 08 | `08-sync-authorization.md` | Gate, transactions, recovery, rebasing |
+| 09 | `09-start-round.md` | Starts, reconciliation, switch successor evidence |
 | 10 | `10-election-round.md` | Session-bound migration lineage |
 | 11 | `11-session-termination.md` | ACKs, certificates, dispositions |
-| 12 | `12-sync-hook-dispatch.md` | Runtime, dispatch, recovery, lifecycle |
-| 13 | `13-react-ui-and-room-integration.md` | Bootstrap and rollback UI |
+| 12 | `12-sync-hook-dispatch.md` | Runtime, dispatch, refresh, lifecycle |
+| 13 | `13-react-ui-and-room-integration.md` | Consistent bootstrap and safety UI |
 | 14 | `14-assets-and-audio.md` | Safe assets and local audio |
-| 15 | `15-persistence.md` | Locked metadata/state transactions and checkpoints |
-| 16 | `16-testing.md` | Regression matrices and failure mesh |
+| 15 | `15-persistence.md` | Locked transactions and coherent bootstrap reads |
+| 16 | `16-testing.md` | Regression, property, and failure matrices |
 | 17 | `17-rollout.md` | Regression, CI, and rollout gates |
 
 ## Failure model
 
-The MVP tolerates honest crashes, reloads, delay, duplication, replay, reordering, temporary partitions, missed lifecycle callbacks, and multiple same-origin tabs. It is not Byzantine fault tolerant. Unsigned decision, recovery, migration, disposition, and completed-end gossip are honest-peer concessions until signatures are added.
+The MVP tolerates honest crashes, reloads, delay, duplication, replay, reordering, temporary partitions, missed lifecycle callbacks, multiple same-origin tabs, and lost generation notifications. It is not Byzantine fault tolerant. Unsigned holder gossip and recovery evidence remain explicit honest-peer concessions until signatures are introduced.
 
 Guarantees:
 
-1. **Integrity safety:** invalid, oversized, semantically impossible, stale, terminally retired, duplicate, or unauthorized input does not expose canonical state.
-2. **Durable monotonic safety:** high water, the current epoch outcome and comparator floor, dispositions, completed-end certificates, start decision, and migration lineage survive reload.
-3. **Eventual reconciliation:** while an epoch is active, any valid complete state may be compared even if its session previously lost a reconciliation. Once delivery stabilizes, every population chooses the same winner.
-4. **Closed-epoch safety:** once the canonical high-water outcome is ended, no start, snapshot, reconcile, restart, migration, or recovery path can install state from that epoch.
-5. **Termination dominance:** a validated completed-end certificate ends only its exact session, epoch, story ID, and story version.
-6. **Cross-tab ordering:** no tab may install state after another tab has committed a newer metadata generation.
+1. **Integrity safety:** invalid, oversized, semantically impossible, stale, terminally disposed, duplicate, or unauthorized input never exposes canonical novella state.
+2. **One total ordering:** every peer, including floor-only peers, uses the same priority tuple and the same SHA-256 digest tie-break.
+3. **Durable monotonic safety:** high water, outcome/floor, session origin, dispositions, end certificates, and migration lineage survive reload.
+4. **Eventual reconciliation:** while the epoch is active, any valid complete state may compete, including a previously losing timeline that later progressed farther.
+5. **Closed-epoch safety:** an ended high-water outcome blocks all same-epoch installation and cancels recovery/conflicts.
+6. **Cross-tab safety:** metadata and canonical-store installation share one room lock; stale generations cannot act or install.
+7. **Fail-closed capacity:** current-epoch safety evidence is never trimmed. Exhaustion disables novella mutation until a verified higher epoch or explicit reset.
 
 ## Non-negotiable invariants
 
-- Exactly one novella runtime per group room; direct-message room instances mount none.
-- No second WebRTC room, microphone, central state API, account, analytics, or cloud progress store.
-- Story content is declarative JSON; no executable code or raw HTML.
-- Receiver order: normalize → outer identity → typed gate → semantic validation → authorization → lock-scoped metadata/state transaction → duplicate commit.
-- No receiver attaches before RoomMeta, the latest checkpoint classification, story catalog, and strongest available baseline are ready.
-- Same `(sessionId, sessionEpoch)` always has one immutable `(storyId, storyVersion)`.
-- `updatedAt` never participates in distributed ordering.
-- `EpochOutcome.floor` is advanced before every canonical state exposure.
-- `reconciled` disposition is historical/UI evidence, not terminal suppression of full-state evidence while the epoch remains active.
-- `ended` and `switched` are terminal for their exact session; a higher epoch terminally supersedes every older epoch.
-- Active migration authority is a bounded lineage for the canonical session, not one replaceable record.
-- Conflict IDs sort their state digests before derivation and can be verified by a peer that has not seen the conflict before.
-- Current-high-water dispositions, certificates, and migration lineage entries are never trimmed. Bound exhaustion fails safely.
-- Every durable historical epoch is `<= highWaterEpoch`.
-- Holder-forwarded evidence uses a fresh outer envelope naming the holder.
+- Exactly one novella runtime per group room; direct-message rooms mount none.
+- No second WebRTC room, media capture, central state API, account, analytics, or cloud progress store.
+- Story packages are declarative JSON with no executable code or raw HTML.
+- Same `(sessionId, sessionEpoch)` has one immutable `(storyId, storyVersion)`.
+- State priority is `(epoch, revision, lower controller ID, lower session ID, lower SHA-256 state digest)`.
+- The SHA-256 input, domain separator, canonical bytes, hexadecimal encoding, and collision behavior are specified in 01.
+- `EpochOutcome.floor` advances in the same transaction as every canonical state exposure.
+- `activeOrigin` proves how the canonical session began, whether by coordinated start or controller-authorized `SESSION_STARTED` switch.
+- A standalone switched disposition is never merged into a stale active outcome; it carries successor evidence and raises the receiver to that successor outcome atomically.
+- `reconciled` dispositions are nonterminal at the active high-water epoch.
+- `ended` is terminal only with an exact matching completed-end certificate.
+- Conflict descriptors are symmetric but not frozen authorization. If the receiver progressed, the incoming state is rebased against the latest baseline.
+- Bootstrap metadata, pointer, and checkpoint are classified from a stable generation.
+- Critical writes require room-scoped Web Lock semantics. No unsafe fallback exists.
+- Every state-changing UI action refreshes the latest generation before authority checks and send.
 
 ## Lifecycle
 
-1. **Start:** coordinator commits a revision-0 decision. A lock-scoped transaction creates the active outcome/floor and installs state.
-2. **Progression:** controller serializes requests. Each accepted event updates the outcome floor and canonical state in one transaction before broadcast/commit.
-3. **Reconciliation:** peers derive a symmetric conflict descriptor from both state digests. A stronger different session updates the outcome, decision, and nonterminal reconciliation disposition before install.
-4. **Switch:** controller terminally retires the old session as `switched`, creates exactly the next epoch and outcome, then installs.
-5. **Migration:** each controller departure appends one lineage entry. Delayed announcements from any retained entry remain full-state evidence and compare against current progress.
-6. **End:** controller persists an `ended` disposition plus completed certificate, marks the outcome ended, cancels same-epoch conflicts/recoveries, and clears state.
-7. **Reload:** bootstrap discards authoritative-stale checkpoints, restores safety metadata, and exact-recovers any missing active full state before interactivity.
+1. **Start:** coordinator commits revision-0 state. One transaction creates high water, active outcome/floor, `activeOrigin`, and canonical state.
+2. **Progression:** controller serializes requests. The accepted transition and new floor install atomically before broadcast/duplicate commit.
+3. **Reconciliation:** peers exchange complete states plus symmetric descriptors. Exact descriptors apply directly; stale descriptors rebase to the receiver’s current state and produce a fresh descriptor or winner.
+4. **Switch:** controller creates exactly the next epoch. The old session receives a switched disposition; the new outcome, origin, floor, and state install atomically.
+5. **Migration:** each controller departure appends one lineage entry. Delayed earlier-lineage announcements remain comparable.
+6. **End:** controller persists ended disposition plus certificate, marks outcome ended, clears origin/lineage, cancels same-epoch operations, and installs null.
+7. **Reload:** a stable-generation bootstrap snapshot initializes the canonical store or floor-only recovery before receiver attachment.
+8. **Capacity/capability failure:** the novella enters a persistent read-only safety state while chat, media, screen share, and files remain available.
 
 ## Milestones
 
 - **M1:** models, validators, engine, bundled story, local UI.
-- **M2:** complete bootstrap, starts, progression, exact recovery, comparator floor.
-- **M3:** reconciliation, migration lineage, dispositions/certificates, lock-scoped transactions.
-- **M4:** production rollback/end/retirement UI, accessibility, assets/audio.
+- **M2:** coherent bootstrap, digest/floor, start, progression, exact recovery.
+- **M3:** rebasing reconciliation, migration lineage, dispositions/certificates, lock-scoped transactions.
+- **M4:** production rollback/end/safety-capacity UI, accessibility, assets/audio.
 - **M5:** adversarial mesh, multi-browser E2E, visible CI, README, optional signatures.
 
 ## Definition of done
 
-- A previously losing session that later has the stronger valid state can still converge while the epoch is active.
-- Ended high-water epochs reject all same-epoch state-installing actions and outstanding recovery responses.
-- RoomMeta rejects any disposition/certificate/migration epoch above high water.
-- A newer cross-tab generation prevents a stale post-write state install.
-- Two or more sequential controller departures retain authorization for delayed earlier announcements.
-- Opposite peers derive the same conflict ID and can create the conflict record from the first reconcile message.
-- Reload without a checkpoint still has a durable comparator floor and exact recovery path.
-- Current-epoch safety bounds fail closed rather than trimming evidence.
-- Same-session story/version changes are rejected.
-- Retired stale checkpoints do not block bootstrap.
-- Retirement notices carry the exact normalized disposition.
+- Full-state peers and floor-only peers choose the same winner for every priority tie.
+- A switched notice arriving before successor state can be persisted and recovered without contradiction.
+- Ended disposition without certificate never suppresses live state.
+- Reconcile/migration envelopes created at rev10 still converge when the receiver is rev11.
+- Bootstrap retries instead of blocking when metadata changes between reads.
+- Repeated logical reconciliation upserts one disposition record.
+- Safety-bound overflow disables all novella mutation and installation.
+- Unsupported/denied Web Locks expose a clear read-only capability error.
+- A crash before generation publication is repaired on focus or before the next novella action.

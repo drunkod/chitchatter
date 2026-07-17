@@ -1,6 +1,6 @@
-# 02 — Data models and durable protocol records
+# 02 — Data models, origins, successor evidence, conflicts, and lineage
 
-> **Revision 10 changes:** introduces structured retirement gossip, a comparator floor, migration lineage, symmetric conflict descriptors, and explicit transaction tokens.
+> **Revision 11 changes:** generalizes persisted session provenance to `activeOrigin`, adds successor evidence for switched notices, makes disposition identity deterministic, and binds recoveries to the expected floor digest.
 
 ## Core state and envelope
 
@@ -27,6 +27,12 @@ export interface VisualNovelSessionState extends Record<string, unknown> {
   controllerPeerId: string
   revision: number
   updatedAt: number
+}
+
+export interface ValidatedState {
+  state: VisualNovelSessionState
+  digest: string
+  canonicalBytes: Uint8Array
 }
 
 export interface VisualNovelActionEnvelope<T = unknown> extends Record<string, unknown> {
@@ -62,7 +68,7 @@ export type VisualNovelActionType =
   | 'RESTART_REQUEST' | 'RESTARTED' | 'ERROR'
 ```
 
-## Durable evidence
+## Origin and durable evidence
 
 ```ts
 export interface StartDecisionRecord extends Record<string, unknown> {
@@ -72,13 +78,25 @@ export interface StartDecisionRecord extends Record<string, unknown> {
   state: VisualNovelSessionState // revision 0
 }
 
+export type SessionOriginEvidence =
+  | {
+      kind: 'start-decision'
+      decision: StartDecisionRecord
+    }
+  | {
+      kind: 'session-started'
+      actionId: string
+      controllerPeerId: string
+      state: VisualNovelSessionState // revision 0 for the new epoch
+    }
+
 export interface SessionDisposition extends Record<string, unknown> {
   sessionId: string
   sessionEpoch: number
   storyId: string
   storyVersion: string
   reason: 'ended' | 'switched' | 'reconciled'
-  decidedByActionId: string
+  evidenceId: string // end action, successor-origin ID, or conflict ID
 }
 
 export interface CompletedEndCertificate extends Record<string, unknown> {
@@ -105,9 +123,17 @@ export interface EpochOutcome extends Record<string, unknown> {
   status: 'active' | 'ended'
   floor: CanonicalStateFloor
 }
+
+export interface SuccessorEvidence extends Record<string, unknown> {
+  outcome: EpochOutcome
+  origin: SessionOriginEvidence
+  knownState: VisualNovelSessionState | null
+}
 ```
 
-## Symmetric conflicts
+`knownState`, when present, exactly matches the successor outcome floor digest. When absent, the receiver enters floor-only exact recovery.
+
+## Symmetric, rebasable conflicts
 
 ```ts
 export type ConflictKind = 'start' | 'migration'
@@ -127,12 +153,12 @@ export interface StateConflict {
   descriptor: ConflictDescriptor
   localState: VisualNovelSessionState
   remoteState: VisualNovelSessionState
-  localDecision: StartDecisionRecord | null
-  remoteDecision: StartDecisionRecord | null
+  localOrigin: SessionOriginEvidence | null
+  remoteOrigin: SessionOriginEvidence | null
 }
 ```
 
-The two state digests and two session IDs are sorted bytewise before deriving `conflictId`; therefore opposite peers derive the same descriptor.
+Session IDs and digests are independently sorted by unsigned bytes before deriving `conflictId`. The descriptor correlates prior evidence; it is not frozen authorization. A receiver whose baseline advanced rebases against the latest state.
 
 ## Migration lineage
 
@@ -149,11 +175,11 @@ export interface MigrationRecord extends Record<string, unknown> {
 export interface MigrationLineage extends Record<string, unknown> {
   sessionEpoch: number
   sessionId: string
-  records: MigrationRecord[] // canonical order by openedAtRevision, migrationId
+  records: MigrationRecord[]
 }
 ```
 
-Every sequential controller departure appends a record. Records remain until exact-session terminal disposition, higher epoch, or reset. Current-epoch lineage is never trimmed; bound exhaustion fails closed.
+Records are canonical by `(openedAtRevision, migrationId)`. Current-epoch lineage never trims.
 
 ## Payloads
 
@@ -171,7 +197,7 @@ export type VisualNovelPayloadByAction = {
   SESSION_RECONCILE: {
     descriptor: ConflictDescriptor
     state: VisualNovelSessionState
-    decision?: StartDecisionRecord
+    origin?: SessionOriginEvidence
   }
 
   STATE_REQUEST: { knownRevision: number; recoveryKind: RecoveryKind }
@@ -190,7 +216,10 @@ export type VisualNovelPayloadByAction = {
   SESSION_ENDED: { sessionEpoch: number }
   SESSION_END_ACK: { endActionId: string }
   SESSION_END_NOTICE_GOSSIP: { certificate: CompletedEndCertificate }
-  SESSION_RETIREMENT_GOSSIP: { disposition: SessionDisposition }
+  SESSION_RETIREMENT_GOSSIP: {
+    disposition: SessionDisposition
+    successor: SuccessorEvidence | null
+  }
 
   ELECTION_ADVERTISE: { roundId: string; state: VisualNovelSessionState }
   CONTROLLER_CHANGED: {
@@ -221,6 +250,7 @@ export interface OutstandingRecovery {
   targetPeerId: string
   expectedEpoch: number
   expectedSessionId: string | null
+  expectedFloorDigest: string | null
   kind: RecoveryKind
   conflictId: string | null
   migrationId: string | null
@@ -241,6 +271,13 @@ export interface AppliedGenerationToken {
   generation: number
   outcomeFloorDigest: string
 }
+
+export interface ConsistentBootstrapSnapshot {
+  roomScope: string
+  generation: number
+  meta: RoomMeta
+  checkpoint: VisualNovelSessionState | null
+}
 ```
 
 ## Persistent RoomMeta
@@ -253,24 +290,25 @@ export interface RoomMeta {
   epochOutcome: EpochOutcome | null
   dispositions: SessionDisposition[]
   completedEndCertificates: CompletedEndCertificate[]
-  activeStartDecision: StartDecisionRecord | null
+  activeOrigin: SessionOriginEvidence | null
   migrationLineage: MigrationLineage | null
+  safetyLock: NovellaSafetyLock | null
 }
 ```
 
 Cross-field invariants:
 
-- high water 0 iff outcome, active decision, and lineage are null and no historical records exist;
+- high water 0 iff there is no outcome, origin, lineage, historical evidence, or safety lock tied to protocol state;
 - nonzero high water has an outcome at exactly high water;
-- high water is at least every disposition/certificate/decision/lineage epoch;
-- outcome floor exactly matches outcome epoch/session;
-- ended outcome has no active decision or migration lineage;
-- active decision matches the active outcome’s session/epoch/story;
-- migration lineage matches the active outcome’s session/epoch;
-- each migration last state matches lineage session/epoch/story;
-- dispositions and certificates are unique and canonically sorted;
-- every certificate has a matching `ended` disposition;
-- certificate fields match the embedded original end envelope and payload epoch;
-- active outcome session has no terminal disposition while status is active;
-- `reconciled` disposition at the active epoch is allowed but nonterminal;
-- current-epoch records obey dedicated non-trimming bounds.
+- every record epoch is `<= highWaterEpoch`;
+- outcome floor exactly matches outcome epoch/session/story;
+- ended outcome has no active origin or migration lineage;
+- active origin matches active outcome session/epoch/story and starts at revision 0;
+- migration lineage matches active outcome session/epoch/story;
+- every certificate has one exact ended disposition and vice versa;
+- switched disposition is historical below high water and its `evidenceId` identifies the successor origin;
+- reconciled disposition at active high water is nonterminal;
+- disposition logical key is `(epoch, sessionId, reason)`;
+- duplicate logical keys are merged deterministically rather than appended;
+- current-epoch evidence obeys non-trimming limits;
+- safety-lock state is structurally bounded and blocks state installation.

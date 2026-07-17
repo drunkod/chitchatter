@@ -1,8 +1,8 @@
-# 13 — Full bootstrap, canonical-store UI, and room integration
+# 13 — Stable-generation bootstrap, canonical-store UI, and room integration
 
-> **Revision 10 changes:** React subscribes to the transaction-owned canonical store, bootstrap discards authoritative-stale checkpoints, and floor-only recovery is explicit.
+> **Revision 11 changes:** bootstrap now reads metadata/checkpoint coherently, exposes Web Lock and safety-capacity states, and refreshes generation before user actions.
 
-## Keyed bootstrap
+## Keyed provider
 
 ```tsx
 export const VisualNovelProvider = (props: Props) => (
@@ -10,30 +10,34 @@ export const VisualNovelProvider = (props: Props) => (
 )
 ```
 
-Bootstrap:
+Room navigation immediately unmounts the old receiver/store subscription.
 
-1. derives room scope;
-2. loads and validates RoomMeta;
-3. loads and semantically validates the latest checkpoint;
-4. classifies the checkpoint;
-5. clears an authoritative-stale pointer best-effort;
-6. resolves stories for outcome/active records;
-7. computes strongest complete baseline;
-8. initializes the canonical store;
-9. mounts the receiver.
+## Consistent bootstrap
 
-## Floor-only bootstrap
+1. derive room scope;
+2. establish generation notification listener/buffer;
+3. call `readConsistentBootstrap` under room lock;
+4. validate RoomMeta and checkpoint from that snapshot;
+5. classify checkpoint;
+6. initialize canonical store/floor-only recovery;
+7. recheck latest generation before receiver attachment;
+8. retry whole bootstrap if generation changed;
+9. attach receiver only after stable result.
 
-If outcome is active but no full state matches the floor:
+No false “checkpoint above floor” error can arise from mixing generations.
 
-- render a read-only “Recovering the room’s novella” state;
-- do not allow fresh start or local controller actions;
-- issue exact-target bootstrap recovery to current controller/known peers;
-- reject states below the floor;
-- accept an equal state only with matching digest;
-- permit a higher authorized complete state and advance the floor transactionally.
+## Floor-only recovery
 
-## Canonical store subscription
+If outcome is active but no full state exactly matches floor:
+
+- render read-only recovery message;
+- block fresh start/controller actions;
+- request exact canonical session from floor controller/known holders;
+- reject below-floor states;
+- accept equal only with exact digest;
+- allow higher authorized state using the same digest comparator and transaction.
+
+## Canonical store
 
 ```tsx
 const state = useSyncExternalStore(
@@ -43,33 +47,30 @@ const state = useSyncExternalStore(
 )
 ```
 
-The store is updated synchronously inside the metadata Web Lock. React does not receive independent delayed install callbacks and does not mirror active decision, lineage, dispositions, or certificates.
+React never mirrors origin, lineage, dispositions, certificates, generation, or floor in independent mutable refs.
 
-## UI phases
+## User-action freshness
 
-Include `bootstrapping`, `recovering`, `lobby`, `starting`, `syncing`, `ready`, `waiting`, `reconciling`, `ending`, and `error`.
+Every novella button calls a service command that runs `ensureLatestGeneration()` before checking controller/participation/revision authority. A stale tab cannot enqueue one last action after missing a notification.
 
-Apply modes:
+## Phases
 
-- `normal`;
-- `timeline-rollback`;
-- `ended-by-certificate`;
-- `retired-by-switch`;
-- `reconciled-history`;
-- `external-generation-recovery`.
+Include `bootstrapping`, `recovering`, `lobby`, `starting`, `syncing`, `ready`, `waiting`, `reconciling`, `ending`, `safety-locked`, `capability-error`, and `error`.
+
+Apply modes include normal, timeline rollback, ended certificate, switched successor, reconciled history, external-generation recovery, and floor-only recovery.
 
 ## Messages
 
-- rollback: “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”
-- completed end: “The room had already ended this novella while you were disconnected.”
-- switched: “This novella session was replaced by a story switch.”
-- reconciliation history: “This timeline previously lost a room comparison, but newer valid progress may still be compared.”
-- floor-only recovery: “Recovering the latest novella state before controls are enabled.”
+- rollback: room selected another timeline; local novella actions rolled back;
+- completed end: room had already ended this exact novella;
+- switched successor: old session was replaced and current room story is being restored;
+- reconciled history: timeline previously lost but newer valid progress may still compete;
+- floor-only: latest state is being recovered before controls enable;
+- safety capacity: safety evidence limit reached; novella is read-only until higher epoch/reset;
+- lock unavailable: this browser cannot provide required cross-tab locking; novella sync is read-only.
 
-Chat, media, screen share, and files remain mounted.
+Chat, media, screen share, and files remain mounted in every novella phase.
 
-## Integration and cleanup
+## Cleanup
 
-Mount once around group-room body, never DM rooms. Keep real `RoomVideoDisplay userId width height` props. Transport identity comes from `peerRoom.getSelfId()`.
-
-Keyed provider immediately removes old receiver/store subscription on navigation. Stale bootstrap promises, recovery operations, and UI timers are cancelled.
+Cancel stale bootstrap retries, exact recoveries, timers, focus listeners, generation subscriptions, and canonical-store subscriptions. Keep real `RoomVideoDisplay userId width height` props and transport identity from `peerRoom.getSelfId()`.

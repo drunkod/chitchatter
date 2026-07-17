@@ -1,81 +1,80 @@
-# 11 — Termination ACKs, completed certificates, and session dispositions
+# 11 — Termination ACKs, completed certificates, dispositions, and successor notices
 
-> **Revision 10 changes:** ending cancels every same-epoch install path, retirement uses structured holder gossip, and active-epoch reconciled dispositions remain nonterminal evidence.
+> **Revision 11 changes:** ended terminality now requires a certificate, retirement gossip forbids standalone ended records, switched notices carry successor evidence, and disposition merging is deterministic.
 
 ## Original end and ACK round
 
-Controller creates one exact-next-revision event:
-
-```ts
-createEnvelope(
-  'SESSION_ENDED',
-  { sessionEpoch: current.sessionEpoch },
-  current,
-  current.revision + 1,
-)
-```
-
-It freezes recipients, retains authority/state, resends the same action ID, and finalizes only after every recipient ACKs or leaves.
+Controller creates one exact-next-revision event with `{ sessionEpoch }`, freezes recipients, retains state/authority, resends the same action ID, and finalizes only after every frozen recipient ACKs or leaves.
 
 ## First application
 
-Replica verifies controller, exact next revision, story identity, and payload epoch. One lock-scoped transaction:
+Replica verifies current controller, exact next revision, story identity, and payload epoch. One transaction:
 
-- adds/updates `SessionDisposition(reason: 'ended')`;
-- stores exact `CompletedEndCertificate`;
-- if exact canonical outcome, marks it `ended` while preserving final floor;
-- clears active decision and migration lineage;
-- cancels same-epoch conflicts and outstanding recovery records;
+- upserts ended disposition keyed by `(epoch, session, ended)` with `evidenceId = endActionId`;
+- stores exact completed certificate;
+- marks exact canonical outcome ended while preserving final floor;
+- clears active origin and migration lineage;
+- cancels same-epoch conflicts/recovery;
 - installs null canonical state.
 
-Then it sends ACK, clears the checkpoint best-effort, and commits the action ID.
+Then ACK, checkpoint cleanup best-effort, and duplicate commit.
 
 ## Re-ACK after reload
 
-Before duplicate/disposition checks, compare an incoming original end action ID with retained certificates. Exact match returns `reack-end` even if in-memory duplicate history was lost.
+Before duplicate/disposition checks, match incoming original end action ID against retained certificates. Exact match re-ACKs even after in-memory duplicate history was lost.
 
-## Holder gossip
+## Completed-end holder gossip
 
-A holder sends a fresh bootstrap-scoped `SESSION_END_NOTICE_GOSSIP` containing the normalized certificate. Outer sender matches transport context. The original event binds action ID, session, epoch, story ID/version, revision, and controller sender.
+A holder sends fresh `SESSION_END_NOTICE_GOSSIP`. Receiver validates outer holder identity and embedded original event. Certificate and ended disposition merge atomically. `SESSION_RETIREMENT_GOSSIP` with reason `ended` is rejected.
 
-## Dominance
+## Terminality
 
-- current higher epoch: retain evidence; never clear higher state;
-- current exact session/epoch/story: transactionally persist evidence, end matching outcome if canonical, cancel recovery/conflicts, install null;
-- same epoch different session: retain exact ended evidence, but do not clear other canonical state;
-- current null: persist idempotently;
-- already retained exact certificate: no-op.
+- ended: terminal only with exact matching certificate;
+- switched: valid persisted record is historical below high water because successor evidence raised the room;
+- reconciled: nonterminal at active high water;
+- any record below high water: terminal by epoch supersession.
 
-An ended canonical outcome rejects every same-epoch state-install path, not only start decisions.
+An unverified “ended” warning may be logged transiently but never enters authoritative RoomMeta or gate suppression.
 
-## Dispositions
+## Disposition gossip
 
-- `ended`: terminal only with a matching certificate;
-- `switched`: terminal for the exact session;
-- `reconciled`: nonterminal while its epoch remains active; used for checkpoint cleanup and UI history;
-- any disposition below high water is terminal because the epoch is superseded.
+### Reconciled
 
-## Structured retirement gossip
+May carry `successor: null` as informational history. It does not clear state or block complete evidence. If successor is included, it must describe current outcome and may accelerate recovery.
 
-A holder responds to stale switched/reconciled traffic with:
+### Switched
 
-```ts
-SESSION_RETIREMENT_GOSSIP { disposition }
-```
+Must carry successor outcome/origin and optional exact-floor known state. Receiver transaction:
 
-The receiver validates and persists the exact record. A reconciled notice does not terminally block later complete-state evidence. An `ended` disposition without a matching certificate is retained as non-authoritative warning only and cannot close state.
+1. validates disposition and successor origin;
+2. requires successor epoch greater than disposed epoch;
+3. raises high water/outcome/origin as authorized;
+4. merges switched disposition;
+5. installs known state only when digest exactly equals floor, otherwise enters floor-only recovery;
+6. clears obsolete lineage/conflicts/recovery.
 
-## Bounds
+A standalone switched disposition cannot contradict a stale active outcome because it is never persisted alone.
 
-Never trim current-high-water dispositions or certificates. If current-epoch bounds are exhausted, reject the new mutation safely. Historical records below high water may be trimmed in coordinated order.
+## Deterministic merge
+
+- logical key `(epoch, sessionId, reason)`;
+- ended/switched duplicate with same evidence ID is idempotent;
+- ended/switched different evidence ID is blocking contradiction;
+- reconciled duplicate chooses bytewise-minimum conflict ID as informational evidence;
+- record order is canonical by epoch/session/reason/evidence ID.
+
+## Capacity failure
+
+Current-epoch disposition/certificate overflow sets capacity safety lock in the same failed operation. The room disables all novella mutation/installation. It does not continue interactively after refusing end evidence. Verified higher epoch or explicit reset may recover according to policy.
 
 ## Tests
 
-- dropped ACK + reload + original resend re-ACKs;
-- certificate epoch/story/action tampering rejects;
-- end cancels pending same-epoch snapshots/reconciliation;
-- holder with changed peer ID forwards certificate/disposition;
-- reconciled notice does not block later stronger state;
-- switched notice remains terminal;
-- exact migrated/progressed session ends, other session/higher epoch does not;
-- current-epoch bound exhaustion fails closed.
+- dropped ACK + reload + resend re-ACKs;
+- ended disposition without certificate never terminal/persisted;
+- end-certificate binding/tampering;
+- switched notice before successor data merges coherently;
+- switched notice without successor rejects;
+- reconciled notice permits later stronger state;
+- deterministic duplicate merge under reorder;
+- exact migrated/progressed session ends only itself;
+- capacity overflow enters room-wide safety lock.

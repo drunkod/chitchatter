@@ -1,42 +1,46 @@
-# 05 — Pure engine
+# 05 — Pure transport-safe engine
 
-> **Revision 10 changes:** no transition semantics change. The plan now requires every accepted engine result to advance the durable comparator floor in the same transaction that exposes state.
+> **Revision 11 changes:** engine semantics remain pure; the plan now makes digest computation an explicit post-engine validation step and requires every exposed transition to advance the persisted digest floor atomically.
 
-The engine imports no React, storage, transport, DOM, global clock, or randomness. It receives a validated manifest and explicit dependencies.
+The engine imports no React, storage, transport, DOM, global clock, randomness, or hashing API. It receives a validated story and explicit dependencies and never mutates input.
 
 ## Operations
 
-- `start(sessionId, controllerPeerId, sessionEpoch)` creates revision 0 at the manifest start entry;
-- `advance` follows legal next transitions and refuses to skip required choices;
-- `choose` validates availability, applies immutable effects, and moves to the target;
-- `restart` preserves session/controller/epoch/story and increments revision;
-- `changeController` preserves session/epoch/story/content and increments revision;
-- getters assert exact story compatibility.
+- `start(sessionId, controllerPeerId, epoch)` creates revision 0 at the manifest start entry;
+- `advance` follows explicit/implicit transitions and refuses required or fully gated choices;
+- `choose` validates choice availability, applies immutable effects, and moves to target;
+- `restart` preserves session/controller/epoch and increments revision;
+- `changeController` preserves story content and increments revision;
+- getters assert exact story compatibility and referenced scene/entry existence.
 
 ## Transport safety
 
-Before returning a changed state, enforce variable count/bytes, finite numbers, bounded history, valid IDs, and snapshot/envelope fit. Failure occurs before mutation.
+Before returning changed state, enforce variable count/bytes, finite numbers, bounded strings, bounded history, and safe revisions. A failed guard throws before mutation. Snapshot conversion later truncates history and final validators enforce aggregate budgets.
+
+## Digest boundary
+
+The engine does not decide distributed priority. After engine output:
+
+```text
+normalize returned state
+→ semantic validation
+→ canonicalStateBytes
+→ SHA-256 state digest
+→ lock-scoped floor/state transaction
+```
+
+`updatedAt` remains diagnostic and is excluded from semantic bytes. The canonical event envelope still provides one shared timestamp during normal progression.
 
 ## Determinism
 
-Given the same normalized manifest, state, action, and injected timestamp, the engine emits byte-equivalent semantic state. `updatedAt` is diagnostic and excluded from distributed ordering.
-
-Replicas replay progression and compare derived scene, entry, variables, history suffix, revision, and immutable story identity before application.
-
-## Integration contract
-
-An engine result is not canonical merely because it is locally valid. The sync layer must:
-
-1. authorize the action;
-2. compute `floorFromState(result)`;
-3. run a lock-scoped metadata/state transaction that advances the floor and installs the exact result;
-4. broadcast/commit only after success.
+Given identical normalized manifest, input state, requested action, and injected clock, the engine returns byte-identical semantic state. Replicas replay progression and compare scene/entry/variables plus computed digest before application.
 
 ## Tests
 
-- starts, endings, next links, restart, controller change;
-- required/unavailable/dead-end choices;
+- starts, endings, explicit next, restart, controller change;
+- gated/unavailable/dead-end choices;
 - string/boolean/numeric effects and nonfinite rejection;
 - variable/history/byte overflow leaves state unchanged;
-- story identity preserved by every operation;
-- deterministic random walks whose states and floors pass validators.
+- deterministic random walks produce equal canonical bytes and SHA-256 digests;
+- every accepted engine transition advances outcome floor in its surrounding transaction;
+- collision-test hook never causes arbitrary state selection.

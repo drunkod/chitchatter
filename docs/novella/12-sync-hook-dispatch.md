@@ -1,14 +1,13 @@
-# 12 — Sync runtime, dispatch, recovery, and lifecycle
+# 12 — Sync runtime, dispatch, coherent recovery, and lifecycle refresh
 
-> **Revision 10 changes:** the runtime uses a canonical external store updated inside metadata transactions, dispatch covers retirement gossip, and end/outcome changes invalidate all same-epoch recovery.
+> **Revision 11 changes:** runtime boots from a stable-generation snapshot, supports conflict rebasing, refreshes generations on focus and before actions, and separates observe-only capability failure from installing operation.
 
 ## Ready inputs
 
 ```ts
 interface Options {
   transport: VisualNovelTransport
-  initialMeta: RoomMeta
-  initialCheckpoint: VisualNovelSessionState | null
+  bootstrap: ConsistentBootstrapSnapshot
   metaStateTransaction: MetaStateTransaction
   storyCatalog: StoryCatalog
   canonicalStore: CanonicalVisualNovelStore
@@ -16,66 +15,72 @@ interface Options {
 }
 ```
 
-No receiver exists before metadata, checkpoint classification, stories, outcome floor, and strongest full-state baseline are ready.
+No installing receiver exists before coherent bootstrap classification, stories, floor, origin, and strongest full-state baseline are ready.
 
 ## Canonical store
 
-The sync service, not React, owns canonical state. `transactAndInstall` updates metadata and this store synchronously while holding the room lock. React subscribes through `useSyncExternalStore`.
-
-No async handler keeps a deferred `setState` callback after metadata persistence.
+The sync service owns canonical state. `transactAndInstall` updates metadata and store synchronously under the room lock. React uses `useSyncExternalStore`. No handler retains deferred `setState` after persistence.
 
 ## Receive path
 
 ```text
-normalize → outer identity → typed gate → participation
-→ semantic validation → action authorization
-→ lock-scoped metadata/state transaction
-→ duplicate commit → best-effort checkpoint side effects
+normalize → outer identity → gate → participation
+→ semantic validation/digest → authorization or rebase
+→ lock-scoped metadata/store transaction
+→ duplicate commit → checkpoint side effects
 ```
 
-Dispatch is exhaustive for every action, including `SESSION_RETIREMENT_GOSSIP`.
+Dispatch is exhaustive for all 22 actions.
 
 ## Recovery map
 
-Requests are bounded and keyed by action ID. Validate echoed ID, exact sender/target, expiry, kind, epoch/session, conflict/migration identity, floor, and closed outcome.
+Records are keyed by action ID and bind target, kind, epoch/session, expected floor digest, conflict/migration identity, and expiry.
 
-When metadata changes to an ended outcome or higher epoch:
+At response time:
 
-- synchronously invalidate matching recovery records;
-- close matching conflict records;
-- ignore any already queued handler at its inside-transaction recheck.
+- refresh/re-read latest metadata inside executor;
+- reject closed/safety-locked outcome;
+- if floor changed, apply kind-specific rebase rather than trusting stale expected floor;
+- success removes only that request;
+- end/higher epoch cancels all matching records.
 
-## Handler rules
+## Conflict handling
 
-- start commit/gossip compares current/checkpoint/decision/lineage full states and floor;
-- reconciliation verifies a symmetric descriptor and may create its conflict on first contact;
-- migration selects any retained lineage ID;
-- original end re-ACK checks certificate ID before disposition suppression;
-- end gossip applies exact dominance;
-- retirement gossip persists exact disposition with terminality rules;
-- every full-state install uses `transactAndInstall`.
+Exact descriptor and stale descriptor share one handler. Stale descriptor does not fail merely because local state advanced. It compares incoming with latest state/floor and emits/applies a fresh descriptor.
 
 ## Request response priority
 
-1. completed-end certificate for exact session;
-2. terminal switched/older-epoch disposition;
-3. active-epoch reconciled disposition plus, when requested for recovery, current canonical state evidence;
+1. completed end certificate;
+2. switched/older-epoch disposition with successor evidence;
+3. active-epoch reconciled history plus current canonical full-state evidence when recovery requested;
 4. pending original termination;
-5. active start decision gossip;
+5. active origin/start decision gossip;
 6. controller snapshot/progression response.
 
-A reconciliation disposition must not hide stronger full-state recovery evidence.
+A disposition never hides stronger recovery evidence.
 
-## External-tab generations
+## External generation repair
 
-Metadata subscriptions queue a refresh through the same service executor. If the new generation:
+Metadata notifications queue on the same executor. Additionally call `ensureLatestGeneration()`:
 
-- ends or switches the live session, perform a local canonical-store transaction to null/reconcile;
-- changes canonical session or advances floor beyond local state, enter read-only recovery;
-- is older/equal, ignore.
+- when document becomes visible;
+- when window regains focus;
+- before every novella state-changing UI action or controller send;
+- before opening migration/start rounds.
+
+If generation advanced:
+
+- ended/switched live session → null/recovery transition;
+- changed outcome or floor above local state → read-only exact recovery;
+- safety lock → persistent error phase;
+- older/equal generation → ignore.
+
+This repairs a sibling tab crash after durable write but before generation publication.
+
+## Lock capability
+
+If room-scoped Web Locks are unavailable/denied, do not attach an installing receiver. Render a read-only capability state and leave chat/media/files active. Never use an unlocked mutation fallback.
 
 ## Lifecycle
 
-Peer events append/retry migration lineage but never expire it. After start reconciliation changes session, clear old lineage and open a new record only if the winning controller is absent.
-
-Joins receive the appropriate snapshot, pending end, certificate, or disposition. Cleanup removes only novella handlers/timers and invalidates pending operations. Room-key change unmounts the ready runtime before new bootstrap.
+Peer events append/retry migration lineage but never expire it. Joins receive snapshot, pending end, end certificate, or disposition plus successor as applicable. Cleanup removes only novella handlers/timers, closes subscriptions, and invalidates pending operations. Room-key change unmounts old runtime before new bootstrap.

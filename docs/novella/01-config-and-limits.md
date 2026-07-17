@@ -1,6 +1,6 @@
-# 01 — Protocol constants, epochs, canonical ordering, and comparator floors
+# 01 — Protocol constants, digest ordering, terminality, and safety capacity
 
-> **Revision 10 changes:** adds migration-lineage/current-epoch bounds, defines terminal versus nonterminal dispositions, adds canonical state floors, and centralizes closed-epoch install checks.
+> **Revision 11 changes:** specifies the exact canonical-state SHA-256 function, makes that digest the global final tie-break, corrects ended/switched terminality, and defines the room-wide safety lock used for capacity or lock-capability failures.
 
 ## Limits
 
@@ -46,55 +46,80 @@ export const visualNovelLimits = {
 } as const
 ```
 
-Timers control retry activity only. They never expire durable authorization.
+Timers govern retry activity only. They never expire durable authority.
 
-## Epoch rules
+## Exact semantic bytes
 
-- first committed session is epoch 1;
-- fresh start and switch create `highWaterEpoch + 1`;
-- proposals are stale at `candidateEpoch <= highWaterEpoch`;
-- decisions/gossip are stale at `< highWaterEpoch`;
-- ordinary state traffic is stale at `< highWaterEpoch`;
-- `epochOutcome.epoch === highWaterEpoch` whenever high water is nonzero;
-- every disposition, certificate, active decision, migration entry, and outcome floor has epoch `<= highWaterEpoch`;
-- an ended high-water outcome rejects every state-installing action at that epoch;
-- higher epoch terminally supersedes all older epochs;
-- old records may be trimmed because high water rejects their traffic;
-- records from `highWaterEpoch` are never trimmed.
-
-## Terminality
+Construct a new semantic object with only these normalized fields, in this order-independent schema:
 
 ```ts
-const dispositionIsTerminal = (
-  disposition: SessionDisposition,
-  meta: RoomMeta,
-): boolean =>
-  disposition.reason === 'ended' ||
-  disposition.reason === 'switched' ||
-  disposition.sessionEpoch < meta.highWaterEpoch
+{
+  protocolVersion,
+  storyId,
+  storyVersion,
+  sessionId,
+  sessionEpoch,
+  sceneId,
+  dialogueEntryId,
+  variables,
+  history,
+  controllerPeerId,
+  revision,
+}
 ```
 
-`reconciled` records at the active high-water epoch are nonterminal. They suppress local request/progression confusion and clear checkpoints, but complete state evidence may still dispatch and compete.
+`updatedAt` is omitted only at the top-level state schema. Do not recursively delete arbitrary properties named `updatedAt`.
 
-## Canonical state ordering
+Canonical JSON rules:
 
-Canonicalize recursively, sort object keys with code-unit ordering, omit diagnostic `updatedAt`, encode UTF-8, and compare unsigned bytes. Never use `localeCompare`.
+- strings use JSON escaping and Unicode scalar values as normalized input already accepted by validators;
+- object keys are sorted by unsigned UTF-8 bytes, not locale or UTF-16 collation;
+- arrays preserve order;
+- numbers are finite safe JSON numbers and use the implementation’s validated canonical JSON number encoder;
+- no whitespace;
+- unknown fields were already dropped by normalization.
+
+`canonicalStateBytes` is UTF-8 of that canonical JSON.
+
+## Exact state digest
+
+```text
+stateDigest = lowercaseHex(
+  SHA-256(
+    UTF8("chitchatter-visual-novel-state-v1\0") ||
+    canonicalStateBytes
+  )
+)
+```
+
+Requirements:
+
+- exactly 64 lowercase hexadecimal characters;
+- Web Crypto SHA-256 in browsers and the corresponding Node SHA-256 in tests;
+- digest computed and cached after structural/semantic validation, before authorization;
+- FNV-derived IDs remain bookkeeping only and are never used for state equality or ordering.
+
+If two complete normalized states produce the same digest but different canonical bytes, enter a persistent protocol-collision safety error. Never choose one arbitrarily.
+
+## One total ordering
+
+Use relational comparisons rather than integer subtraction:
 
 ```ts
-export const compareSessionPriority = (a, b): number =>
-  a.sessionEpoch - b.sessionEpoch ||
-  a.revision - b.revision ||
-  -compareAscii(a.controllerPeerId, b.controllerPeerId) ||
-  -compareAscii(a.sessionId, b.sessionId) ||
-  -compareBytes(canonicalStateBytes(a), canonicalStateBytes(b))
+const compareStatePriority = (a: ValidatedState, b: ValidatedState): number =>
+  compareSafeInt(a.state.sessionEpoch, b.state.sessionEpoch) ||
+  compareSafeInt(a.state.revision, b.state.revision) ||
+  -compareUtf8(a.state.controllerPeerId, b.state.controllerPeerId) ||
+  -compareUtf8(a.state.sessionId, b.state.sessionId) ||
+  -compareDigestBytes(a.digest, b.digest)
 ```
 
-Positive means `a` wins. Same session/epoch states are comparable only after exact story ID/version equality is verified.
+Positive means `a` wins. Lower controller ID, session ID, and digest win ties. `compareStateToFloor` uses exactly the same tuple. This is the only distributed ordering.
 
 ## Canonical comparator floor
 
 ```ts
-export interface CanonicalStateFloor {
+interface CanonicalStateFloor {
   sessionId: string
   sessionEpoch: number
   storyId: string
@@ -103,52 +128,52 @@ export interface CanonicalStateFloor {
   revision: number
   stateDigest: string
 }
-
-export const floorFromState = (state: VisualNovelSessionState): CanonicalStateFloor => ({
-  sessionId: state.sessionId,
-  sessionEpoch: state.sessionEpoch,
-  storyId: state.storyId,
-  storyVersion: state.storyVersion,
-  controllerPeerId: state.controllerPeerId,
-  revision: state.revision,
-  stateDigest: digestCanonicalState(state),
-})
 ```
 
-`compareStateToFloor` applies epoch/revision/controller/session ordering and compares the canonical digest when all preceding fields tie. A state equal to the floor must have the exact digest. A state below the floor is never installed. A higher state may install only through an authorized complete-state path.
+A state below the floor is stale. Equal priority requires exact digest equality. A higher state installs only through an authorized complete-state path. Every canonical exposure advances the floor transactionally.
 
-Every canonical progression, restart, migration, reconciliation, start, and switch advances the floor in the same transaction that exposes state.
+## Epoch and terminality rules
 
-## Strongest full-state baseline
-
-```ts
-export const strongestState = (
-  ...states: Array<VisualNovelSessionState | null | undefined>
-): VisualNovelSessionState | null =>
-  states.filter(Boolean).reduce<VisualNovelSessionState | null>(
-    (best, next) => best === null || compareSessionPriority(next!, best) > 0
-      ? next!
-      : best,
-    null,
-  )
-```
-
-Handlers filter to the relevant epoch and immutable story identity before calling it.
-
-## Closed-epoch helper
-
-All state-installing handlers call one helper after authorization and again inside the locked mutation:
+- first committed session is epoch 1;
+- fresh start/switch creates `highWaterEpoch + 1`;
+- every durable record epoch is `<= highWaterEpoch`;
+- ended high-water outcome blocks every same-epoch state-installing action;
+- higher epoch supersedes every older epoch;
+- current-high-water safety evidence never trims.
 
 ```ts
-assertEpochInstallable(meta, incoming) {
-  if (incoming.sessionEpoch < meta.highWaterEpoch) throw stale()
-  if (
-    meta.epochOutcome?.epoch === incoming.sessionEpoch &&
-    meta.epochOutcome.status === 'ended'
-  ) throw closedEpoch()
+const dispositionIsTerminal = (
+  disposition: SessionDisposition,
+  meta: RoomMeta,
+): boolean => {
+  if (disposition.sessionEpoch < meta.highWaterEpoch) return true
+  if (disposition.reason === 'ended') {
+    return hasExactCompletedEndCertificate(meta, disposition)
+  }
+  // A valid switched disposition is merged only with successor evidence,
+  // which raises high water above its epoch.
+  return false
 }
 ```
 
-## Bounded IDs and bytes
+`reconciled` is nonterminal at active high water. `SESSION_RETIREMENT_GOSSIP` never authoritatively carries `ended`; completed-end gossip carries certificate and disposition together.
 
-`deriveRoundId` remains bounded FNV-1a bookkeeping over canonical raw fields. It is not a signature. Conflict IDs and migration IDs include their raw fields in the payload and are recomputed. Aggregate values use non-throwing UTF-8 measurement and final envelope/snapshot limits.
+## Safety lock
+
+`RoomMeta` or runtime may enter:
+
+```ts
+type NovellaSafetyLock =
+  | { kind: 'capacity'; code: string }
+  | { kind: 'lock-unavailable'; code: string }
+  | { kind: 'digest-collision'; code: string }
+  | { kind: 'storage-failure'; code: string }
+```
+
+While locked:
+
+- disable all novella state-changing controls and outgoing state requests;
+- reject state-installing network actions;
+- retain chat/media/file functionality;
+- permit only verified higher-epoch successor recovery or explicit user-confirmed reset when the lock kind allows it;
+- show a persistent actionable error.

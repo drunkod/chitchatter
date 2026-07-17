@@ -1,6 +1,6 @@
-# 15 — Locked metadata/state transactions, comparator floors, and checkpoints
+# 15 — Locked metadata/state transactions and coherent bootstrap persistence
 
-> **Revision 10 changes:** metadata and canonical state install share one lock-scoped transaction; high-water dominance is restored; current-epoch evidence never trims; floor-only recovery is durable; stale retired checkpoints are discarded.
+> **Revision 11 changes:** specifies a stable-generation bootstrap read, exact digest persistence, successor merge, deterministic disposition upsert, Web Lock capability failure, and repair for lost generation notifications.
 
 ## Keys
 
@@ -10,101 +10,101 @@ visual-novel:v1:<roomScope>:latest
 visual-novel:v1:<roomScope>:<sessionId>
 ```
 
-Room scope is a one-way digest of effective room identity. Never store room secrets, invite URLs, crypto keys, chat, or media.
+Room scope is a one-way digest of effective room identity. Never store room secrets, invite URLs, crypto keys, chat, media, or analytics.
 
-## Bootstrap
+## Required locking capability
 
-1. derive room scope;
-2. load/normalize RoomMeta;
-3. load pointer/checkpoint;
-4. structurally and semantically validate checkpoint;
-5. classify active, authoritative-stale, or blocking contradiction;
-6. clear stale pointer best-effort;
-7. enforce outcome/floor/active-record consistency;
-8. compute strongest complete baseline;
-9. initialize canonical store or floor-only recovery;
-10. mount receiver.
+All protocol metadata writes and consistent bootstrap reads require a room-scoped Web Lock. If `navigator.locks` is unavailable, denied, or fails capability probing:
 
-Malformed RoomMeta blocks. A valid checkpoint made stale by authoritative metadata does not.
+- set runtime `lock-unavailable` safety state;
+- do not perform unlocked writes;
+- do not install network state;
+- keep unrelated room features active.
+
+## Stable-generation bootstrap
+
+Preferred algorithm:
+
+```text
+open/buffer generation notifications
+acquire room Web Lock
+  read and validate RoomMeta
+  read latest pointer and checkpoint blob
+  return one ConsistentBootstrapSnapshot(meta.generation)
+release lock
+initialize store/subscription
+re-read latest generation
+retry whole snapshot if generation changed
+attach receiver
+```
+
+An implementation unable to hold the read lock across metadata and checkpoint reads must use an optimistic loop: read meta generation, read pointer/checkpoint, re-read meta, retry if generation differs. Never declare an above-floor/high-water contradiction from mixed generations.
 
 ## Transaction contract
 
-```ts
-metaStateTransaction.transactAndInstall(change, install)
-```
+Inside one room lock:
 
-Inside one room-scoped Web Lock:
-
-1. read and validate latest stored metadata;
-2. recheck protocol authorization and closed-epoch conditions;
-3. apply `change(current)`;
-4. increment generation;
-5. validate the exact final object and byte/current-epoch bounds;
+1. read/validate latest metadata;
+2. recheck generation freshness, authorization, closed epoch, safety lock, and capacity;
+3. apply mutation callback;
+4. increment generation safely;
+5. validate final object, exact SHA-256 digests, byte/current-epoch bounds;
 6. write metadata;
-7. synchronously update the sync service’s canonical store through no-throw `install`;
+7. synchronously update canonical store through a prevalidated no-throw install value;
 8. publish generation;
 9. release lock.
 
-The returned token records generation and outcome-floor digest. No later deferred state install exists. Checkpoint writes/deletes run after the transaction and are best-effort.
+If an impossible post-write local-store failure occurs, enter storage-failure safety state and reload canonical state from persisted metadata; never continue controls.
 
-A local promise executor orders transactions. External generation notifications use the same executor.
+## Floor and origin persistence
 
-## Floor persistence
+Every canonical state exposure advances outcome floor using the exact Revision 11 digest. Start/switch/different-session reconciliation also updates `activeOrigin`. End clears origin but preserves final floor.
 
-Every state exposure advances `epochOutcome.floor`, including:
+## Disposition upsert
 
-- start/switch;
-- progression and choice;
-- restart;
-- controller change;
-- same/different-session reconciliation;
-- recovered snapshot accepted as canonical.
+Canonical key is `(epoch, sessionId, reason)`.
 
-This makes the floor safety metadata, not continuity data.
+- ended/switched exact duplicate: idempotent;
+- ended/switched conflicting evidence: block metadata as contradictory;
+- reconciled duplicate: keep bytewise-minimum conflict ID;
+- sort by epoch, session ID, reason, evidence ID;
+- never append repeated logical observations.
 
-## Protocol mutations
+## Successor merge
 
-- start: new high water, active outcome/floor, decision;
-- progression/restart: same outcome, advanced floor;
-- reconciliation: advanced/replaced outcome/floor, decision when session changes, reconciliation disposition for loser;
-- open migration: append lineage entry;
-- migration winner: update selected lineage record and floor;
-- switch: switched disposition, next outcome/floor, clear old lineage/conflicts/recovery;
-- end: ended disposition/certificate, ended outcome, clear active decision/lineage, cancel same-epoch operations;
-- disposition/certificate gossip: merge exact evidence without harming another active session;
-- reset: explicit confirmation only.
+For switched gossip, one transaction validates successor origin/outcome, raises high water, installs `activeOrigin`, merges disposition, clears obsolete lineage/conflicts/recovery, and either installs exact-floor known state or stores null canonical state for floor-only recovery.
 
-## Bounds and trimming
+Standalone switched disposition mutation is forbidden when receiver still has that session as active outcome.
 
-Partition records into:
+## Bounds and safety lock
 
-- **current epoch:** never trim; validate dedicated limits and fail closed on overflow;
-- **historical epochs:** canonical sort and trim newest-first within historical bounds.
+Partition historical and current-epoch records. Historical records trim deterministically below high water. Current-epoch dispositions, certificates, conflicts, and lineage never trim.
 
-Certificate trimming occurs before removal of now-unreferenced ended dispositions. High water remains at least every retained record epoch. The outcome/floor is never trimmed.
+On current-epoch overflow:
 
-Migration lineage is current-epoch only and never trimmed.
+- do not drop old evidence;
+- atomically set capacity safety lock when possible;
+- reject new installs and outgoing state changes;
+- allow only verified higher-epoch successor recovery or explicit reset;
+- preserve chat/media/file behavior.
+
+## Lost notification repair
+
+Broadcast generation after successful install, but safety does not depend on notification delivery. Re-read latest generation on focus, visibility, before every state-changing command/send, and before start/migration rounds. Inbound transactions always read latest under lock.
 
 ## Checkpoints
 
-Write a truncated canonical checkpoint and latest pointer after transaction success. A checkpoint is continuity only.
-
-On bootstrap:
-
-- terminally disposed, noncanonical, or older-epoch checkpoint → discard/pointer-clear best-effort;
-- checkpoint above high water or impossible relative to floor → blocking contradiction;
-- missing checkpoint with active outcome → floor-only exact recovery.
-
-Cleanup failure never converts an authoritative stale checkpoint into a blocking protocol error.
+Checkpoint is best-effort continuity only and is written after transaction. Stable bootstrap classifies it against same-generation metadata. Authoritative-stale pointer deletion failure remains nonblocking. Missing active checkpoint enters floor-only recovery.
 
 ## Tests
 
-- metadata/state transaction holds lock through canonical-store install;
-- newer tab cannot land between metadata write and local install;
-- external generation queues after local transaction;
-- every durable record epoch <= high water;
-- floor advances on every canonical transition;
-- current-epoch record/lineage overflow fails closed;
-- historical trimming preserves certificate/disposition pairing;
-- stale retired checkpoint deletion failure still boots into recovery/lobby;
-- active outcome without checkpoint retains comparator floor.
+- metadata/checkpoint mixed-generation race retries;
+- write/store install remains lock-scoped;
+- exact digest persists and comparator matches full-state order;
+- switched successor merge from stale active peer;
+- deterministic disposition upsert under concurrent tabs;
+- current-epoch overflow enters safety lock;
+- Web Lock unavailable/denied never writes;
+- crash after write before publish repaired on focus/action;
+- stale checkpoint cleanup failure still boots;
+- historical trimming preserves ended disposition/certificate pair.

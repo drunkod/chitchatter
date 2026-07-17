@@ -1,8 +1,8 @@
 # 07 — Existing-room transport adapter
 
-> **Revision 10 changes:** adds ordinary-envelope transport for structured retirement gossip; no new WebRTC primitive is introduced.
+> **Revision 11 changes:** no new network primitive is added; switched disposition replies now embed successor evidence, and every outbound state-changing action performs a generation freshness check before enqueue.
 
-Use the existing group-room `PeerRoom`; do not create another Trystero/WebRTC room or media stream.
+Use the existing group-room `PeerRoom`. Do not create another Trystero/WebRTC room, peer identity, microphone, or media stream.
 
 ```ts
 export interface VisualNovelTransport {
@@ -19,22 +19,28 @@ export interface VisualNovelTransport {
 }
 ```
 
-Add one short `PeerAction.VISUAL_NOVEL` entry. One transport action carries the discriminated envelope union.
+One short `PeerAction.VISUAL_NOVEL` value carries the discriminated envelope union.
 
-## Identity
+## Identity rule
 
-Every outer envelope must satisfy:
+For every received outer envelope:
 
 ```ts
 envelope.senderPeerId === messageContext.peerId
 ```
 
-Never resend another peer’s original envelope unchanged. `START_DECISION_GOSSIP`, `SESSION_END_NOTICE_GOSSIP`, and `SESSION_RETIREMENT_GOSSIP` use a fresh outer envelope naming the holder and embed normalized durable evidence.
+Never resend another peer’s original outer envelope unchanged. Holder-forwarded actions use fresh outer envelopes:
 
-## Delivery semantics
+- `START_DECISION_GOSSIP` embeds the decision and known state;
+- `SESSION_END_NOTICE_GOSSIP` embeds the completed certificate;
+- `SESSION_RETIREMENT_GOSSIP` embeds the normalized disposition and successor evidence when required.
 
-Send resolution means enqueue, not delivery. Protocol finalization depends on ACKs or later evidence, never send resolution. Exact-target requests bind the target transport ID.
+The embedded original end or normalized origin retains protocol evidence under the honest-peer MVP model.
 
-## Lifecycle
+## Freshness before send
 
-Keyed join/leave handlers are removed individually. Novella cleanup never flushes chat, media, file, or DM handlers. `getPeers()` is treated as a local transport view, not globally authoritative membership.
+Controller/progression/start/switch/migration UI paths call `ensureLatestGeneration()` before authority checks and enqueue. If metadata advanced, the action is cancelled and the runtime enters recovery/read-only as appropriate.
+
+## Lifecycle handlers
+
+Handlers are keyed and removed individually. Novella cleanup never flushes chat, media, file, or DM handlers. Transport peer visibility is advisory for migration; durable lineage remains authority.

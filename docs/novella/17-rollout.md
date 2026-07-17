@@ -1,39 +1,42 @@
 # 17 — Regression, validation, and rollout
 
-> **Revision 10 changes:** rollout gates now require universal epoch closure, nonterminal reconciliation evidence, migration lineage, symmetric conflicts, comparator floors, and lock-scoped state installation.
+> **Revision 11 changes:** rollout gates now require one digest ordering, coherent successor notices, conflict rebasing, generation-stable bootstrap, deterministic disposition merge, explicit safety-lock behavior, and Web Lock capability handling.
 
 ## Existing-feature regression
 
 - text chat, voice, video, screen share, file transfer, and DM navigation remain functional;
 - exactly one group-room provider and none in DM rooms;
-- `RoomVideoDisplay` retains real props;
+- `RoomVideoDisplay` keeps real props;
 - novella cleanup never clears shared handlers;
 - no room secret/invite URL, analytics, or cloud progress data is stored.
 
 ## Manual multi-window matrix
 
-1. normal start and progression while verifying floor updates;
-2. concurrent starts and partial coordinator crash;
-3. rev10 checkpoint/floor versus delayed rev1 decision;
-4. session B loses, progresses farther while partitioned, then wins on heal;
-5. end canonical session while snapshot/reconcile responses are queued; none reinstall;
-6. two sequential controller departures; deliver earlier-departure stronger announcement last;
-7. derive one conflict from opposite peers and compare IDs;
-8. active outcome with all checkpoints deleted; exact-recover using floor;
-9. current-epoch disposition/lineage bound exhaustion remains read-only without trimming;
-10. same session/epoch attempts different story version and is rejected;
-11. lose end ACK, reload recipient, verify re-ACK;
-12. stale retired checkpoint cannot be deleted, reload still reaches lobby/recovery;
-13. two same-room tabs race outcome replacement/end and never show stale post-write install;
-14. rapid room navigation removes old receiver/store.
+1. normal start/progression while inspecting persisted SHA-256 floor;
+2. construct equal-priority states whose raw canonical-byte order differs from unrelated hash order and confirm digest ordering is universal;
+3. concurrent start and partial coordinator crash;
+4. session B loses, progresses farther, then heals and wins;
+5. create reconcile descriptor, progress receiver once, then deliver and observe rebase;
+6. repeat the rebase scenario for migration;
+7. switch story, deliver only retirement gossip first, and recover successor coherently;
+8. inject ended disposition without certificate and verify no suppression;
+9. end while snapshot/reconcile responses are queued; none reinstall;
+10. two sequential controller departures; deliver earlier stronger announcement last;
+11. change metadata between bootstrap meta/checkpoint reads and verify retry;
+12. repeat reconciliation many times and verify one logical disposition record;
+13. exhaust a current-epoch safety bound and verify room-wide novella read-only state;
+14. disable/deny Web Locks and verify no unsafe write/install;
+15. crash a sibling after metadata write before notification, then focus stale tab and verify refresh;
+16. stale checkpoint deletion failure still reaches recovery/lobby;
+17. rapid room navigation removes old receiver/store/audio.
 
 ## Milestone gates
 
-1. **M1:** models, validators, engine, example story.
-2. **M2:** bootstrap, floor, starts, progression, exact recovery. Gate: floor-only and universal closed-epoch tests.
-3. **M3:** reconciliation, migration lineage, ACK/certificates/dispositions, lock-scoped transactions. Gate: all Revision 10 regressions.
-4. **M4:** production rollback/end/disposition UI, accessibility, assets/audio.
-5. **M5:** E2E, fuzz/negative tests, README, visible CI, optional signatures.
+1. **M1:** models, validators, digest/canonicalizer, engine, example story.
+2. **M2:** stable bootstrap, floor, origins, starts, progression, exact recovery. Gate: digest-order equivalence and mixed-generation retry.
+3. **M3:** rebasing reconciliation, migration lineage, ACK/certificates/dispositions, successor evidence, lock-scoped transactions. Gate: all Revision 11 regressions.
+4. **M4:** production rollback/end/safety-capacity/capability UI, accessibility, assets/audio.
+5. **M5:** E2E, fuzz/negative tests, README, visible CI, optional signed evidence chain.
 
 ## Command gate
 
@@ -48,17 +51,21 @@ npm run test:e2e -- e2e/tests/visual-novel.test.ts
 ## Final checklist
 
 - every action has model, normalization, semantic boundary, gate, authorization, dispatch, persistence order, and tests;
-- reconciled active-epoch timelines remain eligible as complete-state evidence;
-- ended high-water epoch blocks every state-installing path and cancels recovery;
-- high water dominates all durable records;
-- canonical floor advances with every exposed state;
-- metadata and canonical-store install share one room lock;
-- migration lineage preserves sequential-departure authority;
-- conflict descriptors are symmetric and first-contact verifiable;
-- current-epoch safety records never trim;
+- canonical bytes and SHA-256 function are exact and domain-separated;
+- full-state and floor ordering are identical;
+- active origin covers both coordinated start and switch;
+- switched disposition never persists without successor evidence;
+- ended disposition is terminal only with certificate;
+- stale conflict descriptors rebase;
+- bootstrap metadata/checkpoint are one stable generation;
+- logical dispositions upsert deterministically;
+- current-epoch overflow enters room-wide safety lock;
+- unavailable Web Locks have no unsafe fallback;
+- focus/action refresh repairs lost generation notification;
+- ended high-water epoch blocks every state-install path;
+- migration lineage preserves sequential departures;
+- current-epoch safety evidence never trims;
 - same-session story identity is immutable;
-- stale authoritative checkpoints are discarded, not blocking;
-- retirement gossip carries exact structured evidence;
-- no timer is an authorization deadline;
-- rollback is visible and accurately described;
+- stale authoritative checkpoints are nonblocking;
+- rollback and safety states are visible and accurate;
 - crash helpers cannot accidentally deliver dropped traffic.

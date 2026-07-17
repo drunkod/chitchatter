@@ -1,40 +1,33 @@
-# 14 — Safe assets, preload, and local audio
+# 14 — Safe assets and local audio
 
-> **Revision 10 changes:** no distributed protocol change. Asset/audio state remains outside canonical comparison and follows the transaction-owned session identity.
+> **Revision 11 changes:** no protocol payload carries binary assets or synchronized playback; audio now follows canonical-store generation and safety phases so stale tabs cannot continue scene audio after successor/end recovery.
 
-## Asset resolution
+## Assets
 
-Stories reference logical asset IDs. The bundled catalog resolves those IDs to application-controlled same-origin URLs. Reject path traversal, unsupported schemes, raw HTML, scriptable SVG when not explicitly sanitized, and unbounded metadata.
+Story manifests reference bounded asset IDs resolved through a same-origin catalog. Validate MIME expectations, URL/path allowlists, dimensions where available, and configured byte budgets. Never evaluate SVG scripts, remote HTML, or manifest-provided JavaScript.
 
-Asset bytes never travel in novella envelopes or RoomMeta.
-
-## Preload
-
-Preload the current scene plus a small bounded lookahead. Abort stale preloads on room/session/story change. Failed images/audio show accessible fallback without mutating canonical story state.
+Required story data failure blocks that story version. Optional portraits/backgrounds degrade to accessible placeholders without changing canonical state.
 
 ## Audio
 
-Audio playback is local preference only:
+Audio is local presentation only:
 
-- user gesture unlocks playback;
-- mute/volume are local settings;
-- scene/BGM changes derive from canonical state but playback position is not synchronized;
-- cleanup stops/fades audio on unmount, switch, end, or rollback;
-- no microphone/media-room changes.
-
-## Identity
-
-A same-session state cannot change story ID/version, so asset resolution cannot silently jump catalogs during reconciliation. New story identity arrives only through authorized new-session start/switch.
+- no audio timestamp/playback position is replicated;
+- user gesture and browser autoplay policy are respected;
+- volume/mute preferences stay local;
+- scene change may fade/stop previous track;
+- canonical-store update, end, switch successor, external-generation recovery, safety lock, and room unmount stop stale playback immediately;
+- read-only recovery may show the scene but does not auto-start new audio until canonical state is confirmed.
 
 ## Accessibility
 
-Provide captions/transcripts for meaningful audio where authored, alt text for story images, visible focus, keyboard controls, reduced-motion behavior, and no autoplay surprise.
+Provide captions/transcripts for meaningful audio, visible mute/volume controls, reduced-motion-safe transitions, keyboard controls, focus management, and non-color-only state indicators.
 
 ## Tests
 
-- same-origin allowlist and traversal rejection;
-- abort on rapid state/room changes;
-- missing asset fallback;
-- rollback/switch/end audio cleanup;
-- local mute/volume never enters protocol state;
-- immutable session story identity selects one catalog.
+- malicious/unknown asset references reject or degrade safely;
+- missing optional assets do not mutate state;
+- old-room and old-generation audio stops on unmount/recovery;
+- ended/switch successor clears prior scene audio;
+- safety-lock/capability-error UI remains silent and accessible;
+- chat/media streams remain unaffected by novella audio cleanup.

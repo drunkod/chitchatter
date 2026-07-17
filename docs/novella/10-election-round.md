@@ -1,10 +1,10 @@
-# 10 — Session-bound controller migration lineage and supersession
+# 10 — Session-bound migration lineage, supersession, and rebasing
 
-> **Revision 10 changes:** replaces one active migration with a bounded lineage, authorizes delayed earlier-departure announcements as full-state evidence, and uses symmetric migration conflict descriptors.
+> **Revision 11 changes:** migration uses the unified SHA-256 comparator, rebases stale migration descriptors, refreshes generation before election sends, and enters room-wide safety lock on lineage exhaustion.
 
-## Opening migration authority
+## Opening authority
 
-On current-controller departure, append:
+On current-controller departure, after `ensureLatestGeneration()`, append:
 
 ```ts
 const record: MigrationRecord = {
@@ -19,76 +19,63 @@ const record: MigrationRecord = {
 }
 ```
 
-The transaction requires an active outcome for the same session/epoch/story and no terminal disposition.
+The transaction requires active unclosed outcome, matching story/session/epoch, no terminal disposition, and no safety lock.
 
 ## Lineage
 
-`MigrationLineage.records` retains every unresolved departure for the canonical high-water session. A later controller departure appends rather than replaces. Entries remain until:
+Each later controller departure appends. Entries remain until exact-session terminal disposition, higher epoch, or reset. Current-epoch lineage never trims.
 
-- exact-session terminal disposition;
-- higher epoch;
-- explicit reset.
-
-Current-epoch lineage is never trimmed. If `maxMigrationLineage` is reached, the new migration is blocked/read-only and surfaced; existing authority is not discarded.
+At `maxMigrationLineage`, atomically set capacity safety lock and keep all existing authority. Do not discard an older record and do not continue novella controls.
 
 ## Announcement authorization
 
-Require:
+Require selected migration ID in lineage; outer sender = announced/state controller; state session/epoch/story matches active outcome; canonical electorate and round ID; departed controller absent from current transport view; epoch installable; incoming equal to or above floor and able to beat strongest complete baseline.
 
-- selected `migrationId` exists in lineage;
-- outer sender = announced/state controller;
-- state session/epoch/story equals lineage and active outcome;
-- valid canonical electorate and round digest;
-- selected record’s departed controller is absent from local transport view;
-- epoch is not ended;
-- incoming state is equal to or wins over strongest current/full-state baseline and the outcome floor.
-
-A delayed announcement from an earlier lineage entry remains admissible after later departures and reloads.
+Delayed announcements from earlier lineage entries remain admissible.
 
 ## Application
 
-Use `transactAndInstall`:
+Inside `transactAndInstall`:
 
-- re-read latest outcome, floor, and full lineage;
-- reselect the migration record;
-- recheck closed epoch and comparator;
-- update that record’s `lastAppliedState`;
-- advance outcome floor;
+- re-read latest outcome/floor/origin/lineage;
+- reselect migration entry;
+- recheck generation-independent authorization and closed/safety-lock state;
+- compare SHA-256 priority against latest state/floor;
+- update selected record’s `lastAppliedState`;
+- advance floor;
 - synchronously install incoming state.
 
-If the incoming state loses, send `SESSION_RECONCILE` with a symmetric migration descriptor derived from the two state digests and the selected migration ID.
+## Migration reconciliation rebase
 
-## First-contact migration reconciliation
+If announcement loses, send `SESSION_RECONCILE` with kind `migration`, selected migration ID, latest winner state, and descriptor for the actual pair.
 
-The recipient need not already hold a runtime conflict record. It validates:
+On receipt:
 
-- migration ID in lineage;
-- descriptor symmetry and digests;
-- incoming same session/epoch/story;
-- local baseline digest is the other descriptor digest;
-- incoming wins.
+- exact descriptor applies when receiver baseline is the other digest;
+- if receiver progressed, rebase incoming against latest baseline;
+- incoming winner applies with fresh descriptor;
+- incoming loser receives latest winner/fresh descriptor;
+- equal digest is idempotent with collision check.
 
-It then records and applies atomically.
+This prevents a rev10 descriptor from becoming unusable after rev11 progress.
 
 ## Interaction with session conflicts
 
-Cross-session `CONTROLLER_CHANGED` is rejected. A start reconciliation may choose another session; its transaction clears old lineage. If the winning session’s controller is absent, append a new lineage record for that winning session before election traffic.
+Cross-session controller changes reject. A different-session start reconciliation replaces active origin/outcome and clears old lineage. If the new canonical controller is absent, append a new lineage record before election traffic.
 
-## Sequential departure example
+## Generation repair
 
-1. A departs; lineage contains migration A.
-2. B wins and progresses.
-3. B departs; lineage appends migration B.
-4. A-partition’s delayed stronger state arrives under migration A.
-5. It remains authorized, compares against current floor, and either wins or receives symmetric reconciliation.
+Before advertisements or controller-change sends, refresh latest metadata generation. Focus/visibility refresh also catches a sibling-tab commit whose generation publication was lost.
 
 ## Tests
 
-- two and three sequential departures preserve earlier migration authority;
-- delayed older-lineage stronger announcement converges;
-- delayed weaker announcement receives symmetric reconciliation;
-- current rev20 beats delayed rev12;
-- lineage bound exhaustion fails without trimming;
-- reload retains all lineage entries;
+- two/three sequential departures retain earlier IDs;
+- delayed earlier-lineage winner converges;
+- rev10 descriptor arriving at rev11 rebases;
+- delayed weaker announcement receives fresh descriptor;
+- full-state and floor digest ordering agree;
+- lineage overflow enters safety lock;
+- lock-unavailable browser never opens election authority;
+- reload/focus refresh preserves lineage;
 - cross-session announcement rejects;
 - end/higher epoch clears lineage.

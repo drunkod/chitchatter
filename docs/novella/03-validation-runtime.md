@@ -1,98 +1,121 @@
 # 03 — Runtime structural validation and normalization
 
-> **Revision 10 changes:** validates canonical floors, symmetric conflict descriptors, migration lineage, high-water dominance, structured retirement gossip, and immutable same-session story identity.
+> **Revision 11 changes:** validates the exact SHA-256 digest format, generalized session origins, successor evidence, deterministic disposition upserts, stale-conflict rebasing inputs, and coherent bootstrap snapshots.
 
 ## Envelope order
 
-1. reject over-budget encoded input;
+1. reject over-budget encoded input before deep traversal;
 2. validate protocol, action, primitive fields, timestamp, and revision;
-3. select and normalize the discriminated payload;
-4. cross-check outer scope with embedded content;
+3. normalize the selected discriminated payload into fresh objects;
+4. cross-check outer scope with embedded subject scope;
 5. drop unknown fields and MVP `proof`;
-6. return fresh objects;
-7. run semantic story validation separately.
+6. resolve semantic story validation;
+7. compute/cache exact canonical bytes and SHA-256 digest for complete states.
 
-## Start and reconciliation
+## Digest and comparator inputs
 
-- start decisions are revision 0 and have a recomputed deterministic decision ID;
-- `START_COMMITTED` outer sender equals the coordinator;
-- start gossip holder may differ from embedded coordinator;
-- gossip known state shares decision session, epoch, story ID/version and has revision >= 0;
-- conflict descriptor state digests and session IDs are canonical bytewise pairs;
-- recompute `conflictId` from kind, epoch, sorted session IDs, optional migration ID, and sorted digests;
-- incoming state digest must equal one descriptor digest;
-- the receiver’s comparator baseline digest must equal the other descriptor digest;
-- different-session reconciliation requires a matching revision-0 decision for the incoming session/epoch/story;
-- same-session reconciliation requires exact story ID/version equality;
-- migration conflicts require a migration ID present in the retained lineage.
+- `stateDigest` is exactly 64 lowercase hex characters;
+- recompute it from the Revision 11 domain-separated canonical bytes;
+- do not trust supplied digest values;
+- complete-state comparison consumes `ValidatedState` wrappers;
+- equal digest with different canonical bytes triggers the digest-collision safety lock.
 
-A peer may validate and create the runtime conflict record from the first valid reconcile envelope; a pre-existing local record is not required.
+## Session origins
+
+`start-decision` origin validation recomputes the start decision ID and requires revision 0.
+
+`session-started` origin validation requires:
+
+- bounded action/controller IDs;
+- embedded state revision 0;
+- embedded controller equals the origin controller;
+- exact story/session/epoch scope;
+- state semantically valid for the bundled story.
+
+`activeOrigin` must match the active outcome. A different-session reconcile carries the incoming origin, whether start decision or switched-session origin.
+
+## Conflict descriptors and rebasing
+
+Validate:
+
+- canonical bytewise order of session IDs and SHA-256 digests;
+- recomputed `conflictId` from kind, epoch, ordered IDs, optional migration ID, and ordered digests;
+- incoming state digest equals one descriptor digest;
+- start conflicts have no migration ID;
+- migration conflicts select an ID in retained lineage;
+- same-session conflict has exact story identity;
+- different-session conflict has valid incoming origin.
+
+Two authorization modes exist:
+
+1. **Exact descriptor:** receiver’s latest baseline digest is the other descriptor digest.
+2. **Stale descriptor:** receiver’s baseline advanced. The descriptor is accepted only as correlation; authorization rebases incoming against the latest baseline and derives a fresh descriptor if needed.
+
+A pre-existing runtime conflict record is not required.
 
 ## Completed-end certificate
 
-Require the certificate’s session, epoch, story ID/version to equal the embedded original `SESSION_ENDED` envelope and require:
+Require certificate session, epoch, story ID/version to equal the embedded original `SESSION_ENDED` envelope and:
 
 ```ts
 end.payload.sessionEpoch === certificate.sessionEpoch
 ```
 
-The original end is live-session scoped and exact-next revision. End gossip is bootstrap-scoped/revision 0 and identifies the holder only.
+The original end is exact-next revision from the then-current controller. End gossip is bootstrap-scoped/revision 0 and identifies the holder.
 
-## Session disposition
+## Disposition and successor evidence
 
-`SESSION_RETIREMENT_GOSSIP` is bootstrap-scoped/revision 0. Normalize the exact disposition. The holder need not equal `decidedByActionId`’s sender.
+Disposition key is `(sessionEpoch, sessionId, reason)`.
 
-- `ended` disposition requires a matching completed certificate before it is treated as terminal;
-- `switched` is terminal for the exact session;
-- `reconciled` is nonterminal while its epoch is the active high-water epoch;
-- any disposition from an older epoch is terminal because high water supersedes it.
+- `ended` disposition is persisted only through completed-end certificate processing; retirement gossip carrying `ended` is rejected;
+- `switched` retirement gossip requires non-null successor evidence whose outcome epoch is greater than the disposed epoch;
+- successor origin exactly matches successor outcome session/epoch/story;
+- successor known state, when present, exactly matches the outcome floor digest and priority fields;
+- `reconciled` may omit successor; if successor is present, it must describe the current canonical outcome;
+- duplicate logical disposition keys merge deterministically:
+  - ended/switched conflicting evidence IDs are a blocking contradiction;
+  - reconciled uses the bytewise smaller conflict ID as canonical informational evidence.
+
+A switched disposition is never stored at the current active high-water epoch. It is merged in the same transaction that raises the receiver to successor high water.
 
 ## Migration lineage
 
-- lineage entries are sorted and unique by `(openedAtRevision, migrationId)`;
-- each migration ID binds epoch, session, departed controller, and opening revision;
-- every entry shares lineage epoch/session;
-- `lastAppliedState`, when present, shares lineage epoch/session/story;
-- `CONTROLLER_CHANGED.migrationId` selects an existing lineage entry;
-- announced state session/epoch/story matches the lineage and active outcome;
-- electorate is sorted, unique, bounded, excludes departed controller, and selects the minimum member as announced controller.
-
-## Canonical floor
-
-Validate all IDs, epoch/revision, state digest format, and exact consistency:
-
-- floor epoch/session equals outcome epoch/canonical session;
-- floor story identity is nonempty and valid;
-- active decision and migration last states cannot be above the floor unless the same metadata mutation also advances the floor;
-- when a full state is available with the same priority fields as the floor, its canonical digest must match.
+- entries sorted/unique by `(openedAtRevision, migrationId)`;
+- migration ID binds epoch, session, departed controller, and opening revision;
+- every entry shares lineage session/epoch;
+- `lastAppliedState`, when present, shares session/epoch/story;
+- controller-changed payload selects one retained migration ID;
+- electorate remains sorted, unique, bounded, excludes departed controller, and elects minimum ID.
 
 ## RoomMeta normalization
 
 Reject:
 
-- any historical record, active record, lineage entry, or floor epoch greater than high water;
-- high water 0 with any historical or active record;
-- nonzero high water without a matching outcome;
-- outcome/floor epoch or session mismatch;
-- ended outcome with active decision or migration lineage;
-- active decision/lineage different from active outcome;
-- duplicate or noncanonical dispositions/certificates/lineage entries;
-- certificate without exact ended disposition;
-- active canonical session with terminal disposition while outcome is active;
-- current-epoch dispositions, certificates, or lineage beyond configured bounds;
-- malformed final generation or byte budget.
+- any durable epoch greater than high water;
+- high water 0 with protocol evidence;
+- nonzero high water without matching outcome;
+- outcome/floor mismatch;
+- ended outcome with active origin or lineage;
+- active origin or lineage inconsistent with outcome;
+- certificate without exact ended disposition or ended disposition without certificate;
+- switched disposition at high water;
+- active canonical session with a terminal disposition;
+- duplicate/noncanonical evidence after deterministic upsert;
+- current-epoch bound overflow unless the metadata is already in the corresponding safety-lock state;
+- malformed safety-lock code;
+- invalid generation/byte budget.
 
-Malformed RoomMeta blocks receiver attachment. Authoritative-stale checkpoints do not.
+Malformed RoomMeta blocks receiver attachment. A valid stale checkpoint does not.
 
 ## Required tests
 
-- alias-free normalization for every action and durable record;
-- symmetric conflict ID from opposite state order;
-- first reconcile message creates a verifiable conflict;
-- same session/epoch with different story ID/version rejects;
-- certificate epoch/story/action binding;
-- structured retirement holder identity;
-- lineage with two sequential departures;
-- every high-water dominance contradiction;
-- current-epoch bound overflow rejection;
-- canonical floor mismatch and digest tampering.
+- exact digest domain/encoding and lowercase-hex validation;
+- canonical-byte/digest collision hook enters safety lock;
+- both origin variants and successor consistency;
+- switched notice without successor rejects;
+- ended retirement gossip rejects;
+- deterministic disposition upsert under opposite delivery order;
+- exact and stale conflict descriptor paths;
+- high-water and terminality contradictions;
+- current-epoch overflow requires safety lock;
+- alias-free normalization for every action and record.
