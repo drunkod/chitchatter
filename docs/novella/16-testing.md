@@ -1,63 +1,83 @@
-# 16 — Test matrices and failure-injection transport
+# 16 — Regression matrices and failure-injection transport
 
-> **Revision 9 changes:** adds direct regressions for stale start/migration baselines, closed-epoch resurrection, reload re-ACK, cross-session migration rejection, and in-lock cross-tab mutation.
+> **Revision 10 changes:** adds regressions for nonterminal reconciliation evidence, universal epoch closure, high-water history, generation-atomic install, migration lineage, symmetric conflicts, floor-only recovery, current-epoch bounds, story identity, and stale checkpoint cleanup.
 
 ## Required regressions
 
 ### Validation and metadata
 
-- end certificate binds action, session, epoch, story ID/version;
-- switched/reconciled retirement validates without certificate;
-- certificate requires matching ended retirement;
-- epoch outcome and active-record contradictions reject;
+- every disposition/certificate/lineage/floor epoch is <= high water;
+- high water 0 rejects all historical records;
+- certificate binds action/session/epoch/story;
+- switched/reconciled disposition validates without certificate;
+- same session/epoch with different story ID/version rejects;
+- symmetric conflict descriptor validates from either state order;
+- current-epoch bounds reject rather than trim;
 - canonical ordering ignores locale/insertion order.
 
-### Start/reconciliation
+### Start and reconciliation
 
-- active decision rev0 + checkpoint rev10 + competing rev1 keeps rev10;
-- equal-revision same-session and different-session conflicts converge;
-- losing session retirement persists;
-- canonical session ends, then delayed loser decision cannot install;
-- different-session reconciliation requires matching decision.
+- rev0 decision + rev10 checkpoint/floor + competing rev1 keeps rev10;
+- reconciled loser later progresses beyond winner and can become canonical;
+- exact same scenario with deliveries reversed converges identically;
+- first reconcile envelope creates conflict record;
+- opposite peers derive the same conflict ID;
+- different-session reconcile requires matching decision;
+- same-session different story/version rejects;
+- ended epoch rejects start, snapshot, reconcile, restart, and queued recovery.
 
 ### Migration
 
-- lastApplied rev11 + current rev20 + delayed incoming rev12 keeps rev20;
-- losing announcement receives migration reconciliation;
+- lastApplied rev11 + current/floor rev20 + incoming rev12 keeps rev20;
+- two and three sequential departures retain earlier lineage IDs;
+- delayed earlier-lineage stronger announcement converges;
+- losing announcement receives symmetric migration reconcile;
 - cross-session controller change rejects;
-- after start reconciliation changes session, old migration clears and absent winning controller opens a new record;
-- delayed better same-session announcement remains admissible after reload.
+- lineage overflow fails closed without trimming;
+- reload retains lineage.
 
-### Termination
+### Termination/disposition
 
-- dropped ACK, recipient reload, original resend re-ACKs from retained certificate ID;
-- certificate epoch/story tampering rejects;
-- certificate ends exact migrated/progressed session only;
-- switch/reconcile retirement never sends fake end certificate;
-- ended outcome blocks all same-epoch starts.
+- dropped ACK + reload + original resend re-ACKs;
+- certificate tampering rejects;
+- end cancels outstanding same-epoch recovery/conflicts;
+- ended exact session clears, other session/higher epoch does not;
+- structured switched/reconciled disposition gossips exact record;
+- reconciled disposition does not suppress later full-state evidence;
+- current-epoch disposition/certificate overflow fails closed.
 
-### Locked persistence
+### Cross-tab transaction
 
-- two tabs concurrently add different retirements/certificates and preserve union;
-- mutation callback runs after latest read inside Web Lock;
-- external generation refreshes in-memory store;
-- final generation overflow is rejected;
-- critical failure exposes no state.
+- tab A transaction cannot install after tab B newer generation;
+- canonical store update occurs before lock release;
+- external generation queues behind local transaction;
+- write/install failure exposes no partial state;
+- concurrent tabs preserve union of historical records.
 
-### Recovery and UI
+### Bootstrap/checkpoint
 
-- overlapping request IDs coexist;
-- exact target/kind/session/epoch/conflict/migration/expiry enforced;
-- room change removes receiver before new digest;
-- rollback/end/retirement messages match apply mode.
+- active outcome with no checkpoint/decision/lineage state enters floor-only recovery;
+- state below floor rejects; equal digest accepts; higher authorized state advances;
+- retired stale checkpoint pointer deletion failure still boots;
+- checkpoint above high water blocks;
+- rapid room change removes old receiver/store.
 
 ## Link-aware mesh
 
-Each test transport has a `knownPeers` view derived from directional links. Send resolves on enqueue; tests pump, reorder, or drop deliveries. Lifecycle callbacks are generated from visibility changes and may be explicitly suppressed to model a missed event.
+Each `TestTransport` owns a `knownPeers` view from directional links. Send resolves on enqueue. Tests pump, reorder, delay, duplicate, or drop deliveries. Lifecycle callbacks derive from view changes and can be suppressed.
 
-Default crash removes every undelivered item from/to the peer. `preserveBuffered` is opt-in. `deliverPartiallyThenCrash` delivers selected targets, removes remaining sender items, then crashes.
+Default crash removes undelivered items from/to the peer. `preserveBuffered` is opt-in. `deliverPartiallyThenCrash` delivers selected targets, removes remaining sender items, then crashes.
 
-The concrete transport routes all messages through the network, has keyed receiver/lifecycle maps, inserts before join notification, delegates disconnect to network crash, and has a compile-only `VisualNovelTransport` assignment.
+The concrete transport routes all action delivery through the network, has keyed receiver/lifecycle maps, inserts before join notification, delegates disconnect to crash, and includes a compile-only `VisualNovelTransport` assignment.
+
+## Property/fuzz tests
+
+- comparator transitivity and totality for semantically valid states;
+- conflict ID symmetry;
+- delivery-order convergence across start/migration/reconcile traces;
+- arbitrary metadata mutation interleavings preserve invariants;
+- no trace installs state after an ended outcome at the same epoch;
+- every exposed state digest equals persisted outcome floor.
 
 ## CI
 

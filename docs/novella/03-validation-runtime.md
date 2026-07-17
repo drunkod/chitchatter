@@ -1,85 +1,98 @@
 # 03 — Runtime structural validation and normalization
 
-> **Revision 9 changes:** validates end epoch/story binding, separate retirement/certificate records, epoch outcomes, and session-bound migration rules.
+> **Revision 10 changes:** validates canonical floors, symmetric conflict descriptors, migration lineage, high-water dominance, structured retirement gossip, and immutable same-session story identity.
 
 ## Envelope order
 
 1. reject over-budget encoded input;
-2. validate protocol/action/primitive fields;
-3. validate and normalize the selected payload;
-4. cross-check outer scope against embedded content;
+2. validate protocol, action, primitive fields, timestamp, and revision;
+3. select and normalize the discriminated payload;
+4. cross-check outer scope with embedded content;
 5. drop unknown fields and MVP `proof`;
-6. run semantic validation separately.
-
-All returned values are fresh objects.
+6. return fresh objects;
+7. run semantic story validation separately.
 
 ## Start and reconciliation
 
-- start decisions require revision 0 and a recomputed deterministic decision ID;
-- `START_COMMITTED` coordinator equals outer sender;
+- start decisions are revision 0 and have a recomputed deterministic decision ID;
+- `START_COMMITTED` outer sender equals the coordinator;
 - start gossip holder may differ from embedded coordinator;
-- known state shares decision session/epoch and is revision >= 0;
-- `SESSION_RECONCILE.conflictId` is bounded;
-- when reconciliation changes session ID, a matching revision-0 `decision` is mandatory and must describe that state’s session/epoch;
-- same-session migration reconciliation may omit the decision.
+- gossip known state shares decision session, epoch, story ID/version and has revision >= 0;
+- conflict descriptor state digests and session IDs are canonical bytewise pairs;
+- recompute `conflictId` from kind, epoch, sorted session IDs, optional migration ID, and sorted digests;
+- incoming state digest must equal one descriptor digest;
+- the receiver’s comparator baseline digest must equal the other descriptor digest;
+- different-session reconciliation requires a matching revision-0 decision for the incoming session/epoch/story;
+- same-session reconciliation requires exact story ID/version equality;
+- migration conflicts require a migration ID present in the retained lineage.
 
-## Completed-end binding
+A peer may validate and create the runtime conflict record from the first valid reconcile envelope; a pre-existing local record is not required.
+
+## Completed-end certificate
+
+Require the certificate’s session, epoch, story ID/version to equal the embedded original `SESSION_ENDED` envelope and require:
 
 ```ts
-const validateCompletedEndCertificate = (
-  input: unknown,
-): ValidationResult<CompletedEndCertificate> => {
-  const end = validateEnvelope(input.endEnvelope)
-  if (!end.ok || end.value.actionType !== 'SESSION_ENDED') {
-    return fail('Invalid completed-end envelope')
-  }
-  if (
-    end.value.sessionId !== input.sessionId ||
-    end.value.storyId !== input.storyId ||
-    end.value.storyVersion !== input.storyVersion ||
-    end.value.payload.sessionEpoch !== input.sessionEpoch
-  ) {
-    return fail('Completed-end certificate binding mismatch')
-  }
-  return normalizedCertificate(...)
-}
+end.payload.sessionEpoch === certificate.sessionEpoch
 ```
 
-The original `SESSION_ENDED` outer scope is the live session and its payload epoch equals that session state’s epoch. `SESSION_END_NOTICE_GOSSIP` uses bootstrap outer scope/revision 0 and identifies only the holder.
+The original end is live-session scoped and exact-next revision. End gossip is bootstrap-scoped/revision 0 and identifies the holder only.
 
-## Retirement and migration
+## Session disposition
 
-- retirement reason is exactly `ended`, `switched`, or `reconciled`;
-- migration ID binds `sessionEpoch`, `sessionId`, and departed controller;
-- migration last state, when present, shares session/epoch;
-- `CONTROLLER_CHANGED.state.sessionId` must equal the active migration session;
-- cross-session controller-change announcements are structurally valid envelopes but fail protocol authorization in 10.
+`SESSION_RETIREMENT_GOSSIP` is bootstrap-scoped/revision 0. Normalize the exact disposition. The holder need not equal `decidedByActionId`’s sender.
+
+- `ended` disposition requires a matching completed certificate before it is treated as terminal;
+- `switched` is terminal for the exact session;
+- `reconciled` is nonterminal while its epoch is the active high-water epoch;
+- any disposition from an older epoch is terminal because high water supersedes it.
+
+## Migration lineage
+
+- lineage entries are sorted and unique by `(openedAtRevision, migrationId)`;
+- each migration ID binds epoch, session, departed controller, and opening revision;
+- every entry shares lineage epoch/session;
+- `lastAppliedState`, when present, shares lineage epoch/session/story;
+- `CONTROLLER_CHANGED.migrationId` selects an existing lineage entry;
+- announced state session/epoch/story matches the lineage and active outcome;
+- electorate is sorted, unique, bounded, excludes departed controller, and selects the minimum member as announced controller.
+
+## Canonical floor
+
+Validate all IDs, epoch/revision, state digest format, and exact consistency:
+
+- floor epoch/session equals outcome epoch/canonical session;
+- floor story identity is nonempty and valid;
+- active decision and migration last states cannot be above the floor unless the same metadata mutation also advances the floor;
+- when a full state is available with the same priority fields as the floor, its canonical digest must match.
 
 ## RoomMeta normalization
 
-Validate byte/count limits, safe generation/high water, and all nested records. Then reject:
+Reject:
 
-- high water 0 with any outcome/active record;
-- non-zero high water without matching outcome;
-- outcome epoch different from high water;
-- ended outcome with active start/migration;
-- active decision different from active outcome;
-- active migration different from active outcome;
-- active migration last-state mismatch;
-- active outcome session retired while status is active;
-- duplicate or non-canonically ordered retirements/certificates;
-- certificate without matching ended retirement;
-- ended retirement whose certificate fields disagree, when a certificate is present;
-- active records for different sessions;
-- certificate epoch/story/session mismatch with original end envelope.
+- any historical record, active record, lineage entry, or floor epoch greater than high water;
+- high water 0 with any historical or active record;
+- nonzero high water without a matching outcome;
+- outcome/floor epoch or session mismatch;
+- ended outcome with active decision or migration lineage;
+- active decision/lineage different from active outcome;
+- duplicate or noncanonical dispositions/certificates/lineage entries;
+- certificate without exact ended disposition;
+- active canonical session with terminal disposition while outcome is active;
+- current-epoch dispositions, certificates, or lineage beyond configured bounds;
+- malformed final generation or byte budget.
 
-A switched/reconciled retirement needs no certificate. Malformed existing metadata blocks receiver attachment.
+Malformed RoomMeta blocks receiver attachment. Authoritative-stale checkpoints do not.
 
 ## Required tests
 
-- alias-free normalization for every payload/record;
-- decision, conflict, migration, election, and certificate binding;
-- certificate epoch/story tampering;
-- every RoomMeta contradiction;
-- switched/reconciled retirement without end envelope is accepted;
-- ended certificate requires exact matching retirement.
+- alias-free normalization for every action and durable record;
+- symmetric conflict ID from opposite state order;
+- first reconcile message creates a verifiable conflict;
+- same session/epoch with different story ID/version rejects;
+- certificate epoch/story/action binding;
+- structured retirement holder identity;
+- lineage with two sequential departures;
+- every high-water dominance contradiction;
+- current-epoch bound overflow rejection;
+- canonical floor mismatch and digest tampering.

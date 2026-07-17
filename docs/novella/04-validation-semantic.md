@@ -1,40 +1,69 @@
 # 04 — Semantic validation: stories and replicated sessions
 
-> **Revision 9 changes:** semantic bootstrap selection now treats progressed checkpoint/live state as stronger than revision-0 decision evidence.
+> **Revision 10 changes:** enforces immutable story identity within a session, validates floor/full-state consistency, and distinguishes stale checkpoints from blocking contradictions.
 
-## State against story
+## Session against story
 
-`validateSessionAgainstStory` verifies exact story ID/version, current scene and entry, all history scene/entry/choice references, strictly increasing history revisions, and every history revision below current revision. It returns a normalized result without mutation.
+`validateSessionAgainstStory` resolves the exact bundled `(storyId, storyVersion)` and verifies:
+
+- current scene and dialogue entry;
+- every history scene, entry, and choice;
+- strictly increasing history revisions below current revision;
+- variable names/types and effect-reachable bounds;
+- controller/session/epoch/revision primitive constraints;
+- no mutation of input.
 
 ## Mandatory full-state entry points
 
-Run structural normalization, resolve exact bundled story/version, then semantic validation for:
+Run structural normalization, resolve the exact story, and semantic validation for:
 
-- state snapshots, session starts, restarts;
-- start proposals and committed decision state;
-- both start-gossip states;
-- reconciliation state and optional decision state;
-- election advertisements and controller changes;
-- persisted latest checkpoint;
+- start proposal, decision, and decision gossip states;
+- reconciliation state;
+- state snapshot;
+- session switch and restart state;
+- election advertisement and controller-changed state;
+- persisted checkpoint;
 - active start decision state;
-- active migration last state.
+- every migration-lineage `lastAppliedState`.
 
-Completed-end gossip contains no new renderable state; its embedded original envelope is structurally bound to the certificate.
+End certificates and dispositions carry no new story state, but their story identity must be a valid ID/version pair and match related records.
 
-## Bootstrap consistency
+## Immutable session story identity
 
-Validate metadata active-record states and checkpoint independently. Then compute the strongest valid state for the high-water epoch. A checkpoint at revision 10 outranks an active decision’s revision-0 state. Contradictory story/session identities block ready runtime and require explicit recovery/reset.
+For two states sharing `(sessionId, sessionEpoch)`, require exact equality of `storyId` and `storyVersion` before comparator use. A story change requires a new session and authorized start/switch path.
+
+A conflict descriptor for the same session cannot bridge stories. A different-session conflict may compare different stories because the start decision identifies the incoming session.
+
+## Floor consistency
+
+When full state and outcome floor refer to the same session/epoch:
+
+- state below floor is stale;
+- equal priority fields require exact digest equality;
+- state above floor may be accepted only by an authorized full-state handler;
+- checkpoint above the floor is an impossible safety contradiction and blocks bootstrap;
+- checkpoint below/equal floor is continuity evidence only.
+
+## Checkpoint classification
+
+Bootstrap classifies a structurally and semantically valid checkpoint:
+
+- **active candidate:** exact active outcome session/epoch/story and not below an unavailable floor;
+- **authoritative stale:** older epoch, terminally disposed session, noncanonical session selected by an active outcome, or exact disposition superseded by metadata;
+- **blocking contradiction:** checkpoint epoch above high water, same canonical session with different story identity, or digest/priority impossible relative to the floor.
+
+Authoritative-stale checkpoints are discarded and their latest pointer is cleared best-effort. They never block the receiver. Malformed checkpoints are quarantined and reported; malformed RoomMeta remains blocking.
 
 ## Story validation
 
-Keep deep normalization and bounds for manifest size, IDs, scenes, dialogue, choices, assets, transitions, conditions, effects, same-origin paths, and effect-reachable variable count/value width. Warn for all-gated choices without fallback and conservative dangerous numeric cycles.
-
-The engine rejects the first non-finite or over-budget transition before mutation; static analysis does not claim arbitrary loop termination.
+Story manifests remain deeply normalized and bounded: scenes, entries, choices, assets, transitions, conditions, effects, same-origin extensions, variable widths/counts, and total bytes. Warn about unreachable or fully gated content. The engine rejects the first nonfinite/oversized runtime result before mutation.
 
 ## Tests
 
-- invalid live/history references;
-- missing exact story/version at every full-state entry;
-- rev10 checkpoint chosen over rev0 decision;
-- invalid active start/migration state blocks bootstrap;
-- semantic-invalid gossip/reconciliation never reaches state application.
+- same session/epoch with changed story/version rejected at every full-state path;
+- floor equality requires exact digest;
+- state below floor rejected;
+- authoritative-stale retired checkpoint is discarded;
+- checkpoint above high water blocks;
+- unknown story/version yields recoverable blocking lobby;
+- alias-free story/session normalization and effect limits.

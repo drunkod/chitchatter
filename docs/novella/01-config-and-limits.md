@@ -1,6 +1,6 @@
-# 01 — Protocol constants, epochs, and canonical ordering
+# 01 — Protocol constants, epochs, canonical ordering, and comparator floors
 
-> **Revision 9 changes:** adds separate retirement/outcome bounds and defines strongest-baseline selection used by start and migration handlers.
+> **Revision 10 changes:** adds migration-lineage/current-epoch bounds, defines terminal versus nonterminal dispositions, adds canonical state floors, and centralizes closed-epoch install checks.
 
 ## Limits
 
@@ -27,9 +27,13 @@ export const visualNovelLimits = {
   maxTextLength: 8 * 1024,
 
   maxSeenActionIds: 2048,
-  maxRetiredSessions: 32,
-  maxCompletedEndCertificates: 16,
+  maxHistoricalDispositions: 48,
+  maxHistoricalEndCertificates: 24,
+  maxCurrentEpochDispositions: 16,
+  maxCurrentEpochEndCertificates: 16,
+  maxMigrationLineage: 8,
   maxOutstandingRecoveries: 16,
+  maxOpenConflicts: 16,
 
   requestTimeoutMs: 10_000,
   recoveryRecordTtlMs: 30_000,
@@ -42,23 +46,39 @@ export const visualNovelLimits = {
 } as const
 ```
 
-Retry timers affect activity only. They never expire protocol authorization.
+Timers control retry activity only. They never expire durable authorization.
 
 ## Epoch rules
 
-- first committed session: epoch 1;
-- start/switch: `highWaterEpoch + 1`;
-- proposal stale at `candidateEpoch <= highWaterEpoch`;
-- decision/gossip stale at `< highWaterEpoch`;
-- other state traffic stale at `< highWaterEpoch`;
-- `epochOutcome.epoch === highWaterEpoch` whenever high water is non-zero;
-- an `ended` outcome rejects every start decision for that epoch;
-- a higher epoch replaces the previous current outcome;
-- retirement records protect exact sessions; high water protects trimmed old epochs.
+- first committed session is epoch 1;
+- fresh start and switch create `highWaterEpoch + 1`;
+- proposals are stale at `candidateEpoch <= highWaterEpoch`;
+- decisions/gossip are stale at `< highWaterEpoch`;
+- ordinary state traffic is stale at `< highWaterEpoch`;
+- `epochOutcome.epoch === highWaterEpoch` whenever high water is nonzero;
+- every disposition, certificate, active decision, migration entry, and outcome floor has epoch `<= highWaterEpoch`;
+- an ended high-water outcome rejects every state-installing action at that epoch;
+- higher epoch terminally supersedes all older epochs;
+- old records may be trimmed because high water rejects their traffic;
+- records from `highWaterEpoch` are never trimmed.
 
-## Canonical semantic ordering
+## Terminality
 
-Canonicalize recursively, sort object keys with code-unit `<`, omit diagnostic `updatedAt`, encode UTF-8, and compare unsigned bytes. Never use `localeCompare`.
+```ts
+const dispositionIsTerminal = (
+  disposition: SessionDisposition,
+  meta: RoomMeta,
+): boolean =>
+  disposition.reason === 'ended' ||
+  disposition.reason === 'switched' ||
+  disposition.sessionEpoch < meta.highWaterEpoch
+```
+
+`reconciled` records at the active high-water epoch are nonterminal. They suppress local request/progression confusion and clear checkpoints, but complete state evidence may still dispatch and compete.
+
+## Canonical state ordering
+
+Canonicalize recursively, sort object keys with code-unit ordering, omit diagnostic `updatedAt`, encode UTF-8, and compare unsigned bytes. Never use `localeCompare`.
 
 ```ts
 export const compareSessionPriority = (a, b): number =>
@@ -69,9 +89,37 @@ export const compareSessionPriority = (a, b): number =>
   -compareBytes(canonicalStateBytes(a), canonicalStateBytes(b))
 ```
 
-Positive means `a` wins. Equality means equal normalized semantic state.
+Positive means `a` wins. Same session/epoch states are comparable only after exact story ID/version equality is verified.
 
-## Strongest known baseline
+## Canonical comparator floor
+
+```ts
+export interface CanonicalStateFloor {
+  sessionId: string
+  sessionEpoch: number
+  storyId: string
+  storyVersion: string
+  controllerPeerId: string
+  revision: number
+  stateDigest: string
+}
+
+export const floorFromState = (state: VisualNovelSessionState): CanonicalStateFloor => ({
+  sessionId: state.sessionId,
+  sessionEpoch: state.sessionEpoch,
+  storyId: state.storyId,
+  storyVersion: state.storyVersion,
+  controllerPeerId: state.controllerPeerId,
+  revision: state.revision,
+  stateDigest: digestCanonicalState(state),
+})
+```
+
+`compareStateToFloor` applies epoch/revision/controller/session ordering and compares the canonical digest when all preceding fields tie. A state equal to the floor must have the exact digest. A state below the floor is never installed. A higher state may install only through an authorized complete-state path.
+
+Every canonical progression, restart, migration, reconciliation, start, and switch advances the floor in the same transaction that exposes state.
+
+## Strongest full-state baseline
 
 ```ts
 export const strongestState = (
@@ -85,14 +133,22 @@ export const strongestState = (
   )
 ```
 
-Only compare states for the relevant epoch/protocol decision. Handlers use:
+Handlers filter to the relevant epoch and immutable story identity before calling it.
 
-- start: `strongestState(live, checkpoint, activeDecision?.state)`;
-- migration: `strongestState(live, activeMigration.lastAppliedState)`;
-- recovery: the baseline prescribed by its recovery kind.
+## Closed-epoch helper
 
-A revision-0 decision is evidence of origin, not a replacement for progressed state.
+All state-installing handlers call one helper after authorization and again inside the locked mutation:
+
+```ts
+assertEpochInstallable(meta, incoming) {
+  if (incoming.sessionEpoch < meta.highWaterEpoch) throw stale()
+  if (
+    meta.epochOutcome?.epoch === incoming.sessionEpoch &&
+    meta.epochOutcome.status === 'ended'
+  ) throw closedEpoch()
+}
+```
 
 ## Bounded IDs and bytes
 
-`deriveRoundId` remains bounded FNV-1a bookkeeping over canonical raw fields. Validators recompute it; it is not a signature. All aggregate values use non-throwing UTF-8 byte measurement and final envelope/snapshot limits.
+`deriveRoundId` remains bounded FNV-1a bookkeeping over canonical raw fields. It is not a signature. Conflict IDs and migration IDs include their raw fields in the payload and are recomputed. Aggregate values use non-throwing UTF-8 measurement and final envelope/snapshot limits.

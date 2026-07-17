@@ -1,24 +1,42 @@
 # 05 — Pure engine
 
-> **Revision 9:** no functional engine change. The engine remains deterministic, immutable, and transport-safe; protocol ordering compares semantic state without `updatedAt`.
+> **Revision 10 changes:** no transition semantics change. The plan now requires every accepted engine result to advance the durable comparator floor in the same transaction that exposes state.
 
-## Responsibilities
+The engine imports no React, storage, transport, DOM, global clock, or randomness. It receives a validated manifest and explicit dependencies.
 
-- `start(sessionId, controllerPeerId, sessionEpoch)` creates revision 0;
-- `advance` follows validated transitions and refuses to skip required choices;
-- `choose` validates availability, applies immutable effects, and moves;
-- `restart` preserves session/controller/epoch and increments revision;
-- `changeController` preserves story content and increments revision;
+## Operations
+
+- `start(sessionId, controllerPeerId, sessionEpoch)` creates revision 0 at the manifest start entry;
+- `advance` follows legal next transitions and refuses to skip required choices;
+- `choose` validates availability, applies immutable effects, and moves to the target;
+- `restart` preserves session/controller/epoch/story and increments revision;
+- `changeController` preserves session/epoch/story/content and increments revision;
 - getters assert exact story compatibility.
 
 ## Transport safety
 
-Before returning changed state, enforce variable count, encoded variable bytes, finite numeric values, and bounded history. Failed guards throw before mutation. Snapshot conversion later truncates history by count/bytes and final validators enforce full budgets.
+Before returning a changed state, enforce variable count/bytes, finite numbers, bounded history, valid IDs, and snapshot/envelope fit. Failure occurs before mutation.
 
 ## Determinism
 
-Given identical normalized manifest, state, action, and injected clock, replicas derive equivalent semantic state. Progression events are replayed before application. `updatedAt` is diagnostic and excluded from convergence ordering.
+Given the same normalized manifest, state, action, and injected timestamp, the engine emits byte-equivalent semantic state. `updatedAt` is diagnostic and excluded from distributed ordering.
+
+Replicas replay progression and compare derived scene, entry, variables, history suffix, revision, and immutable story identity before application.
+
+## Integration contract
+
+An engine result is not canonical merely because it is locally valid. The sync layer must:
+
+1. authorize the action;
+2. compute `floorFromState(result)`;
+3. run a lock-scoped metadata/state transaction that advances the floor and installs the exact result;
+4. broadcast/commit only after success.
 
 ## Tests
 
-Cover starts/endings, next links, choices, restart, controller change, effects, non-finite increments, count/byte overflow, history bounds, incompatibility, missing entries, immutability, deterministic random walks, and validator compatibility of every emitted snapshot.
+- starts, endings, next links, restart, controller change;
+- required/unavailable/dead-end choices;
+- string/boolean/numeric effects and nonfinite rejection;
+- variable/history/byte overflow leaves state unchanged;
+- story identity preserved by every operation;
+- deterministic random walks whose states and floors pass validators.

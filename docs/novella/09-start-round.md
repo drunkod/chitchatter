@@ -1,70 +1,102 @@
-# 09 — Coordinated starts and full-state reconciliation
+# 09 — Coordinated starts and symmetric full-state reconciliation
 
-> **Revision 9 changes:** selects the strongest progressed baseline, persists a current epoch outcome, retires losing sessions, and permanently closes an ended epoch.
+> **Revision 10 changes:** reconciliation dispositions are nonterminal while active, conflict descriptors are symmetric/self-verifying, the outcome floor advances transactionally, and closed epochs reject all recovery/install paths.
 
 ## Normal start
 
-Coordinator collects revision-0 proposals, selects deterministically, creates `START_COMMITTED`, then performs one locked metadata mutation:
+Coordinator collects revision-0 proposals and selects deterministically. One `transactAndInstall` operation:
 
-- raise high water;
-- set `epochOutcome = { epoch, canonicalSessionId, status: 'active' }`;
-- store active start decision;
-- clear older active migration.
+- requires candidate epoch `highWater + 1`;
+- creates `EpochOutcome(status: 'active', floor: floorFromState(state))`;
+- stores the start decision;
+- clears older migration lineage;
+- installs the exact state synchronously.
 
-Only after the write succeeds is state installed and broadcast.
+Broadcast and duplicate commit occur after transaction success.
 
-## Strongest baseline
+## Baselines
 
-```ts
-const baseline = strongestState(
-  stateRef.current,
-  bootCheckpointRef.current,
-  sync.getActiveStartDecision()?.state,
-)
+Full-state comparison uses:
+
+1. current canonical store state;
+2. boot checkpoint candidate;
+3. every relevant migration-lineage last state;
+4. active start decision revision-0 evidence;
+5. the durable outcome floor.
+
+A full state below the floor loses even when no complete local state is available.
+
+## Decision/gossip acceptance
+
+- reject below high water;
+- reject every same-epoch decision when outcome is ended;
+- require immutable story identity for same session;
+- compare incoming against strongest complete baseline and floor;
+- equal digest is idempotent;
+- losing incoming state receives reconcile evidence when possible;
+- winning different session requires its matching decision;
+- transaction updates outcome/session/floor, active decision, and adds a `reconciled` disposition for the losing session;
+- winning same-session state advances only floor/state and does not dispose the session.
+
+A `reconciled` disposition clears the losing checkpoint and informs UI, but does not block later valid complete-state evidence while the outcome remains active.
+
+## Symmetric conflict descriptor
+
+Derive:
+
+```text
+lowerDigest, higherDigest = sortBytes(digest(local), digest(remote))
+sessionIdA, sessionIdB = sortBytes(local.sessionId, remote.sessionId)
+conflictId = deriveRoundId(kind, epoch, sessionIdA, sessionIdB,
+                           migrationId-or-empty, lowerDigest, higherDigest)
 ```
 
-The active decision’s revision-0 state never replaces a progressed live/checkpoint state merely because it is persisted evidence.
+`SESSION_RECONCILE` carries the full descriptor. A recipient recomputes it using its current/floor baseline and incoming state. It may create the conflict record atomically on first contact.
 
-## Accepting decision/gossip
+Different-session reconcile includes the incoming session’s `StartDecisionRecord`. Same-session reconcile requires exact story ID/version equality.
 
-- reject epoch below high water;
-- reject same epoch when outcome is ended;
-- compare incoming complete state against the strongest same-epoch baseline;
-- equal semantic state is idempotent;
-- losing incoming state receives reconciliation when possible;
-- winning different-session state requires a matching decision;
-- persist outcome/active decision and retirement of the losing session before installing;
-- winning same-session divergence updates state without retiring the session.
+## Stronger former loser
 
-```ts
-await sync.persistStartWinner({
-  decision,
-  incoming,
-  losingSession: local?.sessionId !== incoming.sessionId ? local : null,
-})
-await clearLosingCheckpoint(...)
-installState(incoming)
-```
+If a session with a prior `reconciled` disposition later presents a state that wins the comparator and floor checks, it may become canonical again. The old canonical session receives its own `reconciled` disposition. This is intentional availability-with-eventual-reconciliation behavior.
 
-Metadata mutation rechecks that the outcome remains active and the incoming state still wins against the latest persisted baseline.
+Terminal suppression occurs only for:
 
-## Conflict records
+- exact `ended` certificate/disposition;
+- `switched` session;
+- any older epoch.
 
-Record every same-epoch semantic difference, including equal revision and same session. Conflict IDs bind epoch plus both canonical state digests. `SESSION_RECONCILE` echoes the ID. A different-session reconcile includes the winning start decision.
+## Ended epoch
 
-## Closed epoch
+Ending the canonical outcome:
 
-When the canonical session ends, set its outcome to `ended` and clear active decision/migration. A delayed decision for any session at that epoch is permanently rejected. A higher epoch may start normally.
+- sets status `ended`;
+- preserves final floor;
+- clears active decision and migration lineage;
+- cancels same-epoch conflicts and outstanding recoveries;
+- rejects all later start, snapshot, reconcile, restart, progression, and migration state installation at that epoch.
+
+A higher epoch may start normally.
 
 ## Switch
 
-Controller switch retires old session as `switched`, raises epoch, installs a new active outcome and decision/state as applicable, and clears old migration. No completed-end certificate is fabricated.
+Controller switch transaction:
+
+- terminally disposes old session as `switched`;
+- creates exactly `highWater + 1`;
+- creates new outcome and floor;
+- stores decision evidence when applicable;
+- clears old lineage/conflicts/recoveries;
+- installs new state.
+
+No completed-end certificate is fabricated.
 
 ## Tests
 
-- rev1 competing decision cannot replace rev10 checkpoint;
-- equal-revision same-session and different-session conflicts converge;
-- losing different session is retired;
-- canonical end blocks delayed loser resurrection;
-- persistence failure exposes no replacement;
-- restored decision is the only gossip source.
+- former loser progresses beyond winner and can converge back while epoch active;
+- equal-revision same-session/different-session conflicts converge;
+- opposite peers derive identical conflict IDs;
+- first reconcile creates conflict record;
+- rev1 decision cannot replace rev10 checkpoint/floor;
+- ended epoch rejects decision, snapshot, reconcile, restart, migration response;
+- same-session different story/version rejects;
+- persistence/transaction failure exposes no replacement.

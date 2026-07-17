@@ -1,6 +1,6 @@
-# 08 — Sync service, gate, locked metadata, and authorization
+# 08 — Sync service, typed gate, lock-scoped transactions, and authorization
 
-> **Revision 9 changes:** re-ACK checks retained certificate IDs before tombstones, retired sessions are separate from end certificates, epoch outcome closes ended epochs, and storage mutations run inside the lock against latest data.
+> **Revision 10 changes:** centralizes closed-epoch checks for every state install, permits nonterminal reconciled evidence, adds generation-safe `transactAndInstall`, and authorizes symmetric first-contact reconciliation.
 
 ## Gate decisions
 
@@ -10,80 +10,88 @@ type GateDecision =
   | { kind: 'drop'; reason: string }
   | { kind: 'reack-end' }
   | { kind: 'reply-ended'; certificate: CompletedEndCertificate }
-  | { kind: 'reply-retired'; retirement: SessionRetirement }
+  | { kind: 'reply-disposed'; disposition: SessionDisposition }
 ```
 
-Order after structural normalization and outer identity:
+Order after normalization and outer identity:
 
-1. incoming original `SESSION_ENDED` whose action ID equals a retained certificate → `reack-end` even after reload;
+1. original `SESSION_ENDED` whose action ID matches a retained certificate → `reack-end`;
 2. duplicate original end → `reack-end`;
 3. duplicate other action → drop;
-4. exact retired session:
-   - completed certificate available and request/confusion traffic → `reply-ended`;
-   - switched/reconciled retirement → `reply-retired`;
+4. exact terminal disposition:
+   - ended with certificate and request/confusion traffic → `reply-ended`;
+   - switched or older-epoch disposition → `reply-disposed`;
    - otherwise drop;
-5. start proposal at `<= highWater` → drop;
-6. start decision/gossip at `< highWater` → drop;
-7. start decision at `== highWater` while outcome is `ended` → drop;
-8. other state traffic at `< highWater` → drop;
-9. dispatch.
+5. active-epoch `reconciled` disposition:
+   - request/progression confusion → `reply-disposed`;
+   - complete-state evidence (`START_*`, `SESSION_RECONCILE`, solicited `STATE_SNAPSHOT`, migration actions) continues to authorization;
+6. proposal at `<= highWater` → drop;
+7. decision/gossip at `< highWater` → drop;
+8. any state-installing action at an ended high-water epoch → drop;
+9. other state traffic below high water → drop;
+10. dispatch.
 
-Replies use fresh holder envelopes. `reply-retired` sends a bounded `ERROR` such as `SESSION_RETIRED`; it never invents a completed end.
+`reply-disposed` sends `SESSION_RETIREMENT_GOSSIP` with the exact normalized disposition.
 
-## Locked RoomMeta adapter
+## State-installing action set
 
-The mutation function—not a precomputed object—crosses the storage boundary:
+The central closed-epoch guard covers:
+
+- `START_COMMITTED`, `START_DECISION_GOSSIP`;
+- `SESSION_RECONCILE`;
+- `STATE_SNAPSHOT`;
+- `SESSION_STARTED`;
+- `RESTARTED`;
+- `CONTROLLER_CHANGED`;
+- normal progression events that produce/install state.
+
+It runs in the gate when possible, in action authorization, and inside the locked mutation.
+
+## Lock-scoped transaction API
 
 ```ts
-interface MetaMutationAdapter {
+interface MetaStateTransaction {
+  transactAndInstall<T>(
+    change: (current: RoomMeta) => { meta: RoomMeta; value: T },
+    install: (value: T, token: AppliedGenerationToken) => void,
+  ): Promise<AppliedGenerationToken>
+
   mutate(change: (current: RoomMeta) => RoomMeta): Promise<RoomMeta>
   readLatest(): Promise<RoomMeta>
   subscribe(listener: (meta: RoomMeta) => void): () => void
 }
 ```
 
-```ts
-async function mutate(change) {
-  return withRoomScopedLock(async () => {
-    const current = validateRoomMetaOrThrow(await readStoredMeta())
-    if (current.generation >= Number.MAX_SAFE_INTEGER) {
-      throw new Error('Room metadata generation exhausted')
-    }
-    const candidate = change(current)
-    const next = validateRoomMetaOrThrow({
-      ...candidate,
-      generation: current.generation + 1,
-    })
-    await writeStoredMeta(next)
-    broadcastGeneration(next.generation)
-    return next
-  })
-}
-```
+`transactAndInstall` obtains the room Web Lock, reads latest RoomMeta, applies and validates the mutation, increments generation, writes, updates the sync service’s canonical state store synchronously through a no-throw `install`, then releases the lock. React subscribes to that store. Checkpoint cleanup happens afterward.
 
-The in-memory service queues calls, installs only the returned latest record, and refreshes on external-tab generation notifications. A newer external record updates gate state immediately; retirement/end of the live session forces read-only reconciliation, and a changed active outcome starts exact recovery. Every protocol mutation rechecks its preconditions inside `change(current)`.
+No handler performs `await metadataWrite(); setState(...)`.
 
-## Exact recovery map
+External-generation notifications queue behind local transactions. If newer metadata changes outcome/floor, the service enters read-only reconciliation and exact recovery; it never allows a stale deferred install.
 
-Store bounded records keyed by request action ID. All kinds require exact sender/target, unexpired record, expected epoch, and success-time deletion.
+## Recovery authorization
 
-- revision gap: exact session, revision not behind;
-- bootstrap: compare against strongest boot baseline and epoch outcome;
-- start reconcile: matching conflict ID; different-session state requires matching decision;
-- migration reconcile: matching active session-bound migration ID and session; incoming wins strongest migration baseline.
+Records are keyed by request action ID. Every kind requires exact sender/target, unexpired record, epoch/session, and success-time deletion.
+
+- `revision-gap`: exact active session, state not below floor/current baseline;
+- `bootstrap`: compare to floor and strongest boot state; exact canonical session unless authorized start reconciliation;
+- `start-reconcile`: symmetric descriptor verifies against current baseline; different session requires decision;
+- `migration-reconcile`: descriptor migration ID is in lineage; incoming same session/story and wins current/floor baseline.
+
+When an outcome becomes ended, cancel all matching same-epoch recovery and conflict records before any later response can apply.
 
 ## Authorization summary
 
 | Action | Authority |
 | --- | --- |
-| start proposal | proposer owns candidate; local coordinator; null live state; next epoch |
-| start commit/gossip | valid decision; compare against strongest baseline and epoch outcome |
-| reconciliation | matching conflict; complete state strictly wins |
-| state snapshot | current controller or exact recovery target with kind rules |
-| requests/progression | current controller, exact session/revision, no pending termination |
-| session switch | current controller; exact next epoch; retire old as switched |
-| original end | current controller; exact next revision; payload epoch matches state |
+| start proposal | proposer owns candidate; local coordinator; next epoch |
+| start commit/gossip | valid decision; outcome active/not closed; compare against floor and strongest state |
+| reconciliation | self-verifying descriptor; complete state wins; story identity rules |
+| snapshot | current controller or exact recovery target; central closed-epoch/floor checks |
+| requests/progression | current controller; exact session/revision; no pending termination |
+| switch | current controller; exact next epoch; terminally dispose old |
+| original end | current controller; exact next revision; payload epoch matches |
 | end ACK | frozen recipient and exact end action |
-| end gossip | holder identity; exact bound certificate dominance |
-| controller change | active migration for same session; strongest migration baseline |
+| end gossip | holder identity; exact certificate dominance |
+| retirement gossip | holder identity; exact normalized disposition |
+| controller change | selected retained migration ID; same session/story; strongest floor/current baseline |
 | control actions | reject until implemented |

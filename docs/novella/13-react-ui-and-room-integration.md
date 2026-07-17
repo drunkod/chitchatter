@@ -1,6 +1,6 @@
-# 13 — Full bootstrap, UI state, and room integration
+# 13 — Full bootstrap, canonical-store UI, and room integration
 
-> **Revision 9 changes:** bootstrap explicitly chooses the strongest checkpoint/decision baseline and presents separate messages for timeline rollback, completed end, and non-end retirement.
+> **Revision 10 changes:** React subscribes to the transaction-owned canonical store, bootstrap discards authoritative-stale checkpoints, and floor-only recovery is explicit.
 
 ## Keyed bootstrap
 
@@ -10,42 +10,66 @@ export const VisualNovelProvider = (props: Props) => (
 )
 ```
 
-Bootstrap derives room scope, loads/validates RoomMeta, loads/validates latest checkpoint, resolves exact stories for active records, validates cross-consistency, and returns the strongest boot baseline. No receiver exists before completion.
+Bootstrap:
 
-```ts
-const bootBaseline = strongestState(
-  checkpoint,
-  meta.activeStartDecision?.state,
-  meta.activeMigration?.lastAppliedState,
+1. derives room scope;
+2. loads and validates RoomMeta;
+3. loads and semantically validates the latest checkpoint;
+4. classifies the checkpoint;
+5. clears an authoritative-stale pointer best-effort;
+6. resolves stories for outcome/active records;
+7. computes strongest complete baseline;
+8. initializes the canonical store;
+9. mounts the receiver.
+
+## Floor-only bootstrap
+
+If outcome is active but no full state matches the floor:
+
+- render a read-only “Recovering the room’s novella” state;
+- do not allow fresh start or local controller actions;
+- issue exact-target bootstrap recovery to current controller/known peers;
+- reject states below the floor;
+- accept an equal state only with matching digest;
+- permit a higher authorized complete state and advance the floor transactionally.
+
+## Canonical store subscription
+
+```tsx
+const state = useSyncExternalStore(
+  canonicalStore.subscribe,
+  canonicalStore.getSnapshot,
+  canonicalStore.getServerSnapshot,
 )
 ```
 
-Only same-epoch valid candidates participate. A progressed checkpoint outranks revision-0 evidence.
+The store is updated synchronously inside the metadata Web Lock. React does not receive independent delayed install callbacks and does not mirror active decision, lineage, dispositions, or certificates.
 
-## Ready runtime
+## UI phases
 
-Render checkpoint as read-only provisional state until canonical confirmation. Fresh start is blocked while provisional state exists unless explicitly discarded. The sync layer owns safety records; React does not mirror active decision/migration/certificates in independent refs.
+Include `bootstrapping`, `recovering`, `lobby`, `starting`, `syncing`, `ready`, `waiting`, `reconciling`, `ending`, and `error`.
 
-Canonical apply modes:
+Apply modes:
 
 - `normal`;
 - `timeline-rollback`;
 - `ended-by-certificate`;
 - `retired-by-switch`;
-- `retired-by-reconciliation`.
+- `reconciled-history`;
+- `external-generation-recovery`.
 
-Callbacks run only after locked metadata persistence succeeds.
+## Messages
 
-## User messages
+- rollback: “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”
+- completed end: “The room had already ended this novella while you were disconnected.”
+- switched: “This novella session was replaced by a story switch.”
+- reconciliation history: “This timeline previously lost a room comparison, but newer valid progress may still be compared.”
+- floor-only recovery: “Recovering the latest novella state before controls are enabled.”
 
-- timeline rollback: “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”
-- completed end: “The room had already ended this novella while you were disconnected. Later actions on this timeline were rolled back.”
-- retired session: “This saved novella timeline was replaced by a newer room decision.”
-
-Chat, media, screen share, and file UI remain mounted.
+Chat, media, screen share, and files remain mounted.
 
 ## Integration and cleanup
 
-Mount once around group-room body, never direct-message rooms. Keep real `RoomVideoDisplay userId width height` props. Transport identity comes from `peerRoom.getSelfId()`.
+Mount once around group-room body, never DM rooms. Keep real `RoomVideoDisplay userId width height` props. Transport identity comes from `peerRoom.getSelfId()`.
 
-Keyed provider immediately removes old-room receiver on navigation. Stale bootstrap promises and UI timers are cancelled.
+Keyed provider immediately removes old receiver/store subscription on navigation. Stale bootstrap promises, recovery operations, and UI timers are cancelled.

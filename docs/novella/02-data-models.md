@@ -1,6 +1,6 @@
 # 02 — Data models and durable protocol records
 
-> **Revision 9 changes:** separates retirement from completed-end certificates, binds original end epoch/story, adds the durable current-epoch outcome, and makes migration explicitly session-bound.
+> **Revision 10 changes:** introduces structured retirement gossip, a comparator floor, migration lineage, symmetric conflict descriptors, and explicit transaction tokens.
 
 ## Core state and envelope
 
@@ -29,10 +29,6 @@ export interface VisualNovelSessionState extends Record<string, unknown> {
   updatedAt: number
 }
 
-export type VisualNovelParticipation =
-  | { kind: 'joined' }
-  | { kind: 'left-current-session'; sessionId: string }
-
 export interface VisualNovelActionEnvelope<T = unknown> extends Record<string, unknown> {
   protocol: 'visual-novel'
   protocolVersion: 1
@@ -60,10 +56,13 @@ export type VisualNovelActionType =
   | 'CHOICE_REQUEST' | 'CHOICE_RESOLVED'
   | 'SESSION_STARTED'
   | 'SESSION_ENDED' | 'SESSION_END_ACK' | 'SESSION_END_NOTICE_GOSSIP'
+  | 'SESSION_RETIREMENT_GOSSIP'
   | 'ELECTION_ADVERTISE' | 'CONTROLLER_CHANGED'
   | 'CONTROL_REQUEST' | 'CONTROL_PASSED'
   | 'RESTART_REQUEST' | 'RESTARTED' | 'ERROR'
 ```
+
+## Durable evidence
 
 ```ts
 export interface StartDecisionRecord extends Record<string, unknown> {
@@ -73,12 +72,13 @@ export interface StartDecisionRecord extends Record<string, unknown> {
   state: VisualNovelSessionState // revision 0
 }
 
-export interface SessionRetirement extends Record<string, unknown> {
+export interface SessionDisposition extends Record<string, unknown> {
   sessionId: string
   sessionEpoch: number
   storyId: string
   storyVersion: string
   reason: 'ended' | 'switched' | 'reconciled'
+  decidedByActionId: string
 }
 
 export interface CompletedEndCertificate extends Record<string, unknown> {
@@ -89,12 +89,73 @@ export interface CompletedEndCertificate extends Record<string, unknown> {
   endEnvelope: EnvelopeFor<'SESSION_ENDED'>
 }
 
+export interface CanonicalStateFloor extends Record<string, unknown> {
+  sessionId: string
+  sessionEpoch: number
+  storyId: string
+  storyVersion: string
+  controllerPeerId: string
+  revision: number
+  stateDigest: string
+}
+
 export interface EpochOutcome extends Record<string, unknown> {
   epoch: number
   canonicalSessionId: string
   status: 'active' | 'ended'
+  floor: CanonicalStateFloor
 }
 ```
+
+## Symmetric conflicts
+
+```ts
+export type ConflictKind = 'start' | 'migration'
+
+export interface ConflictDescriptor extends Record<string, unknown> {
+  kind: ConflictKind
+  epoch: number
+  sessionIdA: string
+  sessionIdB: string
+  migrationId: string | null
+  lowerStateDigest: string
+  higherStateDigest: string
+  conflictId: string
+}
+
+export interface StateConflict {
+  descriptor: ConflictDescriptor
+  localState: VisualNovelSessionState
+  remoteState: VisualNovelSessionState
+  localDecision: StartDecisionRecord | null
+  remoteDecision: StartDecisionRecord | null
+}
+```
+
+The two state digests and two session IDs are sorted bytewise before deriving `conflictId`; therefore opposite peers derive the same descriptor.
+
+## Migration lineage
+
+```ts
+export interface MigrationRecord extends Record<string, unknown> {
+  migrationId: string
+  sessionEpoch: number
+  sessionId: string
+  departedControllerPeerId: string
+  openedAtRevision: number
+  lastAppliedState: VisualNovelSessionState | null
+}
+
+export interface MigrationLineage extends Record<string, unknown> {
+  sessionEpoch: number
+  sessionId: string
+  records: MigrationRecord[] // canonical order by openedAtRevision, migrationId
+}
+```
+
+Every sequential controller departure appends a record. Records remain until exact-session terminal disposition, higher epoch, or reset. Current-epoch lineage is never trimmed; bound exhaustion fails closed.
+
+## Payloads
 
 ```ts
 export type EnvelopeFor<T extends VisualNovelActionType> =
@@ -108,8 +169,7 @@ export type VisualNovelPayloadByAction = {
     knownState: VisualNovelSessionState
   }
   SESSION_RECONCILE: {
-    reason: 'start-conflict' | 'migration-conflict'
-    conflictId: string
+    descriptor: ConflictDescriptor
     state: VisualNovelSessionState
     decision?: StartDecisionRecord
   }
@@ -130,15 +190,18 @@ export type VisualNovelPayloadByAction = {
   SESSION_ENDED: { sessionEpoch: number }
   SESSION_END_ACK: { endActionId: string }
   SESSION_END_NOTICE_GOSSIP: { certificate: CompletedEndCertificate }
+  SESSION_RETIREMENT_GOSSIP: { disposition: SessionDisposition }
 
   ELECTION_ADVERTISE: { roundId: string; state: VisualNovelSessionState }
   CONTROLLER_CHANGED: {
     roundId: string
+    migrationId: string
     departedControllerPeerId: string
     electorate: string[]
     controllerPeerId: string
     state: VisualNovelSessionState
   }
+
   CONTROL_REQUEST: Record<string, never>
   CONTROL_PASSED: { controllerPeerId: string }
   RESTART_REQUEST: { expectedRevision: number }
@@ -165,15 +228,6 @@ export interface OutstandingRecovery {
   expiresAt: number
 }
 
-export interface StartConflict {
-  conflictId: string
-  epoch: number
-  localState: VisualNovelSessionState
-  remoteState: VisualNovelSessionState
-  localDecision: StartDecisionRecord | null
-  remoteDecision: StartDecisionRecord | null
-}
-
 export interface PendingTermination {
   sessionId: string
   sessionEpoch: number
@@ -182,12 +236,10 @@ export interface PendingTermination {
   acked: Set<string>
 }
 
-export interface MigrationRecord extends Record<string, unknown> {
-  migrationId: string
-  sessionEpoch: number
-  sessionId: string
-  departedControllerPeerId: string
-  lastAppliedState: VisualNovelSessionState | null
+export interface AppliedGenerationToken {
+  roomScope: string
+  generation: number
+  outcomeFloorDigest: string
 }
 ```
 
@@ -199,22 +251,26 @@ export interface RoomMeta {
   generation: number
   highWaterEpoch: number
   epochOutcome: EpochOutcome | null
-  retiredSessions: SessionRetirement[]
+  dispositions: SessionDisposition[]
   completedEndCertificates: CompletedEndCertificate[]
   activeStartDecision: StartDecisionRecord | null
-  activeMigration: MigrationRecord | null
+  migrationLineage: MigrationLineage | null
 }
 ```
 
 Cross-field invariants:
 
-- high water 0 iff outcome/active records are null;
-- otherwise outcome epoch equals high water;
-- `ended` outcome has no active decision or migration;
-- active decision epoch/session equals active outcome;
-- active migration epoch/session equals active outcome and its last state;
-- retired records and certificates are unique/canonically sorted;
-- every certificate has a matching `ended` retirement;
-- certificate fields exactly match the embedded original end envelope and payload epoch;
-- active outcome session is not retired unless outcome is `ended`;
-- start and migration records may coexist only for the same active session/epoch.
+- high water 0 iff outcome, active decision, and lineage are null and no historical records exist;
+- nonzero high water has an outcome at exactly high water;
+- high water is at least every disposition/certificate/decision/lineage epoch;
+- outcome floor exactly matches outcome epoch/session;
+- ended outcome has no active decision or migration lineage;
+- active decision matches the active outcome’s session/epoch/story;
+- migration lineage matches the active outcome’s session/epoch;
+- each migration last state matches lineage session/epoch/story;
+- dispositions and certificates are unique and canonically sorted;
+- every certificate has a matching `ended` disposition;
+- certificate fields match the embedded original end envelope and payload epoch;
+- active outcome session has no terminal disposition while status is active;
+- `reconciled` disposition at the active epoch is allowed but nonterminal;
+- current-epoch records obey dedicated non-trimming bounds.
