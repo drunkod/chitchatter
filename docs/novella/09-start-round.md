@@ -1,112 +1,70 @@
-# 09 — Coordinated starts, decision gossip, and full-state reconciliation
+# 09 — Coordinated starts and full-state reconciliation
 
-> **Revision 8 changes:** loads a canonical recovery baseline before receivers attach, compares incoming decisions with the persisted active decision even when React state is null, reconciles equal-revision divergence inside the same session, persists before installation, and removes duplicate decision refs.
+> **Revision 9 changes:** selects the strongest progressed baseline, persists a current epoch outcome, retires losing sessions, and permanently closes an ended epoch.
 
 ## Normal start
 
-```text
-starter → coordinator: START_PROPOSE(candidate@highWater+1)
-coordinator: collect for startRoundMs, choose deterministic candidate
-coordinator → all: START_COMMITTED(decision)
-recipient: semantic/authority checks → persist active decision/high water → install
-```
+Coordinator collects revision-0 proposals, selects deterministically, creates `START_COMMITTED`, then performs one locked metadata mutation:
 
-Decision ID binds epoch, coordinator, origin action, selected controller, and session ID. Proposals never install.
+- raise high water;
+- set `epochOutcome = { epoch, canonicalSessionId, status: 'active' }`;
+- store active start decision;
+- clear older active migration.
 
-## Single authoritative held decision
+Only after the write succeeds is state installed and broadcast.
 
-The sync service restores and exposes `getActiveStartDecision()` from RoomMeta. Gossip code reads that getter; there is no independent `heldDecisionRef`.
+## Strongest baseline
 
 ```ts
-const gossipHeldDecision = async (target?: string) => {
-  const held = sync.getActiveStartDecision()
-  const current = stateRef.current ?? bootBaselineRef.current
-  if (!held || !current || current.sessionId !== held.state.sessionId) return
-  await send(makeEnvelope(
-    'START_DECISION_GOSSIP',
-    { decision: held, knownState: toSnapshotState(current) },
-    bootstrapScope,
-    0,
-  ), target ? { target } : undefined)
-}
+const baseline = strongestState(
+  stateRef.current,
+  bootCheckpointRef.current,
+  sync.getActiveStartDecision()?.state,
+)
 ```
 
-## Boot baseline
+The active decision’s revision-0 state never replaces a progressed live/checkpoint state merely because it is persisted evidence.
 
-Before the receiver attaches, bootstrap loads:
+## Accepting decision/gossip
 
-- validated RoomMeta;
-- validated latest checkpoint, if any;
-- semantic story for the checkpoint and active records.
-
-`bootBaselineRef` is the checkpoint state or active-decision state. Incoming same-epoch decisions while live React state is null compare against this baseline and persisted active decision. They are never accepted merely because their epoch equals high water.
-
-## Decision acceptance
+- reject epoch below high water;
+- reject same epoch when outcome is ended;
+- compare incoming complete state against the strongest same-epoch baseline;
+- equal semantic state is idempotent;
+- losing incoming state receives reconciliation when possible;
+- winning different-session state requires a matching decision;
+- persist outcome/active decision and retirement of the losing session before installing;
+- winning same-session divergence updates state without retiring the session.
 
 ```ts
-const acceptStartState = async (
-  decision: StartDecisionRecord,
-  incoming: VisualNovelSessionState,
-  envelope: VisualNovelActionEnvelope,
-  sourcePeerId?: string,
-) => {
-  const local = stateRef.current ?? bootBaselineRef.current
-  const active = sync.getActiveStartDecision()
-  const highWater = sync.getLatestEpoch()
-  if (incoming.sessionEpoch < highWater) return
-
-  const activeBaseline = active?.state ?? local
-  if (!local && incoming.sessionEpoch !== highWater + 1 &&
-      incoming.sessionEpoch !== highWater) return
-
-  if (activeBaseline && incoming.sessionEpoch === activeBaseline.sessionEpoch) {
-    const order = compareSessionPriority(incoming, activeBaseline)
-    if (order < 0) {
-      if (sourcePeerId) void sendReconcileState(sourcePeerId, activeBaseline)
-      return
-    }
-    if (order === 0) { sync.commit(envelope); return }
-  }
-
-  // Equal session/revision but different semantic bytes also reaches this path.
-  const current = local
-  if (current && incoming.sessionEpoch === current.sessionEpoch &&
-      canonicalStateEqual(incoming, current)) {
-    sync.commit(envelope)
-    return
-  }
-
-  const nextMeta = await sync.persistStartWinner(decision)
-  setPhase(current ? 'reconciling' : 'syncing')
-  await clearCheckpointIfLosing(current, incoming)
-  installState(incoming)
-  bootBaselineRef.current = incoming
-  sync.commit(envelope)
-}
+await sync.persistStartWinner({
+  decision,
+  incoming,
+  losingSession: local?.sessionId !== incoming.sessionId ? local : null,
+})
+await clearLosingCheckpoint(...)
+installState(incoming)
 ```
 
-Persistence completes before state exposure. Failed persistence leaves the old state/baseline intact and UI read-only.
+Metadata mutation rechecks that the outcome remains active and the incoming state still wins against the latest persisted baseline.
 
-## Conflict records and reconciliation
+## Conflict records
 
-Whenever same-epoch semantic states differ—including identical session ID and revision—record a `StartConflict` with a bounded digest `conflictId`. `SESSION_RECONCILE` must echo that ID. Apply only when the incoming state strictly wins the shared comparator.
+Record every same-epoch semantic difference, including equal revision and same session. Conflict IDs bind epoch plus both canonical state digests. `SESSION_RECONCILE` echoes the ID. A different-session reconcile includes the winning start decision.
 
-If the winning controller is reachable, prefer an exact-target `STATE_REQUEST(start-reconcile)`; otherwise the honest-peer full-state reconciliation envelope is admissible.
+## Closed epoch
 
-## Partition behavior
+When the canonical session ends, set its outcome to `ended` and clear active decision/migration. A delayed decision for any session at that epoch is permanently rejected. A higher epoch may start normally.
 
-Higher revision wins; ties use lower controller ID, lower session ID, then canonical semantic bytes. Losing novella actions may roll back. UI enters `reconciling`, clears the losing checkpoint, explains the rollback, then renders the winner. Chat/media remain untouched.
+## Switch
 
-## Story switch
-
-Controller-only switch creates exactly `current.epoch + 1`. One serialized metadata mutation tombstones the old session, raises high water, clears old active start/migration, and completes before new state installation/broadcast.
+Controller switch retires old session as `switched`, raises epoch, installs a new active outcome and decision/state as applicable, and clears old migration. No completed-end certificate is fabricated.
 
 ## Tests
 
-- delayed proposals drop while same-epoch decisions/gossip dispatch;
-- partial commit + coordinator crash converges;
-- boot race: conflicting same-epoch gossip cannot overwrite active decision before checkpoint load;
-- equal revision, same session, different branch/variables converges;
-- persistence failure exposes no winning replacement;
-- gossip uses restored service decision after reload;
-- losing checkpoint and rollback UI are correct.
+- rev1 competing decision cannot replace rev10 checkpoint;
+- equal-revision same-session and different-session conflicts converge;
+- losing different session is retired;
+- canonical end blocks delayed loser resurrection;
+- persistence failure exposes no replacement;
+- restored decision is the only gossip source.

@@ -1,74 +1,64 @@
-# 15 — Checkpoints and serialized room safety metadata
+# 15 — Locked RoomMeta, retirement, certificates, and checkpoints
 
-> **Revision 8 changes:** RoomMeta persists migration authority, enforces cross-field invariants, serializes mutations from the latest value, and bootstrap loads the checkpoint baseline before receiver attachment.
+> **Revision 9 changes:** mutation functions execute inside the lock against latest storage, final generation is validated, retirement is separate from certificates, and epoch outcome closes ended epochs.
 
 ## Keys
 
 ```text
-visual-novel:v1:<roomScope>:meta        → RoomMeta
-visual-novel:v1:<roomScope>:latest      → checkpoint session ID
-visual-novel:v1:<roomScope>:<sessionId> → truncated checkpoint state
+visual-novel:v1:<roomScope>:meta
+visual-novel:v1:<roomScope>:latest
+visual-novel:v1:<roomScope>:<sessionId>
 ```
 
-Room scope is an asynchronous one-way digest of the effective room identity. Never store room secrets, invite URLs, crypto keys, transport metadata, chat, or media.
+Room scope is a one-way digest of effective room identity. Never store room secret, invite URL, crypto key, chat, or media.
 
-## Bootstrap order
+## Bootstrap
 
 1. derive room scope;
-2. read and normalize RoomMeta;
-3. read pointer and checkpoint;
-4. structurally and semantically validate checkpoint and active record states;
-5. enforce metadata/checkpoint consistency;
-6. mount ready runtime and only then attach receiver.
+2. load/normalize RoomMeta;
+3. load latest pointer/checkpoint;
+4. structurally and semantically validate checkpoint and active states;
+5. reject retired checkpoint;
+6. enforce outcome/active-record consistency;
+7. compute strongest boot baseline;
+8. mount ready runtime, then receiver.
 
-Malformed existing metadata or contradictory checkpoint safety state shows blocking reset/retry UI. It never silently becomes empty metadata.
-
-## Metadata mutation adapter
-
-Every mutation executes through one room-scoped queue/lock:
+## Mutation contract
 
 ```ts
-mutateMeta(async current => {
-  const next = protocolMutation(current)
-  return validateRoomMetaOrThrow({
-    ...next,
-    generation: current.generation + 1,
-  })
-})
+metaAdapter.mutate(change)
 ```
 
-Implementation reads the latest stored record inside the room-scoped Web Lock, validates it, merges the mutation, writes, then updates the in-memory service snapshot. Within one runtime, a promise queue preserves order. No handler captures and later writes a stale metadata object.
+The adapter obtains a room-scoped Web Lock, reads and validates latest stored metadata, applies `change` inside the lock, increments generation, validates the exact final object, writes it, and publishes the new generation. A local promise queue orders calls. BroadcastChannel/storage notifications refresh other same-room tabs.
 
-If required lock/write semantics are unavailable or fail, novella safety mutations are blocked/read-only. Checkpoint writes remain best-effort because they are UI continuity only.
+Protocol mutations repeat authorization preconditions inside `change(current)`. A stale runtime cannot overwrite a newer outcome, retirement, certificate, decision, or migration.
 
-## Protocol mutation rules
+If lock semantics or critical writes fail, novella becomes read-only and exposes no new canonical state. Checkpoints remain best-effort continuity only.
 
-- start winner: raise high water, store active decision, clear older migration;
-- open migration: store active migration for current high-water session;
-- migration winner: update active migration last state;
-- switch/higher epoch: tombstone replaced session as required, raise high water, clear older active records;
-- completed end: add/replace certificate, canonical-sort/trim tombstones, clear matching active records;
-- reset: explicit confirmation clears metadata and checkpoints.
+## Protocol mutations
+
+- start winner: raise high water; set active outcome/decision; retire losing different session;
+- start same-session reconciliation: preserve session identity and update canonical baseline;
+- open migration: require active outcome/session and store session-bound record;
+- migration winner: compare with strongest current/recorded state and update last state;
+- switch: retire old as switched; create next active outcome; clear old records;
+- completed end: retire ended; store certificate; mark matching canonical outcome ended; clear matching active records;
+- reconciliation replacement: retire losing different session; update outcome/decision; clear/reopen migration as required;
+- reset: explicit confirmation only.
+
+## Bounds and trimming
+
+Retirements and certificates are canonically sorted and separately bounded. Trimming is coordinated: every retained certificate keeps its matching `ended` retirement, and certificate trimming happens before any now-unreferenced retirement is removed. Keep newest entries by `(sessionEpoch, sessionId)`. Old epochs remain suppressed by high water even after trimming. The current epoch outcome is never trimmed.
 
 ## Checkpoints
 
-Write `toSnapshotState(state)` and latest pointer after canonical state is exposed. On failure, continuity is lost but protocol safety remains. Clear losing/replaced/ended checkpoints. A provisional checkpoint never grants controller authority.
-
-## Cross-field validation
-
-Require the complete invariants from 02/03 plus:
-
-- checkpoint session not tombstoned;
-- checkpoint epoch <= high water;
-- if checkpoint epoch equals active decision/migration epoch, session identities agree or bootstrap blocks for explicit recovery;
-- generation is a safe non-negative integer;
-- tombstone trimming keeps greatest `(epoch, sessionId)` entries deterministically.
+Write truncated canonical checkpoint and latest pointer after state exposure. Clear losing, switched, reconciled, or ended checkpoints. A provisional checkpoint grants no authority.
 
 ## Tests
 
-- serialized overlapping mutations preserve union of tombstones and newest records;
-- lock/write failure exposes no new state;
-- full metadata/checkpoint/active-migration round-trip;
-- contradictory metadata or checkpoint blocks ready runtime;
-- losing checkpoint clears after reconciliation/end certificate;
-- multi-tab lock test cannot overwrite newer safety data.
+- concurrent tabs preserve union of records;
+- mutation executes against latest stored data inside lock;
+- generation overflow/final validation blocks write;
+- separate retirement/certificate round trip;
+- strongest boot baseline chooses progressed checkpoint;
+- ended outcome blocks same-epoch resurrection.

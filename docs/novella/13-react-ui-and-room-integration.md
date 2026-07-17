@@ -1,12 +1,8 @@
 # 13 — Full bootstrap, UI state, and room integration
 
-> **Revision 8 changes:** bootstrap now loads both RoomMeta and the validated latest checkpoint before mounting sync, room changes synchronously discard the previous ready runtime, and completed-end rollback has explicit UI.
+> **Revision 9 changes:** bootstrap explicitly chooses the strongest checkpoint/decision baseline and presents separate messages for timeline rollback, completed end, and non-end retirement.
 
-## Context status
-
-Include `bootstrapping`, `lobby`, `starting`, `syncing`, `ready`, `waiting`, `reconciling`, `ending`, and `error`, plus `reconciliationMessage`, provisional controls, participation, and controller actions.
-
-## Keyed two-stage provider
+## Keyed bootstrap
 
 ```tsx
 export const VisualNovelProvider = (props: Props) => (
@@ -14,62 +10,42 @@ export const VisualNovelProvider = (props: Props) => (
 )
 ```
 
-The key guarantees a room change unmounts the old receiver immediately.
-
-```tsx
-const VisualNovelBootstrap = ({ children, transport, roomId }: Props) => {
-  const storage = usePersistedStorage()
-  const [result, setResult] = useState<BootstrapResult | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    setResult(null)
-    setError(null)
-    void bootstrapVisualNovel(storage, roomId)
-      .then(value => { if (!cancelled) setResult(value) })
-      .catch(reason => { if (!cancelled) setError(toMessage(reason)) })
-    return () => { cancelled = true }
-  }, [roomId, storage])
-
-  if (error) return <VisualNovelBootstrapError message={error} />
-  if (!result) return <CircularProgress aria-label="Preparing story sync" />
-  return <ReadyVisualNovelProvider {...result} transport={transport}>{children}</ReadyVisualNovelProvider>
-}
-```
-
-## Complete bootstrap
+Bootstrap derives room scope, loads/validates RoomMeta, loads/validates latest checkpoint, resolves exact stories for active records, validates cross-consistency, and returns the strongest boot baseline. No receiver exists before completion.
 
 ```ts
-const bootstrapVisualNovel = async (storage, roomId): Promise<BootstrapResult> => {
-  const roomScope = await digestRoomId(roomId)
-  const meta = await loadAndValidateRoomMeta(storage, roomScope)
-  const checkpoint = await loadAndValidateLatestCheckpoint(storage, roomScope)
-  validateBootstrapConsistency(meta, checkpoint)
-  return { storage, roomScope, initialMeta: meta, initialCheckpoint: checkpoint }
-}
+const bootBaseline = strongestState(
+  checkpoint,
+  meta.activeStartDecision?.state,
+  meta.activeMigration?.lastAppliedState,
+)
 ```
 
-Consistency rules include checkpoint epoch <= high water, tombstoned checkpoint rejection, and active-decision/migration semantic checks. No transport receiver exists before completion.
+Only same-epoch valid candidates participate. A progressed checkpoint outranks revision-0 evidence.
 
-## Ready provider
+## Ready runtime
 
-Initialize React state as null and render the checkpoint as a read-only provisional baseline until canonical confirmation, or initialize a separate immutable `bootBaseline` supplied to sync. Fresh start remains blocked while a provisional checkpoint exists unless the user explicitly discards it.
+Render checkpoint as read-only provisional state until canonical confirmation. Fresh start is blocked while provisional state exists unless explicitly discarded. The sync layer owns safety records; React does not mirror active decision/migration/certificates in independent refs.
 
-All canonical replacement callbacks receive a mode (`normal`, `rollback`, `ended-by-certificate`). The callback clears losing checkpoints and renders the correct explanation only after the sync layer confirms safety metadata persisted.
+Canonical apply modes:
 
-## Reconciliation UI
+- `normal`;
+- `timeline-rollback`;
+- `ended-by-certificate`;
+- `retired-by-switch`;
+- `retired-by-reconciliation`.
 
-For timeline replacement: “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”
+Callbacks run only after locked metadata persistence succeeds.
 
-For completed-end certificate: “The room had already ended this novella while you were disconnected. Later story actions on this timeline were rolled back.”
+## User messages
 
-Chat/media/file UI remains mounted. Return from `reconciling` to `ready` or `lobby` after atomic render.
+- timeline rollback: “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”
+- completed end: “The room had already ended this novella while you were disconnected. Later actions on this timeline were rolled back.”
+- retired session: “This saved novella timeline was replaced by a newer room decision.”
 
-## Integration
+Chat, media, screen share, and file UI remain mounted.
 
-Mount exactly once around group-room body, never DMs. Keep real `RoomVideoDisplay userId width height` props. Transport self identity always comes from `peerRoom.getSelfId()`, never UI user ID.
+## Integration and cleanup
 
-## Cleanup
+Mount once around group-room body, never direct-message rooms. Keep real `RoomVideoDisplay userId width height` props. Transport identity comes from `peerRoom.getSelfId()`.
 
-Pending UI timers clear on unmount. The keyed provider ensures stale bootstrap promises and old-room receivers cannot survive navigation.
+Keyed provider immediately removes old-room receiver on navigation. Stale bootstrap promises and UI timers are cancelled.

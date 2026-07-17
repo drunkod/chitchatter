@@ -1,6 +1,6 @@
 # 07 — Existing-room transport adapter
 
-> **Revision 8:** no new transport primitive. The new start and completed-end gossip actions use ordinary envelopes whose outer sender always matches transport context.
+> **Revision 9:** no new network primitive. All holder recovery uses fresh outer envelopes, and lifecycle/test semantics remain link-aware.
 
 Use the existing group-room `PeerRoom`; do not create another Trystero/WebRTC room or media stream.
 
@@ -19,16 +19,16 @@ export interface VisualNovelTransport {
 }
 ```
 
-Add only one short `PeerAction.VISUAL_NOVEL` entry within the repository action-name limit. One transport action carries the discriminated envelope union.
+Add one short `PeerAction.VISUAL_NOVEL`. One action carries the discriminated envelope union.
 
 ## Identity rule
 
-For every received outer envelope:
+Every received outer envelope must satisfy:
 
 ```ts
 envelope.senderPeerId === messageContext.peerId
 ```
 
-A peer must never resend another peer's original envelope unchanged. `START_DECISION_GOSSIP` and `SESSION_END_NOTICE_GOSSIP` solve that by using a fresh outer envelope naming the holder and embedding the normalized original decision/certificate.
+Never resend another peer’s original envelope unchanged. `START_DECISION_GOSSIP` and `SESSION_END_NOTICE_GOSSIP` use a new outer envelope naming the holder.
 
-Lifecycle handlers are keyed and removed individually. Novella cleanup never flushes shared chat, media, file, or DM handlers.
+Lifecycle handlers are keyed and removed individually. Novella cleanup never clears shared chat/media/file/DM handlers.

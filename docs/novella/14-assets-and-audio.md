@@ -1,11 +1,31 @@
-# 14 — Asset resolution, preload, and local audio
+# 14 — Safe assets and local audio
 
-> **Revision 8:** no protocol change. Reconciliation and completed-end rollback continue to use only locally resolved assets and stop obsolete audio immediately.
+> **Revision 9:** no protocol change. Asset and audio behavior remains local and must survive reconciliation without affecting canonical state.
 
-- Resolve assets only from the validated bundled story root.
-- Reject traversal, scheme-relative, cross-origin, malformed, and unsupported-extension paths during story validation.
-- Preload bounded current/near-next visual assets; failures show fallbacks and never block protocol state.
-- Music and sound are local presentation effects. Asset bytes and playback position never enter envelopes.
-- Respect browser autoplay policy, user mute/volume preferences, and reduced-motion/accessibility settings.
-- On story switch, reconciliation, restart, end, or completed-end certificate, stop/fade obsolete audio and start the newly rendered scene's local audio without changing canonical state.
-- Cleanup object URLs, event handlers, and audio nodes on unmount.
+## Asset resolution
+
+Resolve only manifest-declared, same-origin relative assets under the bundled story root. Reject traversal, protocol-relative paths, unsupported extensions, and unknown asset keys. Asset bytes never travel in novella envelopes.
+
+Preload the current scene plus bounded likely-next assets. Failed optional audio does not block state synchronization; missing required visual assets surface an accessible story error.
+
+## Audio
+
+Music and sound effects are local presentation:
+
+- user gesture unlocks playback;
+- local mute/volume preferences are not canonical story variables;
+- scene changes cross-fade/cancel prior audio;
+- reconciliation/end stops obsolete timeline audio before rendering the new state/lobby;
+- cleanup releases element/event references.
+
+## Accessibility
+
+Images have authored alternatives where meaningful; decorative art is hidden from assistive technology. Dialogue remains readable with assets/audio disabled. Reduced-motion and mute preferences are respected.
+
+## Tests
+
+- path traversal/cross-origin/extension rejection;
+- preload boundedness and cancellation;
+- no audio autoplay before gesture;
+- reconciliation and completed-end cleanup;
+- asset failure never mutates canonical state or chat/media controls.

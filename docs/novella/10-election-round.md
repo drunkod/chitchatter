@@ -1,82 +1,69 @@
-# 10 — Durable controller migration and supersession
+# 10 — Session-bound controller migration and supersession
 
-> **Revision 8 changes:** migration authorization no longer expires by local time, the active migration record is persisted, and controller-change replacement persists before state exposure.
+> **Revision 9 changes:** compares against current progress as well as recorded winner and explicitly rejects cross-session announcements until start reconciliation completes.
 
-## Local collection round
+## Migration authority
 
-On current-controller departure, freeze the local canonical electorate and derive the bounded round ID. Local round timers control advertisement collection and retry only; they do not decide whether a later announcement is authorized.
-
-## Persisted migration authority
+On current-controller departure, persist:
 
 ```ts
-const migrationId = deriveRoundId(
-  `migration:${state.sessionEpoch}:${state.sessionId}:${departedControllerPeerId}`)
-
 const record: MigrationRecord = {
-  migrationId,
+  migrationId: deriveRoundId(
+    `migration:${state.sessionEpoch}:${state.sessionId}:${departedPeerId}`),
   sessionEpoch: state.sessionEpoch,
   sessionId: state.sessionId,
-  departedControllerPeerId,
+  departedControllerPeerId: departedPeerId,
   lastAppliedState: null,
 }
 ```
 
-Persist the record before sending/accepting controller-change announcements. If a peer missed the leave event, it may create the record from an internally consistent announcement only when the announcement concerns its current session/controller, the departed peer is absent from its transport view, and the state is not older.
+The record remains until exact-session retirement, a higher epoch, explicit reset, or replacement by a newly opened migration for the same canonical session. Retry timers do not affect authorization.
 
-The record remains authoritative until:
+## Session-bound rule
 
-- that exact session/epoch is tombstoned;
-- a higher epoch installs;
-- local safety metadata is explicitly reset.
+`CONTROLLER_CHANGED.state.sessionId` and epoch must equal the active migration. Cross-session announcements are rejected. Same-epoch session conflicts first resolve through start decision/reconciliation. After installing a different winning session:
 
-`migrationRetryMs` stops active retries; it never makes a delayed valid announcement inadmissible. Reload restores the record before receivers attach.
+1. clear the losing session’s migration;
+2. inspect the winning state’s controller;
+3. if absent, persist a new migration record for that winning session before election traffic.
 
-## Announcement authorization
+This removes the Revision 8 contradiction between a session-bound migration ID and cross-session adoption.
 
-Require:
+## Strongest migration baseline
 
-- outer sender = announced controller = state controller;
-- announced controller = minimum canonical electorate ID;
-- digest-bound round fields valid;
-- departed peer absent from receiver transport view;
-- active migration ID/session/epoch/departed controller match;
-- incoming state is equal to or strictly wins over `record.lastAppliedState ?? current` using the shared bytewise comparator.
+```ts
+const baseline = strongestState(
+  stateRef.current,
+  migration.lastAppliedState,
+)
+```
 
-A delayed competing announcement remains comparable after arbitrary delay and after reload because authorization uses the persisted migration record, not `current.controllerPeerId` or a deadline.
+Incoming controller-change state must equal or strictly win over this baseline. A delayed revision-12 announcement cannot replace current revision 20. When incoming loses, send exact-target migration reconciliation with the current winner.
 
 ## Application
 
 ```ts
-const applyControllerChange = async (envelope, context) => {
-  const current = stateRef.current!
-  const incoming = envelope.payload.state
-  const migration = sync.requireActiveMigration(envelope.payload)
-  if (!authorizeControllerChange(envelope, context, migration, current)) return
-
-  if (canonicalStateEqual(incoming, migration.lastAppliedState ?? current)) {
-    sync.commit(envelope)
-    return
-  }
-
-  await sync.persistMigrationWinner(migration.migrationId, incoming)
-  setPhase('reconciling')
-  await clearCheckpointIfLosing(current, incoming)
-  installState(incoming)
-  sync.commit(envelope)
-}
+await sync.persistMigrationWinner({
+  migrationId: migration.migrationId,
+  incoming,
+  expectedBaseline: baseline,
+})
+setPhase('reconciling')
+await clearLosingCheckpointIfNeeded(...)
+installState(incoming)
 ```
 
-Persist before installation. Same session/epoch/revision with different content still uses the comparator.
+The locked mutation rechecks current metadata, session, epoch, migration ID, and comparator before writing.
 
-## Interaction with start conflicts
+## Announcement fields
 
-Announcements may carry competing same-epoch sessions. The shared comparator selects one complete state. The active migration then follows the winning session record persisted by the metadata mutation; losing peers display rollback.
+Require outer sender = announced/state controller, announced controller = minimum canonical electorate, valid digest-bound round fields, departed peer absent from receiver’s view, and active migration match.
 
 ## Tests
 
-- second announcement supersedes after first apply;
-- announcement delayed beyond retry timer still applies;
-- reload preserves original departure authorization;
-- same metadata but different session/content converges;
-- persistence failure exposes no replacement;
-- higher epoch/end clears migration; unrelated join/leave does not.
+- delayed announcement never replaces newer current progress;
+- delayed better announcement supersedes older state after reload;
+- cross-session controller change is rejected;
+- start reconciliation to another session clears/reopens migration correctly;
+- write failure exposes no replacement;
+- exact end/higher epoch clears migration.

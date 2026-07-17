@@ -1,110 +1,85 @@
 # 03 — Runtime structural validation and normalization
 
-> **Revision 8 changes:** validates `SESSION_END_NOTICE_GOSSIP`, reconciliation conflict IDs, durable migrations, and complete RoomMeta cross-field invariants.
+> **Revision 9 changes:** validates end epoch/story binding, separate retirement/certificate records, epoch outcomes, and session-bound migration rules.
 
-## General order
+## Envelope order
 
-1. bound the encoded envelope before deep traversal;
-2. validate protocol, action, IDs, revision, timestamp, and payload shape;
-3. normalize every nested collection into fresh objects;
-4. cross-check outer scope against embedded state where applicable;
-5. drop unknown properties and MVP `proof`;
-6. perform semantic story checks separately in 04.
+1. reject over-budget encoded input;
+2. validate protocol/action/primitive fields;
+3. validate and normalize the selected payload;
+4. cross-check outer scope against embedded content;
+5. drop unknown fields and MVP `proof`;
+6. run semantic validation separately.
 
-Existing `isId`, `isEpoch`, `isRevision`, `utf8Bytes`, variable/history/state validators, and final snapshot/envelope byte gates remain mandatory.
+All returned values are fresh objects.
 
-## Start and reconciliation payloads
+## Start and reconciliation
 
-`validateStartDecision` requires revision 0 and recomputes:
+- start decisions require revision 0 and a recomputed deterministic decision ID;
+- `START_COMMITTED` coordinator equals outer sender;
+- start gossip holder may differ from embedded coordinator;
+- known state shares decision session/epoch and is revision >= 0;
+- `SESSION_RECONCILE.conflictId` is bounded;
+- when reconciliation changes session ID, a matching revision-0 `decision` is mandatory and must describe that state’s session/epoch;
+- same-session migration reconciliation may omit the decision.
 
-```ts
-const expectedDecisionId = deriveRoundId([
-  'start', state.sessionEpoch, coordinatorPeerId, originActionId,
-  state.controllerPeerId, state.sessionId,
-].join(':'))
-```
-
-- `START_COMMITTED`: embedded coordinator equals outer sender.
-- `START_DECISION_GOSSIP`: outer sender is only the holder; decision and known state must share session/epoch, and known state revision is at least decision revision.
-- `SESSION_RECONCILE`: `conflictId` is a valid ID and state is normalized; outer sender is the holder, not necessarily the state controller.
-
-## Completed-end certificate
+## Completed-end binding
 
 ```ts
-const validatePersistedEndNotice = (
+const validateCompletedEndCertificate = (
   input: unknown,
-): ValidationResult<PersistedEndNotice> => {
-  if (!isRecord(input) || !isId(input.sessionId) || !isEpoch(input.epoch)) {
-    return fail('Invalid retained end notice')
-  }
+): ValidationResult<CompletedEndCertificate> => {
   const end = validateEnvelope(input.endEnvelope)
   if (!end.ok || end.value.actionType !== 'SESSION_ENDED') {
-    return fail('Invalid retained end envelope')
+    return fail('Invalid completed-end envelope')
   }
-  if (end.value.sessionId !== input.sessionId) {
-    return fail('Retained end scope mismatch')
+  if (
+    end.value.sessionId !== input.sessionId ||
+    end.value.storyId !== input.storyId ||
+    end.value.storyVersion !== input.storyVersion ||
+    end.value.payload.sessionEpoch !== input.sessionEpoch
+  ) {
+    return fail('Completed-end certificate binding mismatch')
   }
-  return {
-    ok: true,
-    value: {
-      sessionId: input.sessionId,
-      epoch: input.epoch,
-      endEnvelope: end.value as EnvelopeFor<'SESSION_ENDED'>,
-    },
-  }
+  return normalizedCertificate(...)
 }
 ```
 
-`SESSION_END_NOTICE_GOSSIP` contains only this normalized certificate. Its outer envelope uses bootstrap scope/revision 0 and identifies the holder. Receivers never require the holder to equal the original end-envelope sender.
+The original `SESSION_ENDED` outer scope is the live session and its payload epoch equals that session state’s epoch. `SESSION_END_NOTICE_GOSSIP` uses bootstrap outer scope/revision 0 and identifies only the holder.
 
-## Election and migration fields
+## Retirement and migration
 
-`CONTROLLER_CHANGED.electorate` remains sorted, unique, non-empty, at most 64, valid IDs, and excludes the departed controller. Recompute the digest-bound round ID and require announced controller = state controller = outer sender = minimum electorate ID.
-
-`MigrationRecord` validation recomputes:
-
-```ts
-migrationId === deriveRoundId(
-  `migration:${sessionEpoch}:${sessionId}:${departedControllerPeerId}`)
-```
-
-If `lastAppliedState` exists, it must share the record session and epoch.
-
-## Envelope scope rules
-
-- start proposal/commit/gossip, end-notice gossip: bootstrap outer scope, revision 0;
-- reconciliation: outer scope matches payload state so participation and stale-epoch gates have an exact subject;
-- normal state-carrying actions: outer session/story/version/revision equal embedded state;
-- original `SESSION_ENDED` scope is the ended live session; its epoch comes from the validated persistent certificate when gossiped.
+- retirement reason is exactly `ended`, `switched`, or `reconciled`;
+- migration ID binds `sessionEpoch`, `sessionId`, and departed controller;
+- migration last state, when present, shares session/epoch;
+- `CONTROLLER_CHANGED.state.sessionId` must equal the active migration session;
+- cross-session controller-change announcements are structurally valid envelopes but fail protocol authorization in 10.
 
 ## RoomMeta normalization
 
-```ts
-export const validateRoomMeta = (input: unknown): ValidationResult<RoomMeta> => {
-  // First enforce maxRoomMetaBytes, version, generation/highWater safe integers,
-  // tombstone count, normalized notices, active decision, and active migration.
-  // Then enforce cross-field invariants below.
-}
-```
+Validate byte/count limits, safe generation/high water, and all nested records. Then reject:
 
-Mandatory cross-field rejection rules:
+- high water 0 with any outcome/active record;
+- non-zero high water without matching outcome;
+- outcome epoch different from high water;
+- ended outcome with active start/migration;
+- active decision different from active outcome;
+- active migration different from active outcome;
+- active migration last-state mismatch;
+- active outcome session retired while status is active;
+- duplicate or non-canonically ordered retirements/certificates;
+- certificate without matching ended retirement;
+- ended retirement whose certificate fields disagree, when a certificate is present;
+- active records for different sessions;
+- certificate epoch/story/session mismatch with original end envelope.
 
-- any tombstone epoch greater than high water;
-- duplicate or non-canonically ordered tombstones;
-- active decision epoch different from high water;
-- active decision session present in tombstones;
-- active migration epoch different from high water;
-- active migration session tombstoned;
-- active migration `lastAppliedState` mismatch;
-- active decision and active migration describing different sessions at one epoch;
-- retained end-envelope scope mismatch.
-
-Malformed existing metadata blocks receiver mount. It never degrades silently to empty safety metadata.
+A switched/reconciled retirement needs no certificate. Malformed existing metadata blocks receiver attachment.
 
 ## Required tests
 
-- alias-free normalization of every action and record;
-- holder identity independent of embedded start/end origin;
-- invalid end certificate, decision ID, migration ID, reconcile conflict ID, and election digest rejected;
-- every RoomMeta cross-field contradiction rejected;
-- canonical tombstone order and configured bounds enforced.
+- alias-free normalization for every payload/record;
+- decision, conflict, migration, election, and certificate binding;
+- certificate epoch/story tampering;
+- every RoomMeta contradiction;
+- switched/reconciled retirement without end envelope is accepted;
+- ended certificate requires exact matching retirement.

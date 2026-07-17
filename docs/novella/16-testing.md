@@ -1,84 +1,64 @@
 # 16 — Test matrices and failure-injection transport
 
-> **Revision 8 changes:** adds end-certificate forwarding/dominance, delayed durable migration, bootstrap-baseline races, metadata write serialization, equal-revision same-session conflicts, and realistic crash/lifecycle queue behavior.
+> **Revision 9 changes:** adds direct regressions for stale start/migration baselines, closed-epoch resurrection, reload re-ACK, cross-session migration rejection, and in-lock cross-tab mutation.
 
-## Required matrices
+## Required regressions
 
-### Validation
+### Validation and metadata
 
-- alias-free normalization of every payload and persisted record;
-- start/migration/digest IDs and canonical electorate;
-- completed-end certificate outer holder identity independent of original sender;
-- all RoomMeta cross-field contradictions;
-- canonical byte ordering property across shuffled object insertion order and mocked locales.
-
-### Bootstrap and persistence
-
-- metadata plus checkpoint baseline load before receiver;
-- conflicting same-epoch gossip queued during bootstrap cannot overwrite active decision;
-- overlapping start/tombstone/migration mutations serialize and retain all safety data;
-- critical write/lock failure exposes no replacement;
-- room change unmounts old receiver before new digest resolves.
+- end certificate binds action, session, epoch, story ID/version;
+- switched/reconciled retirement validates without certificate;
+- certificate requires matching ended retirement;
+- epoch outcome and active-record contradictions reject;
+- canonical ordering ignores locale/insertion order.
 
 ### Start/reconciliation
 
-- partial commit + coordinator crash + identity-safe gossip;
-- equal-revision different session and equal-revision same-session divergence;
-- full semantic bytes decide independently of delivery order;
-- persistence precedes `setState`;
-- restored active decision is the sole gossip source.
+- active decision rev0 + checkpoint rev10 + competing rev1 keeps rev10;
+- equal-revision same-session and different-session conflicts converge;
+- losing session retirement persists;
+- canonical session ends, then delayed loser decision cannot install;
+- different-session reconciliation requires matching decision.
 
 ### Migration
 
-- first announcement installs, later better announcement supersedes;
-- delay beyond any retry timer still admissible;
-- reload preserves original departure record;
-- end/higher epoch clears record;
-- same metadata but different state content converges.
+- lastApplied rev11 + current rev20 + delayed incoming rev12 keeps rev20;
+- losing announcement receives migration reconciliation;
+- cross-session controller change rejects;
+- after start reconciliation changes session, old migration clears and absent winning controller opens a new record;
+- delayed better same-session announcement remains admissible after reload.
 
 ### Termination
 
-- ACK round and duplicate original re-ACK;
-- holder with changed peer ID forwards `SESSION_END_NOTICE_GOSSIP` successfully;
-- certificate clears migrated/progressed exact session/epoch but not other session/higher epoch;
-- persistence failure preserves state/round;
-- retained certificate survives reload.
+- dropped ACK, recipient reload, original resend re-ACKs from retained certificate ID;
+- certificate epoch/story tampering rejects;
+- certificate ends exact migrated/progressed session only;
+- switch/reconcile retirement never sends fake end certificate;
+- ended outcome blocks all same-epoch starts.
 
-### Recovery
+### Locked persistence
+
+- two tabs concurrently add different retirements/certificates and preserve union;
+- mutation callback runs after latest read inside Web Lock;
+- external generation refreshes in-memory store;
+- final generation overflow is rejected;
+- critical failure exposes no state.
+
+### Recovery and UI
 
 - overlapping request IDs coexist;
-- exact target, expiry, session/epoch, conflict ID, and recovery kind enforced;
-- revision-gap cannot authorize cross-session snapshot;
-- bootstrap/start/migration reconciliation each use their own comparator baseline.
+- exact target/kind/session/epoch/conflict/migration/expiry enforced;
+- room change removes receiver before new digest;
+- rollback/end/retirement messages match apply mode.
 
-## Link-aware test network
+## Link-aware mesh
 
-Each `TestTransport` owns a `knownPeers` view. The network stores ordered links and refreshes affected views after register, unregister, link change, partition, and heal. Tests can suppress a lifecycle notification while still changing link visibility to model missed leave/join events.
+Each test transport has a `knownPeers` view derived from directional links. Send resolves on enqueue; tests pump, reorder, or drop deliveries. Lifecycle callbacks are generated from visibility changes and may be explicitly suppressed to model a missed event.
 
-```ts
-crash(peerId, { preserveBuffered = false } = {}) {
-  if (!preserveBuffered) {
-    queue = queue.filter(item => item.from !== peerId && item.to !== peerId)
-  }
-  unregister(peerId)
-  refreshAllViews()
-}
-```
+Default crash removes every undelivered item from/to the peer. `preserveBuffered` is opt-in. `deliverPartiallyThenCrash` delivers selected targets, removes remaining sender items, then crashes.
 
-Default crash drops every undelivered delivery from/to the peer. A test that intentionally models already-buffered network delivery opts into `preserveBuffered` explicitly.
-
-`send` resolves on enqueue. Delivery is manually pumped/reordered/dropped. One-way `setLink` controls `getPeers` and receiver delivery. Lifecycle callbacks are derived from each transport's prior `knownPeers` versus refreshed visibility, with an explicit suppression option for missed-event scenarios.
-
-`deliverPartiallyThenCrash` pumps only selected target deliveries, removes all remaining sender deliveries, then crashes the sender.
-
-## Concrete transport requirements
-
-- `makeAction<T extends DataPayload>` routes every delivery through network enqueue;
-- receiver sets and keyed lifecycle handler maps;
-- insert-before-join notification;
-- disconnect delegates to network crash;
-- compile-only assignment to `VisualNovelTransport` locks type compatibility.
+The concrete transport routes all messages through the network, has keyed receiver/lifecycle maps, inserts before join notification, delegates disconnect to network crash, and has a compile-only `VisualNovelTransport` assignment.
 
 ## CI
 
-Unit, type, lint, build, and focused E2E suites appear as status checks on implementation PRs. Documentation-only plan commits may have no runs.
+Implementation PRs must show unit, type, lint, build, and focused E2E checks. Documentation-only plan commits may have no workflow run.

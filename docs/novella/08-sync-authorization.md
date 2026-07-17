@@ -1,91 +1,89 @@
-# 08 — Sync service, typed gate, serialized metadata, and authorization
+# 08 — Sync service, gate, locked metadata, and authorization
 
-> **Revision 8 changes:** adds identity-safe end-certificate gating, a serialized RoomMeta mutation store, one authoritative source for active records, and complete kind-specific recovery authorization.
+> **Revision 9 changes:** re-ACK checks retained certificate IDs before tombstones, retired sessions are separate from end certificates, epoch outcome closes ended epochs, and storage mutations run inside the lock against latest data.
 
-## Subject helpers and gate
-
-`subjectState` returns embedded state for start, reconcile, snapshot, switch, restart, election, and controller-change actions. `subjectSessionId` additionally returns `ended.sessionId` for `SESSION_END_NOTICE_GOSSIP`.
+## Gate decisions
 
 ```ts
-export type GateDecision =
+type GateDecision =
   | { kind: 'dispatch' }
   | { kind: 'drop'; reason: string }
   | { kind: 'reack-end' }
-  | { kind: 'reply-ended'; ended: PersistedEndNotice }
+  | { kind: 'reply-ended'; certificate: CompletedEndCertificate }
+  | { kind: 'reply-retired'; retirement: SessionRetirement }
 ```
 
-Gate order:
+Order after structural normalization and outer identity:
 
-1. duplicate original `SESSION_ENDED` → `reack-end` before tombstone suppression;
-2. duplicate other action → drop;
-3. tombstoned request/progression → `reply-ended` certificate;
-4. other tombstoned traffic → drop, except a new `SESSION_END_NOTICE_GOSSIP` may dispatch when its exact certificate is not already retained;
-5. proposal at `<= highWater` → drop;
-6. decision/gossip at `< highWater` → drop;
-7. other state traffic at `< highWater` → drop;
-8. dispatch.
+1. incoming original `SESSION_ENDED` whose action ID equals a retained certificate → `reack-end` even after reload;
+2. duplicate original end → `reack-end`;
+3. duplicate other action → drop;
+4. exact retired session:
+   - completed certificate available and request/confusion traffic → `reply-ended`;
+   - switched/reconciled retirement → `reply-retired`;
+   - otherwise drop;
+5. start proposal at `<= highWater` → drop;
+6. start decision/gossip at `< highWater` → drop;
+7. start decision at `== highWater` while outcome is `ended` → drop;
+8. other state traffic at `< highWater` → drop;
+9. dispatch.
 
-`reply-ended` sends a fresh `SESSION_END_NOTICE_GOSSIP`, never the original end envelope.
+Replies use fresh holder envelopes. `reply-retired` sends a bounded `ERROR` such as `SESSION_RETIRED`; it never invents a completed end.
 
-## Serialized metadata store
+## Locked RoomMeta adapter
 
-All safety mutations go through one queue and read the latest validated value inside the queue:
+The mutation function—not a precomputed object—crosses the storage boundary:
 
 ```ts
-class RoomMetaStore {
-  private tail = Promise.resolve()
-  constructor(private current: RoomMeta, private write: (meta: RoomMeta) => Promise<void>) {}
-
-  mutate(change: (current: RoomMeta) => RoomMeta): Promise<RoomMeta> {
-    const run = this.tail.then(async () => {
-      const next = validateRoomMetaOrThrow(change(this.current))
-      const withGeneration = { ...next, generation: this.current.generation + 1 }
-      await this.write(withGeneration)
-      this.current = withGeneration
-      return withGeneration
-    })
-    this.tail = run.then(() => undefined, () => undefined)
-    return run
-  }
-
-  snapshot = () => this.current
+interface MetaMutationAdapter {
+  mutate(change: (current: RoomMeta) => RoomMeta): Promise<RoomMeta>
+  readLatest(): Promise<RoomMeta>
+  subscribe(listener: (meta: RoomMeta) => void): () => void
 }
 ```
 
-Handlers never build independent stale metadata snapshots. A failed write leaves state unchanged/read-only. The service exposes authoritative getters for active start decision, migration record, retained ends, and high water; React does not mirror them in separate refs.
+```ts
+async function mutate(change) {
+  return withRoomScopedLock(async () => {
+    const current = validateRoomMetaOrThrow(await readStoredMeta())
+    if (current.generation >= Number.MAX_SAFE_INTEGER) {
+      throw new Error('Room metadata generation exhausted')
+    }
+    const candidate = change(current)
+    const next = validateRoomMetaOrThrow({
+      ...candidate,
+      generation: current.generation + 1,
+    })
+    await writeStoredMeta(next)
+    broadcastGeneration(next.generation)
+    return next
+  })
+}
+```
 
-For multiple same-origin tabs, the persistence adapter performs the queued read/merge/write under a room-scoped Web Lock when available. If an existing browser cannot provide the required lock semantics, novella safety writes are blocked rather than pretending cross-tab durability.
+The in-memory service queues calls, installs only the returned latest record, and refreshes on external-tab generation notifications. A newer external record updates gate state immediately; retirement/end of the live session forces read-only reconciliation, and a changed active outcome starts exact recovery. Every protocol mutation rechecks its preconditions inside `change(current)`.
 
 ## Exact recovery map
 
-Store at most `maxOutstandingRecoveries` records in a map keyed by request action ID. Remove on success, cancellation, expiry, room change, or unmount.
+Store bounded records keyed by request action ID. All kinds require exact sender/target, unexpired record, expected epoch, and success-time deletion.
 
-Authorization by kind:
+- revision gap: exact session, revision not behind;
+- bootstrap: compare against strongest boot baseline and epoch outcome;
+- start reconcile: matching conflict ID; different-session state requires matching decision;
+- migration reconcile: matching active session-bound migration ID and session; incoming wins strongest migration baseline.
 
-- `revision-gap`: exact target, request ID, session ID, epoch, revision not behind;
-- `bootstrap`: exact target, epoch >= high water, then compare against boot baseline/active decision;
-- `start-reconcile`: matching open `StartConflict.conflictId`, same epoch, incoming state wins comparator;
-- `migration-reconcile`: matching active migration ID/session/epoch, incoming state wins comparator;
-- every kind: `now <= expiresAt` and exact transport sender.
+## Authorization summary
 
-## Authorization matrix
-
-| Action | Required authority/result |
+| Action | Authority |
 | --- | --- |
-| `START_PROPOSE` | proposer owns candidate; self is local coordinator; null live state; exact next epoch |
-| `START_COMMITTED` | outer sender is decision coordinator and acceptable coordinator; compare/install |
-| `START_DECISION_GOSSIP` | any honest holder; embedded decision valid; compare/install |
-| `SESSION_RECONCILE` | matching recorded conflict; complete state strictly wins |
-| `STATE_REQUEST` | answer with end certificate, held decision, or exact controller snapshot |
-| `STATE_SNAPSHOT` | current controller or exact outstanding target; kind-specific rules above |
-| requests | self current controller; exact session/revision; no pending termination |
-| progression | outer sender current controller; exact next revision; engine replay matches |
-| `SESSION_STARTED` | current controller; revision 0; exact `epoch + 1` |
-| original `SESSION_ENDED` | current controller; exact next revision; persist tombstone then ack/clear |
-| `SESSION_END_ACK` | frozen recipient and exact pending action ID |
-| `SESSION_END_NOTICE_GOSSIP` | any holder; normalized certificate; exact session/epoch dominance rules in 11 |
-| election advertise | local round member to local winner; round/epoch match |
-| controller changed | winner of canonical electorate; active persisted migration; state wins comparator |
+| start proposal | proposer owns candidate; local coordinator; null live state; next epoch |
+| start commit/gossip | valid decision; compare against strongest baseline and epoch outcome |
+| reconciliation | matching conflict; complete state strictly wins |
+| state snapshot | current controller or exact recovery target with kind rules |
+| requests/progression | current controller, exact session/revision, no pending termination |
+| session switch | current controller; exact next epoch; retire old as switched |
+| original end | current controller; exact next revision; payload epoch matches state |
+| end ACK | frozen recipient and exact end action |
+| end gossip | holder identity; exact bound certificate dominance |
+| controller change | active migration for same session; strongest migration baseline |
 | control actions | reject until implemented |
-
-The comparator from 01 is the only distributed state ordering.

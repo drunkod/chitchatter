@@ -1,26 +1,39 @@
 # 06 — Bundled example story and catalog
 
-> **Revision 8:** no protocol change. Fixtures are referenced by the expanded reconciliation, persistence, and end-certificate tests.
+> **Revision 9:** no protocol change. This step remains the deterministic fixture used by engine, semantic-validator, replay, reconciliation, and UI tests.
 
-Ship one small declarative bundled story that exercises:
+## Package layout
 
-- sequential dialogue;
-- a required choice with conditions and effects;
-- at least two endings;
-- background, portrait/sprite, music, and sound references;
-- restart and controller migration without changing story identity.
+```text
+src/stories/example-story/
+  story.json
+  backgrounds/
+  characters/
+  audio/
+```
 
-The catalog exposes normalized manifests by exact `(storyId, storyVersion)`. Missing or changed versions make persisted/network state unavailable rather than silently substituting another story.
+The manifest is declarative and versioned. Asset references are same-origin relative paths. No script, HTML, remote URL, analytics, or executable extension is allowed.
 
-## Required fixtures
+## Fixture requirements
 
-Alongside the production example, tests may construct bounded in-memory fixtures for:
+The example contains:
 
-- invalid scene/entry/choice/history references;
-- all choices condition-gated with no fallback;
-- too many effect variables or encoded variable bytes;
-- non-finite increment result;
-- equal session/epoch/revision states with different branch/variables for reconciliation;
-- maximal legal UTF-8 snapshot sizes.
+- at least two scenes and two endings;
+- an explicit next link and an implicit next entry;
+- a required choice;
+- string, boolean, and numeric effects;
+- one conditional branch;
+- background, character, portrait, music, and sound references;
+- stable IDs suitable for deterministic snapshots.
 
-No asset bytes travel in protocol envelopes.
+## Catalog
+
+`getBundledStory(id, version)` returns only a deep-normalized manifest that already passed `validateStory`. Missing exact versions are recoverable lobby errors, not fallback to a different version.
+
+## Tests
+
+- fixture validates and every asset resolves;
+- engine reaches both endings deterministically;
+- all expected snapshots pass structural and semantic validation;
+- catalog refuses unknown version;
+- mutating imported/raw fixture data cannot mutate the catalog result.

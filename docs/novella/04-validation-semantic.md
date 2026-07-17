@@ -1,39 +1,40 @@
 # 04 — Semantic validation: stories and replicated sessions
 
-> **Revision 8 changes:** adds completed-end gossip boundaries and requires the bootstrap checkpoint baseline, active start state, active migration state, and every reconciliation state to be semantically validated before receiver attachment or application.
+> **Revision 9 changes:** semantic bootstrap selection now treats progressed checkpoint/live state as stronger than revision-0 decision evidence.
 
-## Session against story
+## State against story
 
-`validateSessionAgainstStory` verifies exact story ID/version, current scene/entry, every history scene/entry/choice, strictly increasing history revisions, and history revisions below current revision. It returns errors rather than throwing and never mutates input.
+`validateSessionAgainstStory` verifies exact story ID/version, current scene and entry, all history scene/entry/choice references, strictly increasing history revisions, and every history revision below current revision. It returns a normalized result without mutation.
 
 ## Mandatory full-state entry points
 
-Run structural normalization, resolve the exact bundled story/version, then semantic validation before authorization/application for:
+Run structural normalization, resolve exact bundled story/version, then semantic validation for:
 
-- `STATE_SNAPSHOT`, `SESSION_STARTED`, `RESTARTED`;
-- `START_PROPOSE.candidate`, `START_COMMITTED.decision.state`;
-- both states in `START_DECISION_GOSSIP`;
-- `SESSION_RECONCILE.state`;
-- `ELECTION_ADVERTISE.state`, `CONTROLLER_CHANGED.state`;
+- state snapshots, session starts, restarts;
+- start proposals and committed decision state;
+- both start-gossip states;
+- reconciliation state and optional decision state;
+- election advertisements and controller changes;
 - persisted latest checkpoint;
-- `RoomMeta.activeStartDecision.state`;
-- `RoomMeta.activeMigration.lastAppliedState` when present.
+- active start decision state;
+- active migration last state.
 
-`SESSION_END_NOTICE_GOSSIP` has no new story state; its embedded original end envelope and persisted scope are structurally validated in 03. Applying it only tombstones/clears an exact session and epoch.
+Completed-end gossip contains no new renderable state; its embedded original envelope is structurally bound to the certificate.
 
-Unknown story/version is a recoverable blocking lobby state, never a render-time engine exception.
+## Bootstrap consistency
+
+Validate metadata active-record states and checkpoint independently. Then compute the strongest valid state for the high-water epoch. A checkpoint at revision 10 outranks an active decision’s revision-0 state. Contradictory story/session identities block ready runtime and require explicit recovery/reset.
 
 ## Story validation
 
-`validateStory` remains deep and normalizing. It bounds total size, scenes/dialogue/choices/assets, validates all IDs and map keys, transitions, choice targets, asset references, conditions, effects, same-origin extensions, and effect-reachable variable names/value width. It warns about all-gated choices without fallback and conservative large increments in cycles.
+Keep deep normalization and bounds for manifest size, IDs, scenes, dialogue, choices, assets, transitions, conditions, effects, same-origin paths, and effect-reachable variable count/value width. Warn for all-gated choices without fallback and conservative dangerous numeric cycles.
 
-Static validation cannot prove arbitrary numeric loops terminate before overflow. The engine rejects the first invalid result before mutation. That is an authoring/runtime error for one action, not an untransmittable canonical state.
+The engine rejects the first non-finite or over-budget transition before mutation; static analysis does not claim arbitrary loop termination.
 
 ## Tests
 
-- unknown live/history scene, entry, or choice;
-- incoherent history revisions;
-- missing bundled story/version at every full-state entry point;
-- invalid persisted active start/migration baseline blocks ready runtime;
-- reconciliation and gossip state never reaches `setState` on semantic failure;
-- story normalization is alias-free and effect limits are enforced.
+- invalid live/history references;
+- missing exact story/version at every full-state entry;
+- rev10 checkpoint chosen over rev0 decision;
+- invalid active start/migration state blocks bootstrap;
+- semantic-invalid gossip/reconciliation never reaches state application.

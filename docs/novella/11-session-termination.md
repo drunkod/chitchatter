@@ -1,67 +1,60 @@
-# 11 — Session termination, acknowledgements, and completed-end gossip
+# 11 — Termination ACKs, completed certificates, and retirement
 
-> **Revision 8 changes:** retained end certificates are forwarded in identity-safe outer envelopes and explicitly dominate same-session/same-epoch migration or progression.
+> **Revision 9 changes:** original end payload binds epoch, re-ACK survives reload through retained action-ID matching, and retirement is separate from certificate evidence.
 
-## Controller ACK round
+## Original end and ACK round
 
-The controller creates one `SESSION_ENDED` at exact next revision, freezes current recipients, keeps state/authority, resends the same action ID to unacknowledged recipients, and finalizes only after every frozen recipient ACKs or leaves.
-
-On finalization, one serialized metadata mutation stores the exact `PersistedEndNotice`, raises high water if needed, and clears matching active start/migration records. Only after that succeeds does the controller clear state/checkpoint.
-
-If persistence fails, termination remains pending/read-only and retries.
-
-## Applying the original end
-
-A replica accepts the original `SESSION_ENDED` only from its current controller at exact next revision. It then:
-
-1. persists the tombstone/certificate;
-2. sends `SESSION_END_ACK` to the original sender;
-3. clears matching state/checkpoint;
-4. commits the action ID.
-
-Duplicate original end is checked before tombstones and triggers another ACK.
-
-## Identity-safe retained certificate
-
-A holder responding to stale traffic sends:
+Controller creates one exact-next-revision event:
 
 ```ts
-makeEnvelope(
-  'SESSION_END_NOTICE_GOSSIP',
-  { ended: sync.getRetainedEndNotice(sessionId)! },
-  bootstrapScope,
-  0,
+createEnvelope(
+  'SESSION_ENDED',
+  { sessionEpoch: current.sessionEpoch },
+  current,
+  current.revision + 1,
 )
 ```
 
-The outer sender is the holder and must match transport context. The embedded original envelope remains evidence of the controller-issued end under the honest-peer MVP model.
+It freezes recipients, retains authority/state, resends the same action ID, and finalizes only after every recipient ACKs or leaves.
 
-## Dominance semantics
+## First application
 
-After structural and certificate validation:
+Replica verifies current controller, exact next revision, and payload epoch. One locked mutation:
 
-- current higher epoch: retain/drop certificate as stale; never clear the higher session;
-- current same epoch and same session ID: certificate wins regardless of migrated controller or later revision, persist tombstone, enter `reconciling`, clear state/checkpoint, show that the room completed an end that this peer missed;
-- current same epoch but different session ID: retain the tombstone for its exact session but do not clear the other timeline;
+- add/update `SessionRetirement(reason: 'ended')`;
+- add exact `CompletedEndCertificate`;
+- if this is the active outcome’s canonical session, set outcome status `ended`;
+- clear matching active decision/migration.
+
+Then send ACK, clear matching state/checkpoint, and commit action ID.
+
+## Re-ACK after reload
+
+Before duplicate/tombstone checks, compare incoming original `SESSION_ENDED.actionId` with retained certificates. Exact match returns `reack-end` even when the in-memory seen-action set was lost on reload.
+
+## Holder gossip
+
+A holder sends a fresh bootstrap-scoped `SESSION_END_NOTICE_GOSSIP` containing the normalized certificate. The outer sender matches transport context; the embedded original event binds session ID, epoch, story ID/version, and original controller action ID.
+
+## Dominance
+
+- current higher epoch: retain certificate; do not clear higher state;
+- current exact session/epoch/story: persist idempotently, enter reconciliation, clear state/checkpoint;
+- current same epoch but different session: retain exact retirement/certificate only; do not clear the other timeline;
 - current null: persist idempotently;
-- certificate for an already retained exact `(sessionId, epoch, original actionId)` is a no-op.
+- already retained exact certificate: no-op.
 
-This closes controller-crash-during-termination splits. It intentionally may roll back post-migration novella actions for the ended session. A malicious peer could fabricate such a certificate only by fabricating a structurally valid original controller envelope; signatures are post-MVP hardening.
+If the certificate ends the canonical high-water outcome, mark the epoch ended so other same-epoch decisions cannot resurrect.
 
-## Gate responses
+## Switch/reconciliation retirement
 
-Tombstoned `STATE_REQUEST`, advance, choice, restart, and same-session confusion receive a fresh `SESSION_END_NOTICE_GOSSIP`, never the original end envelope. Other tombstoned traffic drops.
-
-## Participation
-
-Participation remains sync-ref owned. Leave is scoped to one session; a higher epoch resets it. Rejoin sets `joined` before exact-target bootstrap send.
+`switched` and `reconciled` retirements suppress stale exact-session traffic but have no completed certificate. Replies use `SESSION_RETIRED`, not end gossip.
 
 ## Tests
 
-- send resolves before delivery but no finalize without ACK;
-- first ACK dropped, duplicate original end re-ACKs;
-- holder with a different peer ID successfully forwards certificate;
-- certificate ends a migrated/progressed same session and shows rollback-to-lobby;
-- certificate never ends another session or higher epoch;
-- persistence failure retains old interactive state/termination round;
-- full reload retains and forwards certificate.
+- dropped ACK + recipient reload + original resend re-ACKs;
+- certificate epoch/story tampering rejects;
+- holder with changed peer ID forwards successfully;
+- exact migrated/progressed session ends, other session/higher epoch does not;
+- switched/reconciled retirement works without certificate;
+- canonical end blocks losing decision resurrection.
