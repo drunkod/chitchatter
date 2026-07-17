@@ -86,7 +86,7 @@ export const VisualNovelRoom = ({ peerRoom }: VisualNovelRoomProps) => {
   const isAtEnd = engine.isAtEnd(state)
   const isDeadEnd = engine.isChoiceDeadEnd(state)
   const controlsDisabled =
-    snapshot.pendingRequest || snapshot.phase === 'syncing' || !!snapshot.error
+    snapshot.pendingRequest || snapshot.phase === 'syncing'
 
   return (
     <Paper
@@ -143,9 +143,11 @@ export const VisualNovelRoom = ({ peerRoom }: VisualNovelRoomProps) => {
           <Alert severity="warning">
             <Stack spacing={1} alignItems="flex-start">
               <span>{snapshot.error}</span>
-              <Button size="small" onClick={session.retryRecovery}>
-                Retry
-              </Button>
+              {snapshot.phase === 'error' && (
+                <Button size="small" onClick={session.retryRecovery}>
+                  Retry
+                </Button>
+              )}
             </Stack>
           </Alert>
         )}

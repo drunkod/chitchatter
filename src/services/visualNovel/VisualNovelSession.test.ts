@@ -1,4 +1,5 @@
 import { getBundledStory } from '../../stories/catalog'
+import { VisualNovelEngine } from './VisualNovelEngine'
 import { VisualNovelSession } from './VisualNovelSession'
 import { TestVisualNovelNetwork } from './testing/TestVisualNovelTransport'
 
@@ -20,6 +21,15 @@ const makeDependencies = (peerId: string) => {
     },
     resolveStory: getBundledStory,
   }
+}
+
+const createStartedState = (controllerPeerId: string, sessionId: string) => {
+  const story = getBundledStory('harbour-lights', '1.0.0')
+  if (!story) throw new Error('Missing test story')
+  return new VisualNovelEngine(story, { now: () => 1000 }).start(
+    sessionId,
+    controllerPeerId
+  )
 }
 
 const connectPair = () => {
@@ -141,10 +151,17 @@ describe('VisualNovelSession', () => {
   })
 
   it('uses the lower controller/session tuple for competing starts', async () => {
-    const { a, b } = connectPair()
+    const { network, a, b } = connectPair()
 
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'SESSION_STARTED' &&
+        fromPeerId === 'peer-b' &&
+        toPeerId === 'peer-a'
+    )
     b.startStory('harbour-lights', '1.0.0', 'session-z')
     await settle()
+    expect(a.getSnapshot().state).toBeNull()
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
 
@@ -153,6 +170,56 @@ describe('VisualNovelSession', () => {
       sessionId: 'session-a',
     })
     expect(b.getSnapshot().state).toEqual(a.getSnapshot().state)
+
+    const delayedStartIndex = network
+      .getSentMessages()
+      .findIndex(
+        message =>
+          message.envelope.actionType === 'SESSION_STARTED' &&
+          message.fromPeerId === 'peer-b' &&
+          message.toPeerId === 'peer-a'
+      )
+    expect(delayedStartIndex).toBeGreaterThanOrEqual(0)
+    await network.replayMessage(delayedStartIndex)
+    expect(a.getSnapshot().state).toEqual(b.getSnapshot().state)
+
+    a.destroy()
+    b.destroy()
+  })
+
+  it('keeps a progressed session when a lower start arrives late', async () => {
+    const { network, a, b } = connectPair()
+    a.startStory('harbour-lights', '1.0.0', 'session-a')
+    a.requestAdvance()
+    await settle()
+
+    const decided = b.getSnapshot().state
+    expect(decided?.revision).toBe(1)
+
+    b.startStory('harbour-lights', '1.0.0', 'session-0')
+    expect(b.getSnapshot().state).toEqual(decided)
+
+    const lateStart = createStartedState('peer-0', 'session-0')
+    await network.send(
+      'peer-0',
+      {
+        protocol: 'visual-novel',
+        protocolVersion: 1,
+        actionId: 'late-lower-start',
+        actionType: 'SESSION_STARTED',
+        senderPeerId: 'peer-0',
+        sessionId: lateStart.sessionId,
+        storyId: lateStart.storyId,
+        storyVersion: lateStart.storyVersion,
+        revision: lateStart.revision,
+        timestamp: 1000,
+        payload: { state: lateStart },
+      },
+      'peer-b'
+    )
+    await settle()
+
+    expect(b.getSnapshot().state).toEqual(decided)
 
     a.destroy()
     b.destroy()
@@ -263,6 +330,187 @@ describe('VisualNovelSession', () => {
       canClaimControl: false,
     })
 
+    b.destroy()
+  })
+
+  it('corrects a stale controller claim before accepting a second claim', async () => {
+    const { network, a, b } = connectPair()
+    const c = new VisualNovelSession(
+      network.createTransport('peer-c'),
+      makeDependencies('c')
+    )
+    c.connect()
+    a.startStory('harbour-lights', '1.0.0', 'session-a')
+    await settle()
+
+    for (let revision = 1; revision <= 5; revision += 1) {
+      a.requestRestart()
+      await settle()
+    }
+    for (let revision = 6; revision <= 7; revision += 1) {
+      network.dropNext(
+        (envelope, fromPeerId, toPeerId) =>
+          envelope.actionType === 'RESTARTED' &&
+          fromPeerId === 'peer-a' &&
+          toPeerId === 'peer-b'
+      )
+      a.requestRestart()
+      await settle()
+    }
+
+    expect(b.getSnapshot().state?.revision).toBe(5)
+    expect(c.getSnapshot().state?.revision).toBe(7)
+
+    network.disconnect('peer-a')
+    a.destroy()
+    b.claimControl()
+    await settle()
+
+    expect(b.getSnapshot()).toMatchObject({
+      phase: 'paused',
+      canClaimControl: true,
+      state: { revision: 7, controllerPeerId: 'peer-a' },
+    })
+    expect(c.getSnapshot()).toMatchObject({
+      phase: 'paused',
+      state: { revision: 7, controllerPeerId: 'peer-a' },
+    })
+
+    b.claimControl()
+    await settle()
+
+    expect(b.getSnapshot()).toMatchObject({
+      phase: 'active',
+      state: { revision: 8, controllerPeerId: 'peer-b' },
+    })
+    expect(c.getSnapshot().state).toEqual(b.getSnapshot().state)
+
+    b.destroy()
+    c.destroy()
+  })
+
+  it('recovers a null-state peer after it overhears live traffic', async () => {
+    let timeoutHandler: () => void = () => undefined
+    const { network, a, b } = connectPair()
+    a.startStory('harbour-lights', '1.0.0', 'session-a')
+    await settle()
+    network.disconnect('peer-a')
+    a.destroy()
+
+    const c = new VisualNovelSession(network.createTransport('peer-c'), {
+      ...makeDependencies('c'),
+      timers: {
+        setTimeout: handler => {
+          timeoutHandler = handler
+          return 1
+        },
+        clearTimeout: () => undefined,
+      },
+    })
+    c.connect()
+    timeoutHandler()
+    expect(c.getSnapshot()).toMatchObject({ phase: 'idle', state: null })
+
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'CONTROL_CLAIMED' &&
+        fromPeerId === 'peer-b' &&
+        toPeerId === 'peer-c'
+    )
+    b.claimControl()
+    await settle()
+    expect(c.getSnapshot().state).toBeNull()
+
+    b.requestAdvance()
+    await settle()
+
+    expect(c.getSnapshot()).toMatchObject({
+      phase: 'active',
+      state: { controllerPeerId: 'peer-b', revision: 2 },
+    })
+    expect(c.getSnapshot().state).toEqual(b.getSnapshot().state)
+
+    b.destroy()
+    c.destroy()
+  })
+
+  it('ends a behind replica without requesting an impossible snapshot', async () => {
+    const { network, a, b } = connectPair()
+    a.startStory('harbour-lights', '1.0.0', 'session-a')
+    await settle()
+
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'ADVANCED' &&
+        fromPeerId === 'peer-a' &&
+        toPeerId === 'peer-b'
+    )
+    b.requestAdvance()
+    await settle()
+    expect(a.getSnapshot().state?.revision).toBe(1)
+    expect(b.getSnapshot().state?.revision).toBe(0)
+
+    a.endSession()
+    await settle()
+
+    expect(b.getSnapshot()).toMatchObject({
+      phase: 'ended',
+      state: null,
+      error: null,
+      pendingRequest: false,
+    })
+
+    a.destroy()
+    b.destroy()
+  })
+
+  it('ignores stale canonical replay without requesting a snapshot', async () => {
+    const { network, a, b } = connectPair()
+    a.startStory('harbour-lights', '1.0.0', 'session-a')
+    b.requestAdvance()
+    await settle()
+
+    const state = b.getSnapshot().state
+    expect(state?.revision).toBe(1)
+    if (!state) return
+    const requestsBefore = network
+      .getSentMessages()
+      .filter(
+        message =>
+          message.envelope.actionType === 'STATE_REQUEST' &&
+          message.fromPeerId === 'peer-b'
+      ).length
+
+    await network.send(
+      'peer-a',
+      {
+        protocol: 'visual-novel',
+        protocolVersion: 1,
+        actionId: 'old-advanced-replay',
+        actionType: 'ADVANCED',
+        senderPeerId: 'peer-a',
+        sessionId: state.sessionId,
+        storyId: state.storyId,
+        storyVersion: state.storyVersion,
+        revision: 1,
+        timestamp: 1000,
+        payload: { previousRevision: 0 },
+      },
+      'peer-b'
+    )
+    await settle()
+
+    const requestsAfter = network
+      .getSentMessages()
+      .filter(
+        message =>
+          message.envelope.actionType === 'STATE_REQUEST' &&
+          message.fromPeerId === 'peer-b'
+      ).length
+    expect(requestsAfter).toBe(requestsBefore)
+    expect(b.getSnapshot().state?.revision).toBe(1)
+
+    a.destroy()
     b.destroy()
   })
 

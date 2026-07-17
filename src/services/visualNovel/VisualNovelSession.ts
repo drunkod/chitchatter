@@ -91,6 +91,8 @@ export class VisualNovelSession {
 
   private lastSnapshotRequestTargetPeerId: string | null = null
 
+  private lastControlClaimActionId: string | null = null
+
   private unsubscribeMessage: (() => void) | null = null
 
   private unsubscribeJoin: (() => void) | null = null
@@ -150,6 +152,8 @@ export class VisualNovelSession {
     storyVersion: string,
     sessionId = this.dependencies.createId()
   ) => {
+    if (this.state) return
+
     const story = this.dependencies.resolveStory(storyId, storyVersion)
     if (!story) {
       this.fail('The selected story is unavailable')
@@ -158,7 +162,6 @@ export class VisualNovelSession {
 
     const engine = this.createEngine(story)
     const candidate = engine.start(sessionId, this.transport.getSelfId())
-    if (this.state && compareStartIdentity(candidate, this.state) >= 0) return
 
     this.installState(candidate)
     void this.send('SESSION_STARTED', { state: candidate }, candidate)
@@ -232,12 +235,18 @@ export class VisualNovelSession {
       this.state,
       this.transport.getSelfId()
     )
-    this.installState(changed)
-    void this.send(
+    const envelope = this.envelopeFor(
       'CONTROL_CLAIMED',
       { previousControllerPeerId, state: toSnapshotState(changed) },
       changed
     )
+    this.rememberAction(envelope.actionId)
+    this.lastControlClaimActionId = envelope.actionId
+    this.installState(changed)
+    void this.transport.send(envelope).catch(error => {
+      console.error(error)
+      this.warn('The controller claim could not be broadcast')
+    })
   }
 
   retryRecovery = () => {
@@ -260,6 +269,11 @@ export class VisualNovelSession {
   private fail = (message: string) => {
     this.error = message
     this.phase = 'error'
+    this.emit()
+  }
+
+  private warn = (message: string) => {
+    this.error = message
     this.emit()
   }
 
@@ -351,7 +365,7 @@ export class VisualNovelSession {
       await this.transport.send(envelope, targetPeerId)
     } catch (error) {
       console.error(error)
-      this.fail('The novella message could not be sent')
+      this.warn('The novella message could not be sent')
     }
     return envelope
   }
@@ -376,7 +390,9 @@ export class VisualNovelSession {
       if (this.commandRequest?.actionId !== commandRequest.actionId) return
       this.commandRequest = null
       this.error = 'The storyteller did not respond in time'
-      this.phase = this.state ? 'active' : 'idle'
+      if (!this.recovery) {
+        this.phase = this.state ? 'active' : 'idle'
+      }
       this.emit()
     }, visualNovelLimits.requestTimeoutMs)
     this.commandRequest = commandRequest
@@ -404,6 +420,19 @@ export class VisualNovelSession {
 
     const envelope = result.value
     if (this.seenActionIds.has(envelope.actionId)) return
+
+    if (
+      !this.state &&
+      !this.recovery &&
+      envelope.sessionId !== null &&
+      envelope.actionType !== 'STATE_REQUEST' &&
+      envelope.actionType !== 'STATE_SNAPSHOT' &&
+      envelope.actionType !== 'SESSION_STARTED' &&
+      envelope.actionType !== 'SESSION_ENDED' &&
+      this.phase !== 'ended'
+    ) {
+      this.requestSnapshot('gap', envelope.senderPeerId)
+    }
 
     let handled = false
     switch (envelope.actionType) {
@@ -481,12 +510,15 @@ export class VisualNovelSession {
       return false
     }
 
-    if (
-      this.state &&
-      (this.state.sessionId === incoming.sessionId ||
-        compareStartIdentity(incoming, this.state) >= 0)
-    ) {
-      return true
+    if (this.state) {
+      const decided = this.state.revision > 0
+      if (
+        decided ||
+        this.state.sessionId === incoming.sessionId ||
+        compareStartIdentity(incoming, this.state) >= 0
+      ) {
+        return true
+      }
     }
 
     this.installState(incoming)
@@ -522,14 +554,41 @@ export class VisualNovelSession {
       this.recovery?.actionId === envelope.payload.requestActionId
     const matchesRecentRequest =
       this.lastSnapshotRequestActionId === envelope.payload.requestActionId
-    if (!matchesActiveRequest && !matchesRecentRequest) return false
+    const matchesClaimCorrection =
+      this.lastControlClaimActionId === envelope.payload.requestActionId
+    if (
+      !matchesActiveRequest &&
+      !matchesRecentRequest &&
+      !matchesClaimCorrection
+    ) {
+      return false
+    }
     const expectedTarget = matchesActiveRequest
       ? this.recovery?.targetPeerId
       : this.lastSnapshotRequestTargetPeerId
-    if (expectedTarget && envelope.senderPeerId !== expectedTarget) return false
+    if (
+      !matchesClaimCorrection &&
+      expectedTarget &&
+      envelope.senderPeerId !== expectedTarget
+    ) {
+      return false
+    }
 
     const incoming = envelope.payload.state
-    if (incoming.controllerPeerId !== envelope.senderPeerId) return false
+    if (matchesClaimCorrection) {
+      if (!this.state) return false
+      const sameSession =
+        incoming.sessionId === this.state.sessionId &&
+        incoming.storyId === this.state.storyId &&
+        incoming.storyVersion === this.state.storyVersion
+      if (!sameSession) return false
+      if (incoming.revision <= this.state.revision) return true
+      if (this.connectedPeerIds().includes(incoming.controllerPeerId)) {
+        return false
+      }
+    } else if (incoming.controllerPeerId !== envelope.senderPeerId) {
+      return false
+    }
 
     if (this.state) {
       const sameSession =
@@ -555,9 +614,9 @@ export class VisualNovelSession {
   }
 
   private receiveAdvanced = (envelope: VisualNovelEnvelopeFor<'ADVANCED'>) => {
-    if (!this.authorizeControllerEvent(envelope)) return false
+    if (!this.authorizeControllerEvent(envelope) || !this.state) return false
+    if (envelope.revision <= this.state.revision) return true
     if (
-      !this.state ||
       envelope.payload.previousRevision !== this.state.revision ||
       envelope.revision !== this.state.revision + 1
     ) {
@@ -588,9 +647,9 @@ export class VisualNovelSession {
   private receiveChoiceResolved = (
     envelope: VisualNovelEnvelopeFor<'CHOICE_RESOLVED'>
   ) => {
-    if (!this.authorizeControllerEvent(envelope)) return false
+    if (!this.authorizeControllerEvent(envelope) || !this.state) return false
+    if (envelope.revision <= this.state.revision) return true
     if (
-      !this.state ||
       envelope.payload.previousRevision !== this.state.revision ||
       envelope.revision !== this.state.revision + 1
     ) {
@@ -621,9 +680,9 @@ export class VisualNovelSession {
   private receiveRestarted = (
     envelope: VisualNovelEnvelopeFor<'RESTARTED'>
   ) => {
-    if (!this.authorizeControllerEvent(envelope)) return false
+    if (!this.authorizeControllerEvent(envelope) || !this.state) return false
+    if (envelope.revision <= this.state.revision) return true
     if (
-      !this.state ||
       envelope.payload.previousRevision !== this.state.revision ||
       envelope.revision !== this.state.revision + 1
     ) {
@@ -641,10 +700,6 @@ export class VisualNovelSession {
     envelope: VisualNovelEnvelopeFor<'SESSION_ENDED'>
   ) => {
     if (!this.authorizeControllerEvent(envelope) || !this.state) return false
-    if (envelope.payload.previousRevision !== this.state.revision) {
-      this.requestSnapshot('gap', envelope.senderPeerId)
-      return false
-    }
 
     this.state = null
     this.phase = 'ended'
@@ -669,9 +724,21 @@ export class VisualNovelSession {
       incoming.storyVersion !== this.state.storyVersion ||
       incoming.controllerPeerId !== envelope.senderPeerId ||
       connected.includes(previousControllerPeerId) ||
-      this.lowestConnectedPeerId() !== envelope.senderPeerId ||
-      incoming.revision <= this.state.revision
+      this.lowestConnectedPeerId() !== envelope.senderPeerId
     ) {
+      return false
+    }
+
+    if (incoming.revision <= this.state.revision) {
+      void this.send(
+        'STATE_SNAPSHOT',
+        {
+          requestActionId: envelope.actionId,
+          state: toSnapshotState(this.state),
+        },
+        this.state,
+        envelope.senderPeerId
+      )
       return false
     }
 
