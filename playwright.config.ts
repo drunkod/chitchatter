@@ -66,9 +66,14 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         /* Disable mDNS local IP hiding so WebRTC connections between local browser contexts
-           can establish successfully in sandboxed/offline E2E environments without relying on system DNS */
+           can establish successfully in sandboxed/offline E2E environments without relying on system DNS.
+           Fake media devices keep the video regression deterministic in headless CI. */
         launchOptions: {
-          args: ['--disable-features=WebRtcHideLocalIpsWithMdns'],
+          args: [
+            '--disable-features=WebRtcHideLocalIpsWithMdns',
+            '--use-fake-device-for-media-stream',
+            '--use-fake-ui-for-media-stream',
+          ],
         },
       },
     },
@@ -112,6 +117,7 @@ export default defineConfig({
     timeout: 120 * 1000,
     env: {
       IS_E2E_TEST: 'true',
+      VITE_ENABLE_NOVELLA: 'true',
     },
   },
 })
