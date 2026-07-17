@@ -1,171 +1,75 @@
-# 13 — React bootstrap, UI state, and room integration
+# 13 — Full bootstrap, UI state, and room integration
 
-> **Revision 7 changes:** splits asynchronous persistence bootstrap from the live sync runtime, exposes provisional discard through context, and adds an explicit reconciliation/rollback UI state.
+> **Revision 8 changes:** bootstrap now loads both RoomMeta and the validated latest checkpoint before mounting sync, room changes synchronously discard the previous ready runtime, and completed-end rollback has explicit UI.
 
-## Context
+## Context status
 
-```ts
-export type VisualNovelStatus =
-  | 'bootstrapping'
-  | 'lobby'
-  | 'starting'
-  | 'loading'
-  | 'syncing'
-  | 'ready'
-  | 'waiting'
-  | 'reconciling'
-  | 'ending'
-  | 'error'
+Include `bootstrapping`, `lobby`, `starting`, `syncing`, `ready`, `waiting`, `reconciling`, `ending`, and `error`, plus `reconciliationMessage`, provisional controls, participation, and controller actions.
 
-export interface VisualNovelContextValue {
-  stories: VisualNovelManifest[]
-  story: VisualNovelManifest | null
-  state: VisualNovelSessionState | null
-  provisional: VisualNovelSessionState | null
-  scene: VisualNovelScene | null
-  entry: VisualNovelDialogueEntry | null
-  availableChoices: VisualNovelChoice[]
-  status: VisualNovelStatus
-  error: string | null
-  reconciliationMessage: string | null
-  isController: boolean
-  pendingAction: boolean
-  canStartStory: boolean
-  participation: VisualNovelParticipation
-  startStory: (storyId: string) => Promise<void>
-  switchStory: (storyId: string) => Promise<void>
-  advance: () => Promise<void>
-  choose: (choiceId: string) => Promise<void>
-  restart: () => Promise<void>
-  endStory: () => Promise<void>
-  leaveStory: () => void
-  rejoinStory: () => Promise<void>
-  requestControl: () => Promise<void>
-  passControl: (peerId: string) => Promise<void>
-  discardProvisional: () => Promise<void>
-}
-```
-
-## Two-stage provider
-
-Hooks cannot be conditionally skipped inside one component. Mount a bootstrap component first, then a child containing checkpoint and sync hooks:
+## Keyed two-stage provider
 
 ```tsx
-export const VisualNovelProvider = ({ children, transport, roomId }: Props) => {
-  const { getPersistedStorage } = useContext(StorageContext)
-  const storage = useMemo(() => getPersistedStorage(), [getPersistedStorage])
-  const [bootstrap, setBootstrap] = useState<BootstrapResult | null>(null)
+export const VisualNovelProvider = (props: Props) => (
+  <VisualNovelBootstrap key={props.roomId} {...props} />
+)
+```
+
+The key guarantees a room change unmounts the old receiver immediately.
+
+```tsx
+const VisualNovelBootstrap = ({ children, transport, roomId }: Props) => {
+  const storage = usePersistedStorage()
+  const [result, setResult] = useState<BootstrapResult | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
+    setResult(null)
+    setError(null)
     void bootstrapVisualNovel(storage, roomId)
-      .then(result => { if (!cancelled) setBootstrap(result) })
+      .then(value => { if (!cancelled) setResult(value) })
       .catch(reason => { if (!cancelled) setError(toMessage(reason)) })
     return () => { cancelled = true }
   }, [roomId, storage])
 
   if (error) return <VisualNovelBootstrapError message={error} />
-  if (!bootstrap) return <CircularProgress aria-label="Preparing story sync" />
-
-  return (
-    <ReadyVisualNovelProvider
-      transport={transport}
-      storage={storage}
-      roomScope={bootstrap.roomScope}
-      initialMeta={bootstrap.meta}
-    >
-      {children}
-    </ReadyVisualNovelProvider>
-  )
+  if (!result) return <CircularProgress aria-label="Preparing story sync" />
+  return <ReadyVisualNovelProvider {...result} transport={transport}>{children}</ReadyVisualNovelProvider>
 }
 ```
 
+## Complete bootstrap
+
 ```ts
-const bootstrapVisualNovel = async (
-  storage: StorageAdapter,
-  roomId: string,
-): Promise<BootstrapResult> => {
+const bootstrapVisualNovel = async (storage, roomId): Promise<BootstrapResult> => {
   const roomScope = await digestRoomId(roomId)
-  const rawMeta = await storage.getItem(metaKey(roomScope))
-  const meta = rawMeta === null
-    ? emptyRoomMeta()
-    : unwrapOrThrow(validateRoomMeta(rawMeta))
-  return { roomScope, meta }
+  const meta = await loadAndValidateRoomMeta(storage, roomScope)
+  const checkpoint = await loadAndValidateLatestCheckpoint(storage, roomScope)
+  validateBootstrapConsistency(meta, checkpoint)
+  return { storage, roomScope, initialMeta: meta, initialCheckpoint: checkpoint }
 }
 ```
 
-No novella transport receiver exists before this completes.
+Consistency rules include checkpoint epoch <= high water, tombstoned checkpoint rejection, and active-decision/migration semantic checks. No transport receiver exists before completion.
 
-## Ready runtime
+## Ready provider
 
-`ReadyVisualNovelProvider` may safely call:
+Initialize React state as null and render the checkpoint as a read-only provisional baseline until canonical confirmation, or initialize a separate immutable `bootBaseline` supplied to sync. Fresh start remains blocked while a provisional checkpoint exists unless the user explicitly discards it.
 
-```ts
-const checkpoint = useVisualNovelCheckpoint({ storage, roomScope, state })
-const sync = useVisualNovelSync({
-  transport,
-  initialMeta,
-  persistMeta: meta => storage.setItem(metaKey(roomScope), meta).then(() => undefined),
-  story,
-  state,
-  setState: applyCanonical,
-  onParticipationChange: setParticipation,
-  onSessionEnded: checkpoint.clear,
-  onProtocolError: setError,
-})
-```
-
-Load the provisional checkpoint on mount. Track `checkpointSettled`; fresh start requires `checkpointSettled`, `sync.phase === 'idle'`, no live state, and no provisional session unless the user explicitly discards it.
+All canonical replacement callbacks receive a mode (`normal`, `rollback`, `ended-by-certificate`). The callback clears losing checkpoints and renders the correct explanation only after the sync layer confirms safety metadata persisted.
 
 ## Reconciliation UI
 
-When start or migration conflict resolution replaces local state:
+For timeline replacement: “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”
 
-- set status `reconciling` before the atomic replacement;
-- show “The room reconnected and selected another novella timeline. Story actions from the disconnected timeline were rolled back.”;
-- preserve chat, media, and file UI;
-- clear the losing checkpoint;
-- return to `ready` after the canonical state renders.
+For completed-end certificate: “The room had already ended this novella while you were disconnected. Later story actions on this timeline were rolled back.”
 
-This makes the availability-with-rollback model visible rather than silently rewriting the story.
+Chat/media/file UI remains mounted. Return from `reconciling` to `ready` or `lobby` after atomic render.
 
-## Provisional controls
+## Integration
 
-`discardProvisional` is part of the context and return object:
-
-```ts
-const discardProvisional = async () => {
-  const saved = checkpoint.provisional
-  if (!saved) return
-  await checkpoint.clear(saved.sessionId)
-}
-```
-
-The lobby displays both “Waiting to reconnect…” and “Discard saved progress.”
-
-## Room integration
-
-Mount one provider only for the group room:
-
-```tsx
-<RoomContext.Provider value={roomContextValue}>
-  {isDirectMessageRoom ? roomBody : (
-    <VisualNovelProvider transport={peerRoom} roomId={roomId}>
-      {roomBody}
-    </VisualNovelProvider>
-  )}
-</RoomContext.Provider>
-```
-
-Keep existing video props:
-
-```tsx
-<RoomVideoDisplay userId={userId} width="100%" height="100%" />
-```
-
-Transport identity always comes from `peerRoom.getSelfId()`, not `userId`.
+Mount exactly once around group-room body, never DMs. Keep real `RoomVideoDisplay userId width height` props. Transport self identity always comes from `peerRoom.getSelfId()`, never UI user ID.
 
 ## Cleanup
 
-Clear pending-action, start, reconciliation, migration, and termination timers. Room changes remount the provider with a new asynchronous scope; stale bootstrap promises are cancelled.
+Pending UI timers clear on unmount. The keyed provider ensures stale bootstrap promises and old-room receivers cannot survive navigation.

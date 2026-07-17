@@ -1,8 +1,8 @@
-# 02 — Data models and protocol records
+# 02 — Data models and durable protocol records
 
-> **Revision 7 changes:** adds identity-safe start-decision gossip, explicit reconciliation state, migration records that retain the original departure, exact-target recovery records, and complete persistent room metadata.
+> **Revision 8 changes:** adds identity-safe completed-end gossip, persists active migration authority, makes recovery requests conflict-specific, and gives RoomMeta a generation for serialized writes.
 
-## Core session models
+## Session and envelope
 
 ```ts
 export type VisualNovelValue = string | number | boolean
@@ -29,42 +29,7 @@ export interface VisualNovelSessionState extends Record<string, any> {
   updatedAt: number
 }
 
-export type VisualNovelParticipation =
-  | { kind: 'joined' }
-  | { kind: 'left-current-session'; sessionId: string }
-```
-
-Story manifest, scene, dialogue, choice, condition, effect, and asset-reference types remain the normalized declarative types validated in 04.
-
-## Actions
-
-```ts
-export type VisualNovelActionType =
-  | 'START_PROPOSE'
-  | 'START_COMMITTED'
-  | 'START_DECISION_GOSSIP'
-  | 'SESSION_RECONCILE'
-  | 'STATE_REQUEST'
-  | 'STATE_SNAPSHOT'
-  | 'ADVANCE_REQUEST'
-  | 'ADVANCED'
-  | 'CHOICE_REQUEST'
-  | 'CHOICE_RESOLVED'
-  | 'SESSION_STARTED'
-  | 'SESSION_ENDED'
-  | 'SESSION_END_ACK'
-  | 'ELECTION_ADVERTISE'
-  | 'CONTROLLER_CHANGED'
-  | 'CONTROL_REQUEST'
-  | 'CONTROL_PASSED'
-  | 'RESTART_REQUEST'
-  | 'RESTARTED'
-  | 'ERROR'
-```
-
-```ts
-export interface VisualNovelActionEnvelope<T = any>
-  extends Record<string, any> {
+export interface VisualNovelActionEnvelope<T = any> extends Record<string, any> {
   protocol: 'visual-novel'
   protocolVersion: 1
   actionId: string
@@ -78,38 +43,46 @@ export interface VisualNovelActionEnvelope<T = any>
   payload: T
   proof?: string
 }
-
-export type EnvelopeFor<T extends VisualNovelActionType> =
-  VisualNovelActionEnvelope<VisualNovelPayloadByAction[T]> & { actionType: T }
 ```
 
-## Start decision records
+## Actions and payloads
 
 ```ts
+export type VisualNovelActionType =
+  | 'START_PROPOSE' | 'START_COMMITTED' | 'START_DECISION_GOSSIP'
+  | 'SESSION_RECONCILE'
+  | 'STATE_REQUEST' | 'STATE_SNAPSHOT'
+  | 'ADVANCE_REQUEST' | 'ADVANCED'
+  | 'CHOICE_REQUEST' | 'CHOICE_RESOLVED'
+  | 'SESSION_STARTED' | 'SESSION_ENDED' | 'SESSION_END_ACK'
+  | 'SESSION_END_NOTICE_GOSSIP'
+  | 'ELECTION_ADVERTISE' | 'CONTROLLER_CHANGED'
+  | 'CONTROL_REQUEST' | 'CONTROL_PASSED'
+  | 'RESTART_REQUEST' | 'RESTARTED' | 'ERROR'
+
 export interface StartDecisionRecord extends Record<string, any> {
   decisionId: string
   coordinatorPeerId: string
   originActionId: string
-  state: VisualNovelSessionState // revision 0 decision state
+  state: VisualNovelSessionState // decision state at revision 0
+}
+
+export interface PersistedEndNotice extends Record<string, any> {
+  sessionId: string
+  epoch: number
+  endEnvelope: EnvelopeFor<'SESSION_ENDED'>
 }
 
 export type VisualNovelPayloadByAction = {
-  START_PROPOSE: {
-    proposalId: string
-    candidate: VisualNovelSessionState
-  }
-  START_COMMITTED: {
-    decision: StartDecisionRecord
-  }
-  // Outer sender is the honest holder. The embedded record preserves the
-  // coordinator decision without pretending the holder is the coordinator.
+  START_PROPOSE: { proposalId: string; candidate: VisualNovelSessionState }
+  START_COMMITTED: { decision: StartDecisionRecord }
   START_DECISION_GOSSIP: {
     decision: StartDecisionRecord
     knownState: VisualNovelSessionState
   }
-  // Full-state deterministic reconciliation after a same-epoch conflict.
   SESSION_RECONCILE: {
     reason: 'start-conflict' | 'migration-conflict'
+    conflictId: string
     state: VisualNovelSessionState
   }
 
@@ -127,6 +100,8 @@ export type VisualNovelPayloadByAction = {
   SESSION_STARTED: { state: VisualNovelSessionState }
   SESSION_ENDED: Record<string, never>
   SESSION_END_ACK: { endActionId: string }
+  // New outer sender is the holder; the embedded original end envelope is the certificate.
+  SESSION_END_NOTICE_GOSSIP: { ended: PersistedEndNotice }
   ELECTION_ADVERTISE: { roundId: string; state: VisualNovelSessionState }
   CONTROLLER_CHANGED: {
     roundId: string
@@ -141,37 +116,40 @@ export type VisualNovelPayloadByAction = {
   RESTARTED: { state: VisualNovelSessionState }
   ERROR: { code: string; requestActionId?: string }
 }
+
+export type EnvelopeFor<T extends VisualNovelActionType> =
+  VisualNovelActionEnvelope<VisualNovelPayloadByAction[T]> & { actionType: T }
 ```
 
-## Internal lifecycle records
+## Runtime records
 
 ```ts
 export type RecoveryKind =
-  | 'bootstrap'
-  | 'revision-gap'
-  | 'start-reconcile'
-  | 'migration-reconcile'
+  | 'bootstrap' | 'revision-gap' | 'start-reconcile' | 'migration-reconcile'
 
 export interface OutstandingRecovery {
   actionId: string
   targetPeerId: string
   expectedEpoch: number
+  expectedSessionId: string | null
   kind: RecoveryKind
+  conflictId: string | null
   createdAt: number
+  expiresAt: number
 }
 
-export interface StartRound {
-  coordinatorPeerId: string
+export interface StartConflict {
+  conflictId: string
   epoch: number
-  proposals: VisualNovelSessionState[]
-  openedAt: number
+  localState: VisualNovelSessionState
+  remoteState: VisualNovelSessionState
 }
 
-export interface MigrationRecord {
+export interface MigrationRecord extends Record<string, any> {
+  migrationId: string
   sessionEpoch: number
+  sessionId: string
   departedControllerPeerId: string
-  openedAt: number
-  closesAt: number
   lastAppliedState: VisualNovelSessionState | null
 }
 
@@ -184,23 +162,27 @@ export interface PendingTermination {
 }
 ```
 
-## Persistent room metadata
+## Persistent RoomMeta
 
 ```ts
-export interface PersistedEndNotice {
-  sessionId: string
-  epoch: number
-  endEnvelope: EnvelopeFor<'SESSION_ENDED'>
-}
-
 export interface RoomMeta {
   version: 1
+  generation: number
   highWaterEpoch: number
   endedSessions: PersistedEndNotice[]
-  // Retains a recoverable decision across reloads. It is removed when the
-  // epoch is ended or replaced by a higher epoch.
   activeStartDecision: StartDecisionRecord | null
+  activeMigration: MigrationRecord | null
 }
 ```
 
-`RoomMeta` is normalized and validated before constructing the sync service. It is not populated by casting storage data.
+Cross-field invariants:
+
+- `highWaterEpoch >=` every tombstone epoch;
+- active start decision epoch equals `highWaterEpoch` and is not tombstoned;
+- active migration epoch equals `highWaterEpoch`, names the same session as its last applied state, and is not tombstoned;
+- active start and migration may coexist only for the same session/epoch;
+- tombstones are unique and canonically sorted by `(epoch, sessionId)`;
+- retained original end envelope scope matches its persisted session and its revision is valid;
+- higher epoch or exact-session end clears obsolete active records.
+
+All records are normalized into fresh objects before use.

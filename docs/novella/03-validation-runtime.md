@@ -1,188 +1,110 @@
 # 03 — Runtime structural validation and normalization
 
-> **Revision 7 changes:** validates the new start-gossip and reconciliation actions, binds start decisions to deterministic IDs, normalizes persisted room metadata, and removes every trust-on-cast path.
+> **Revision 8 changes:** validates `SESSION_END_NOTICE_GOSSIP`, reconciliation conflict IDs, durable migrations, and complete RoomMeta cross-field invariants.
 
-## Validation order
+## General order
 
-1. Reject values that are not bounded records.
-2. Enforce `maxEnvelopeBytes` before deep traversal.
-3. Validate primitive fields and action type.
-4. Validate and normalize the action payload.
-5. Cross-check envelope scope against embedded state.
-6. Return a fresh envelope; drop unknown properties and the reserved MVP `proof`.
+1. bound the encoded envelope before deep traversal;
+2. validate protocol, action, IDs, revision, timestamp, and payload shape;
+3. normalize every nested collection into fresh objects;
+4. cross-check outer scope against embedded state where applicable;
+5. drop unknown properties and MVP `proof`;
+6. perform semantic story checks separately in 04.
 
-The existing `isId`, `isEpoch`, `isRevision`, `utf8Bytes`, `validateVariables`, `validateHistory`, `validateSessionState`, and semantic-validation boundaries remain.
+Existing `isId`, `isEpoch`, `isRevision`, `utf8Bytes`, variable/history/state validators, and final snapshot/envelope byte gates remain mandatory.
 
-## Start decision validation
+## Start and reconciliation payloads
+
+`validateStartDecision` requires revision 0 and recomputes:
 
 ```ts
-const validateStartDecision = (
-  input: unknown
-): ValidationResult<StartDecisionRecord> => {
-  if (!isRecord(input)) return fail('Start decision must be an object')
-  if (!isId(input.decisionId) ||
-      !isId(input.coordinatorPeerId) ||
-      !isId(input.originActionId)) {
-    return fail('Invalid start decision identifiers')
+const expectedDecisionId = deriveRoundId([
+  'start', state.sessionEpoch, coordinatorPeerId, originActionId,
+  state.controllerPeerId, state.sessionId,
+].join(':'))
+```
+
+- `START_COMMITTED`: embedded coordinator equals outer sender.
+- `START_DECISION_GOSSIP`: outer sender is only the holder; decision and known state must share session/epoch, and known state revision is at least decision revision.
+- `SESSION_RECONCILE`: `conflictId` is a valid ID and state is normalized; outer sender is the holder, not necessarily the state controller.
+
+## Completed-end certificate
+
+```ts
+const validatePersistedEndNotice = (
+  input: unknown,
+): ValidationResult<PersistedEndNotice> => {
+  if (!isRecord(input) || !isId(input.sessionId) || !isEpoch(input.epoch)) {
+    return fail('Invalid retained end notice')
   }
-
-  const state = validateSessionState(input.state)
-  if (!state.ok) return state
-  if (state.value.revision !== 0) return fail('Start decision state must be revision 0')
-
-  const expectedId = deriveRoundId([
-    'start',
-    state.value.sessionEpoch,
-    input.coordinatorPeerId,
-    input.originActionId,
-    state.value.controllerPeerId,
-    state.value.sessionId,
-  ].join(':'))
-  if (input.decisionId !== expectedId) {
-    return fail('Start decision ID does not bind its fields')
+  const end = validateEnvelope(input.endEnvelope)
+  if (!end.ok || end.value.actionType !== 'SESSION_ENDED') {
+    return fail('Invalid retained end envelope')
   }
-
+  if (end.value.sessionId !== input.sessionId) {
+    return fail('Retained end scope mismatch')
+  }
   return {
     ok: true,
     value: {
-      decisionId: input.decisionId,
-      coordinatorPeerId: input.coordinatorPeerId,
-      originActionId: input.originActionId,
-      state: state.value,
+      sessionId: input.sessionId,
+      epoch: input.epoch,
+      endEnvelope: end.value as EnvelopeFor<'SESSION_ENDED'>,
     },
   }
 }
 ```
 
-## New payload cases
+`SESSION_END_NOTICE_GOSSIP` contains only this normalized certificate. Its outer envelope uses bootstrap scope/revision 0 and identifies the holder. Receivers never require the holder to equal the original end-envelope sender.
+
+## Election and migration fields
+
+`CONTROLLER_CHANGED.electorate` remains sorted, unique, non-empty, at most 64, valid IDs, and excludes the departed controller. Recompute the digest-bound round ID and require announced controller = state controller = outer sender = minimum electorate ID.
+
+`MigrationRecord` validation recomputes:
 
 ```ts
-case 'START_PROPOSE': {
-  if (!isId(payload.proposalId)) return fail('Invalid proposalId')
-  const candidate = validateSessionState(payload.candidate)
-  if (!candidate.ok) return candidate
-  if (candidate.value.revision !== 0) return fail('Start candidate must be revision 0')
-  return { ok: true, value: { proposalId: payload.proposalId, candidate: candidate.value } }
-}
-
-case 'START_COMMITTED': {
-  const decision = validateStartDecision(payload.decision)
-  if (!decision.ok) return decision
-  if (decision.value.coordinatorPeerId !== senderPeerId) {
-    return fail('Start commit sender/coordinator mismatch')
-  }
-  return { ok: true, value: { decision: decision.value } }
-}
-
-case 'START_DECISION_GOSSIP': {
-  const decision = validateStartDecision(payload.decision)
-  if (!decision.ok) return decision
-  const knownState = validateSessionState(payload.knownState)
-  if (!knownState.ok) return knownState
-  if (knownState.value.sessionEpoch !== decision.value.state.sessionEpoch ||
-      knownState.value.sessionId !== decision.value.state.sessionId) {
-    return fail('Gossip state does not belong to the decision')
-  }
-  return {
-    ok: true,
-    value: { decision: decision.value, knownState: knownState.value },
-  }
-}
-
-case 'SESSION_RECONCILE': {
-  if (payload.reason !== 'start-conflict' &&
-      payload.reason !== 'migration-conflict') return fail('Invalid reconcile reason')
-  const state = validateSessionState(payload.state)
-  return state.ok
-    ? { ok: true, value: { reason: payload.reason, state: state.value } }
-    : state
-}
-
-case 'SESSION_END_ACK':
-  return isId(payload.endActionId)
-    ? { ok: true, value: { endActionId: payload.endActionId } }
-    : fail('Invalid end acknowledgement')
+migrationId === deriveRoundId(
+  `migration:${sessionEpoch}:${sessionId}:${departedControllerPeerId}`)
 ```
 
-## Election payloads
+If `lastAppliedState` exists, it must share the record session and epoch.
 
-`CONTROLLER_CHANGED.electorate` must be non-empty, sorted, unique, bounded to 64, contain valid IDs, and exclude the departed peer. Recompute:
+## Envelope scope rules
 
-```ts
-const expectedRoundId = deriveRoundId(
-  `${state.sessionEpoch}:${departedControllerPeerId}:${electorate.join(',')}`
-)
-```
+- start proposal/commit/gossip, end-notice gossip: bootstrap outer scope, revision 0;
+- reconciliation: outer scope matches payload state so participation and stale-epoch gates have an exact subject;
+- normal state-carrying actions: outer session/story/version/revision equal embedded state;
+- original `SESSION_ENDED` scope is the ended live session; its epoch comes from the validated persistent certificate when gossiped.
 
-Require `controllerPeerId === state.controllerPeerId === senderPeerId` and `controllerPeerId === electController(electorate)`.
-
-## Envelope scope checks
-
-- `START_PROPOSE`, `START_COMMITTED`, and `START_DECISION_GOSSIP` use bootstrap outer scope and outer revision 0.
-- For `START_PROPOSE`, embedded controller equals sender.
-- For `START_COMMITTED`, embedded coordinator equals sender.
-- Gossip and reconciliation outer sender is only the forwarder; do not require it to equal the state controller.
-- Every other state-carrying action must match envelope session/story/version/revision.
-
-## `RoomMeta` validator
+## RoomMeta normalization
 
 ```ts
 export const validateRoomMeta = (input: unknown): ValidationResult<RoomMeta> => {
-  if (utf8Bytes(input) > visualNovelLimits.maxRoomMetaBytes) {
-    return fail('Room metadata is too large')
-  }
-  if (!isRecord(input) || input.version !== 1 || !isRevision(input.highWaterEpoch)) {
-    return fail('Invalid room metadata')
-  }
-  if (!Array.isArray(input.endedSessions) ||
-      input.endedSessions.length > visualNovelLimits.maxPersistedTombstones) {
-    return fail('Invalid persisted tombstones')
-  }
-
-  const endedSessions: PersistedEndNotice[] = []
-  const seen = new Set<string>()
-  for (const item of input.endedSessions) {
-    if (!isRecord(item) || !isId(item.sessionId) || !isEpoch(item.epoch)) {
-      return fail('Invalid persisted tombstone')
-    }
-    const end = validateEnvelope(item.endEnvelope)
-    if (!end.ok || end.value.actionType !== 'SESSION_ENDED' ||
-        end.value.sessionId !== item.sessionId) {
-      return fail('Invalid retained end notice')
-    }
-    if (seen.has(item.sessionId)) return fail('Duplicate persisted tombstone')
-    seen.add(item.sessionId)
-    endedSessions.push({
-      sessionId: item.sessionId,
-      epoch: item.epoch,
-      endEnvelope: end.value as EnvelopeFor<'SESSION_ENDED'>,
-    })
-  }
-
-  let activeStartDecision: StartDecisionRecord | null = null
-  if (input.activeStartDecision !== null) {
-    const validated = validateStartDecision(input.activeStartDecision)
-    if (!validated.ok) return validated
-    activeStartDecision = validated.value
-  }
-
-  return {
-    ok: true,
-    value: {
-      version: 1,
-      highWaterEpoch: input.highWaterEpoch,
-      endedSessions,
-      activeStartDecision,
-    },
-  }
+  // First enforce maxRoomMetaBytes, version, generation/highWater safe integers,
+  // tombstone count, normalized notices, active decision, and active migration.
+  // Then enforce cross-field invariants below.
 }
 ```
 
-Corrupt metadata does not silently become empty metadata while the network receiver is active. The bootstrap UI surfaces the problem and requires reset or retry before novella writes are enabled.
+Mandatory cross-field rejection rules:
+
+- any tombstone epoch greater than high water;
+- duplicate or non-canonically ordered tombstones;
+- active decision epoch different from high water;
+- active decision session present in tombstones;
+- active migration epoch different from high water;
+- active migration session tombstoned;
+- active migration `lastAppliedState` mismatch;
+- active decision and active migration describing different sessions at one epoch;
+- retained end-envelope scope mismatch.
+
+Malformed existing metadata blocks receiver mount. It never degrades silently to empty safety metadata.
 
 ## Required tests
 
-- Every validator returns fresh nested objects.
-- A holder can forward a start decision without failing sender/context identity, because only the outer envelope sender is checked against transport context.
-- Decision ID tampering, gossip-state mismatch, invalid reconciliation reason, and malformed retained notices are rejected.
-- Metadata normalization restores retained envelopes and honors the configured tombstone bound.
+- alias-free normalization of every action and record;
+- holder identity independent of embedded start/end origin;
+- invalid end certificate, decision ID, migration ID, reconcile conflict ID, and election digest rejected;
+- every RoomMeta cross-field contradiction rejected;
+- canonical tombstone order and configured bounds enforced.

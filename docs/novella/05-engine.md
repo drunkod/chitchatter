@@ -1,101 +1,40 @@
-# 05 — Pure visual-novel engine
+# 05 — Pure engine
 
-> **Revision 7 changes:** removes the last claim that validated stories can never hit a runtime numeric guard. The load-bearing guarantee is that the engine refuses an illegal transition before mutation, so it never emits an untransmittable canonical state.
+> **Revision 8 changes:** no functional engine change. The plan now clarifies that distributed reconciliation compares normalized semantic state excluding diagnostic `updatedAt`; engine determinism and transport-limit enforcement remain unchanged.
 
-## Responsibilities
+The engine owns legal story transitions and imports no React, storage, transport, DOM, global clock, or randomness. It receives a validated manifest and explicit dependencies.
 
-`VisualNovelEngine` owns deterministic story transitions. It receives a normalized manifest, an explicit clock, and immutable session state. It imports no React, storage, transport, DOM, random, or global time dependency.
+## Required operations
 
-Required API:
+- `start(sessionId, controllerPeerId, sessionEpoch)` creates revision 0 at the manifest start entry;
+- `advance` follows explicit/implicit next transitions and refuses to skip required or fully gated choices;
+- `choose` validates availability, applies immutable effects, and moves to the target scene;
+- `restart` preserves session/controller/epoch and increments revision;
+- `changeController` preserves story content and increments revision;
+- getters assert story compatibility and resolve exact scene/entry.
 
-```ts
-class VisualNovelEngine {
-  constructor(
-    story: VisualNovelManifest,
-    dependencies: { now: () => number },
-  )
+## Transport safety
 
-  start(
-    sessionId: string,
-    controllerPeerId: string,
-    sessionEpoch: number,
-  ): VisualNovelSessionState
+Before returning a changed state, the engine verifies:
 
-  getScene(state: VisualNovelSessionState): VisualNovelScene
-  getEntry(state: VisualNovelSessionState): VisualNovelDialogueEntry
-  getAvailableChoices(state: VisualNovelSessionState): VisualNovelChoice[]
-  canAdvance(state: VisualNovelSessionState): boolean
-  advance(state: VisualNovelSessionState): VisualNovelSessionState
-  choose(state: VisualNovelSessionState, choiceId: string): VisualNovelSessionState
-  restart(state: VisualNovelSessionState): VisualNovelSessionState
-  changeController(
-    state: VisualNovelSessionState,
-    controllerPeerId: string,
-  ): VisualNovelSessionState
-}
-```
+- variable count <= `maxVariables`;
+- encoded variables <= `maxVariablesBytes`;
+- every numeric value is finite;
+- history is bounded in memory.
 
-## Transition invariants
+A failed guard throws before mutation. Snapshot conversion later truncates history by count and bytes and final validators enforce the full snapshot/envelope budgets.
 
-- `start` creates revision 0 and preserves the supplied epoch/controller.
-- `advance`, `choose`, `restart`, and `changeController` produce exactly `revision + 1`.
-- input state and manifest are never mutated;
-- history records the previous location and is bounded in memory;
-- a choice entry with no currently available choice is `CHOICE_DEAD_END`, not an implicit advance;
-- story mismatch, missing scene/entry, invalid choice, and end-of-branch use typed engine errors.
+## Determinism
 
-## Effects and transport limits
+Given the same normalized manifest, input state, requested action, and injected clock, the engine returns byte-equivalent semantic state. It never mutates input. Replicas replay progression events and compare derived scene/entry/variables before application.
 
-```ts
-private applyEffect(
-  variables: Record<string, VisualNovelValue>,
-  effect: VisualNovelEffect,
-): Record<string, VisualNovelValue> {
-  if (effect.type === 'set') {
-    return { ...variables, [effect.variable]: effect.value }
-  }
-
-  const current = variables[effect.variable]
-  if (current !== undefined && typeof current !== 'number') {
-    throw new VisualNovelEngineError(
-      'INVALID_INCREMENT', 'Increment target is not numeric')
-  }
-  const result = (current ?? 0) + effect.amount
-  if (!Number.isFinite(result)) {
-    throw new VisualNovelEngineError(
-      'INVALID_INCREMENT', 'Increment result is not finite')
-  }
-  return { ...variables, [effect.variable]: result }
-}
-```
-
-Before committing a choice result:
-
-```ts
-private assertVariablesWithinLimits(
-  variables: Record<string, VisualNovelValue>,
-) {
-  if (Object.keys(variables).length > visualNovelLimits.maxVariables ||
-      utf8Bytes(variables) > visualNovelLimits.maxVariablesBytes) {
-    throw new VisualNovelEngineError(
-      'VARIABLES_LIMIT', 'Variables exceed the transport budget')
-  }
-}
-```
-
-The check occurs before `commit`, so a refused transition leaves the controller on its prior transmissible state. Runtime refusal may still happen for a looped increment; it is surfaced to the initiating user and is not broadcast.
-
-## Replay
-
-Replicas call the same engine method for `ADVANCED` and `CHOICE_RESOLVED`, then compare scene, entry, choice result, and variables with the canonical delta. Mismatch starts exact-target recovery rather than applying the event.
+`updatedAt` is diagnostic and excluded from the distributed final tie-break in 01; canonical event envelopes still provide one shared timestamp in normal progression.
 
 ## Tests
 
-- deterministic equality from identical input/clock;
-- input and manifest immutability;
-- start/advance/choice/restart/controller revisions and epochs;
-- all branch endings and dead ends;
-- effects, conditions, unavailable choices;
-- variable count/byte refusal leaves input unchanged;
-- non-finite and non-numeric increment refusal;
-- every emitted snapshot form passes structural and semantic validation.
+- starts, both endings, explicit next links, restart, controller change;
+- unavailable/required/dead-end choices and `STORY_ENDED`;
+- string/boolean/numeric effects and non-finite increment rejection;
+- variable count/byte overflow leaves state unchanged;
+- history bounding, incompatible stories, missing scenes/entries;
+- deterministic immutable random walks where every emitted snapshot passes runtime validation.

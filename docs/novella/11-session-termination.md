@@ -1,114 +1,67 @@
-# 11 — Session termination, acknowledgements, and participation
+# 11 — Session termination, acknowledgements, and completed-end gossip
 
-> **Revision 7 changes:** duplicate end notices re-ack before tombstone suppression, stale requests and progression receive the retained end notice, and metadata persistence is part of finalization rather than a best-effort afterthought.
+> **Revision 8 changes:** retained end certificates are forwarded in identity-safe outer envelopes and explicitly dominate same-session/same-epoch migration or progression.
 
-## Controller termination round
+## Controller ACK round
 
-```ts
-const endSession = async () => {
-  const current = stateRef.current
-  if (!current || current.controllerPeerId !== selfId) return
-  if (pendingTerminationRef.current) return
+The controller creates one `SESSION_ENDED` at exact next revision, freezes current recipients, keeps state/authority, resends the same action ID to unacknowledged recipients, and finalizes only after every frozen recipient ACKs or leaves.
 
-  const envelope = createVisualNovelEnvelope(
-    'SESSION_ENDED', {}, current, selfId, current.revision + 1, dependencies)
+On finalization, one serialized metadata mutation stores the exact `PersistedEndNotice`, raises high water if needed, and clears matching active start/migration records. Only after that succeeds does the controller clear state/checkpoint.
 
-  pendingTerminationRef.current = {
-    sessionId: current.sessionId,
-    sessionEpoch: current.sessionEpoch,
-    envelope,
-    recipients: new Set(transport.getPeers()),
-    acked: new Set(),
-  }
-  setPhase('terminating')
-  await disseminateTermination()
-}
-```
+If persistence fails, termination remains pending/read-only and retries.
 
-The controller retains state and authority. Progression, switch, and fresh start are disabled.
+## Applying the original end
 
-## Ack loop
+A replica accepts the original `SESSION_ENDED` only from its current controller at exact next revision. It then:
 
-Send the same end envelope/action ID to unacknowledged recipients every `terminationAckTimeoutMs`. A recipient departure removes it from the frozen set. Finalization occurs only when no recipient remains outstanding.
+1. persists the tombstone/certificate;
+2. sends `SESSION_END_ACK` to the original sender;
+3. clears matching state/checkpoint;
+4. commits the action ID.
+
+Duplicate original end is checked before tombstones and triggers another ACK.
+
+## Identity-safe retained certificate
+
+A holder responding to stale traffic sends:
 
 ```ts
-const handleSessionEndAck = (envelope, context) => {
-  const pending = pendingTerminationRef.current
-  if (!pending) return
-  if (!pending.recipients.has(context.peerId)) return
-  if (envelope.payload.endActionId !== pending.envelope.actionId) return
-  pending.acked.add(context.peerId)
-  sync.commit(envelope)
-  maybeFinalize()
-}
-```
-
-## Replica receive order
-
-The gate must check duplicate end notices before tombstones:
-
-```ts
-const gate = sync.inspectGate(envelope)
-switch (gate.kind) {
-  case 'reack-end':
-    await sendEndAck(envelope, context.peerId)
-    return
-  case 'reply-ended':
-    await send(gate.notice, { target: context.peerId })
-    return
-  case 'drop':
-    return
-  case 'dispatch':
-    break
-}
-```
-
-On first application:
-
-1. validate controller and exact next revision;
-2. persist the tombstone and retained end envelope;
-3. send `SESSION_END_ACK` to the sender;
-4. clear state and checkpoint;
-5. commit the received action ID.
-
-If the ACK is lost, a duplicate end envelope takes the `reack-end` path even though the session is already tombstoned.
-
-## Retained notices
-
-Tombstoned `STATE_REQUEST`, advance, choice, and restart traffic receives the retained end notice rather than silence. Other tombstoned traffic is dropped. The notice remains in validated `RoomMeta` after reload.
-
-## Critical persistence
-
-Finalization awaits the RoomMeta write:
-
-```ts
-await sync.tombstone(
-  pending.sessionId,
-  pending.sessionEpoch,
-  pending.envelope,
+makeEnvelope(
+  'SESSION_END_NOTICE_GOSSIP',
+  { ended: sync.getRetainedEndNotice(sessionId)! },
+  bootstrapScope,
+  0,
 )
-pendingTerminationRef.current = null
-sync.commit(pending.envelope)
-setState(null)
-await onSessionEnded(pending.sessionId)
 ```
 
-If persistence fails, the controller stays in `terminating`, retains state and the pending record, and retries. It must not clear authority and claim durable termination.
+The outer sender is the holder and must match transport context. The embedded original envelope remains evidence of the controller-issued end under the honest-peer MVP model.
 
-## Controller crash during termination
+## Dominance semantics
 
-Peers that received the end remain tombstoned. Peers that did not may migrate the live session and end again. On stabilization, retained notices propagate through stale requests. The UI may transiently differ; it must not silently claim everyone has ended until acknowledgements complete.
+After structural and certificate validation:
+
+- current higher epoch: retain/drop certificate as stale; never clear the higher session;
+- current same epoch and same session ID: certificate wins regardless of migrated controller or later revision, persist tombstone, enter `reconciling`, clear state/checkpoint, show that the room completed an end that this peer missed;
+- current same epoch but different session ID: retain the tombstone for its exact session but do not clear the other timeline;
+- current null: persist idempotently;
+- certificate for an already retained exact `(sessionId, epoch, original actionId)` is a no-op.
+
+This closes controller-crash-during-termination splits. It intentionally may roll back post-migration novella actions for the ended session. A malicious peer could fabricate such a certificate only by fabricating a structurally valid original controller envelope; signatures are post-MVP hardening.
+
+## Gate responses
+
+Tombstoned `STATE_REQUEST`, advance, choice, restart, and same-session confusion receive a fresh `SESSION_END_NOTICE_GOSSIP`, never the original end envelope. Other tombstoned traffic drops.
 
 ## Participation
 
-The sync hook owns `participationRef`. Leave sets `left-current-session` synchronously; rejoin sets `joined` before sending bootstrap. The guard reads the ref. A new higher-epoch session resets participation because leaving is scoped to one session.
+Participation remains sync-ref owned. Leave is scoped to one session; a higher epoch resets it. Rejoin sets `joined` before exact-target bootstrap send.
 
 ## Tests
 
-- send resolves before delivery but finalization waits for ACKs;
-- first ACK dropped, duplicate end re-acks despite tombstone;
-- stale progression gets retained end notice;
-- wrong sender, recipient, or action ID ACK is ignored;
-- RoomMeta write failure keeps termination pending;
-- completed notice survives full reload and bounded tombstone trimming;
-- participant rejoin snapshot delivered synchronously is applied.
+- send resolves before delivery but no finalize without ACK;
+- first ACK dropped, duplicate original end re-ACKs;
+- holder with a different peer ID successfully forwards certificate;
+- certificate ends a migrated/progressed same session and shows rollback-to-lobby;
+- certificate never ends another session or higher epoch;
+- persistence failure retains old interactive state/termination round;
+- full reload retains and forwards certificate.

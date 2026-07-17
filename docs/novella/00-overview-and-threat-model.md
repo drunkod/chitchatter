@@ -1,96 +1,85 @@
 # 00 — Architecture, threat model, and delivery plan
 
-> **Revision 7 (2026-07-16).** Corrects the remaining Revision 6 contradictions: start proposals and start decisions now have different epoch gates; retained decisions travel inside a new identity-safe `START_DECISION_GOSSIP` envelope; same-epoch conflicts use one deterministic session-priority comparator and an explicit reconciliation state; election supersession retains the original migration identity and compares the full adopted state; duplicate end notices re-ack before tombstone handling; `RoomMeta` is normalized, restored completely, and loaded before receivers attach; React mounts the sync runtime only after the asynchronous room scope and safety metadata are ready; the test transport actually routes through its link network.
+> **Revision 8 (2026-07-17).** Closes the remaining Revision 7 recovery and durability gaps: completed end notices now travel in an identity-safe `SESSION_END_NOTICE_GOSSIP` envelope; migration authority is persisted and never expires merely because a local timer elapsed; metadata and the validated checkpoint baseline load before any receiver attaches; canonical replacement persists safety metadata before exposing state; all convergence ordering is locale-independent byte ordering; equal-revision divergence inside one session reconciles; RoomMeta mutations are serialized; recovery authorization is kind-specific and request-scoped; metadata validation enforces cross-field invariants; and the failure-injection mesh drops post-crash deliveries and routes lifecycle visibility through its link model.
 
 ## Step index
 
 | Step | File | Contents |
 | --- | --- | --- |
 | 00 | this file | Scope, guarantees, milestones |
-| 01 | `01-config-and-limits.md` | Limits, epochs, deterministic IDs and state ordering |
-| 02 | `02-data-models.md` | Models, envelopes, recovery records |
-| 03 | `03-validation-runtime.md` | Normalizing structural validation |
-| 04 | `04-validation-semantic.md` | Story and state semantic validation |
+| 01 | `01-config-and-limits.md` | Limits, epochs, canonical byte ordering |
+| 02 | `02-data-models.md` | Models, envelopes, durable protocol records |
+| 03 | `03-validation-runtime.md` | Normalizing structural and metadata validation |
+| 04 | `04-validation-semantic.md` | Story and full-state semantic validation |
 | 05 | `05-engine.md` | Pure, transport-safe engine |
 | 06 | `06-example-story.md` | Bundled story and catalog |
 | 07 | `07-transport.md` | Existing-room transport adapter |
-| 08 | `08-sync-authorization.md` | Gate decisions and authorization matrix |
+| 08 | `08-sync-authorization.md` | Gate, metadata queue, and authorization |
 | 09 | `09-start-round.md` | Start decisions, gossip, and reconciliation |
-| 10 | `10-election-round.md` | Controller migration and supersession |
-| 11 | `11-session-termination.md` | End acknowledgements and retained notices |
-| 12 | `12-sync-hook-dispatch.md` | Receiver lifecycle, handlers, recovery |
-| 13 | `13-react-ui-and-room-integration.md` | Bootstrapped runtime and UI composition |
+| 10 | `10-election-round.md` | Durable controller migration and supersession |
+| 11 | `11-session-termination.md` | End acknowledgements and certificate gossip |
+| 12 | `12-sync-hook-dispatch.md` | Receiver lifecycle, handlers, exact recovery |
+| 13 | `13-react-ui-and-room-integration.md` | Full bootstrap and rollback UI |
 | 14 | `14-assets-and-audio.md` | Safe assets and local audio |
-| 15 | `15-persistence.md` | Checkpoints and room safety metadata |
+| 15 | `15-persistence.md` | Checkpoints and serialized room metadata |
 | 16 | `16-testing.md` | Matrices and failure-injection mesh |
 | 17 | `17-rollout.md` | Regression, CI, and rollout gates |
 
 ## Product outcome
 
-Members of one existing Chitchatter group room can keep text, voice, video, and file sharing active while reading one synchronized visual novel. One controller approves canonical progression; every peer validates and replays it locally.
+Members of one existing Chitchatter group room keep chat, voice, video, screen share, and file transfer active while reading a synchronized visual novel. One controller approves normal progression; every peer validates and replays canonical events locally.
 
-## Threat and failure model
+## Failure model and guarantees
 
-The MVP is **crash-fault tolerant among honest room members**, not Byzantine fault tolerant.
+The MVP tolerates honest crash faults, delay, replay, duplication, reordering, and temporary partitions. It is not Byzantine fault tolerant. Unsigned bootstrap, recovery, election, and retained-certificate gossip are explicit honest-peer concessions until post-MVP signatures are added.
 
-Peers may disconnect, duplicate, reorder, delay, replay, or temporarily partition messages. There is no fixed maximum delay. Deliberately malicious peers remain able to fabricate structurally valid bootstrap, reconciliation, or election state until post-MVP signatures are added.
+The guarantees are deliberately separated:
 
-The plan distinguishes three guarantees:
-
-1. **Integrity safety — unconditional.** Invalid, oversized, semantically impossible, unauthorized, stale, tombstoned, duplicate, or unsupported messages do not mutate canonical state.
-2. **Monotonic session safety — durable.** Persisted epochs and tombstones prevent an older or ended session from becoming current merely because browsers reload.
-3. **Agreement and liveness — eventual-stability scoped.** During a real partition, honest populations may temporarily progress different same-epoch sessions. When connectivity and membership stabilize, a deterministic comparator selects one session and the losing side visibly reconciles. That can roll back losing-partition novella actions; the UI must show `reconciling` rather than pretending strict consensus existed. Strict no-rollback consensus is outside the MVP.
-
-This is intentionally an **availability-with-deterministic-reconciliation** design. The documentation must not call transient split progression “unconditional agreement safety.”
-
-## Post-MVP provenance hardening
-
-Use existing peer public keys to sign a canonical digest chain:
-
-- controller signs each canonical event and resulting state digest;
-- start commits and controller changes carry the previous signed digest;
-- reconciliation and election adopt only states descending from that chain.
-
-The envelope retains a reserved `proof` field, but MVP validators discard it.
+1. **Integrity safety, unconditional:** invalid, oversized, semantically impossible, unauthorized, stale, tombstoned, duplicate, and unsupported messages do not mutate canonical state.
+2. **Durable monotonic safety:** persisted high-water epochs, tombstones, active start decisions, and active migration records survive reloads and prevent old sessions or old controller departures from being mistaken for new ones.
+3. **Agreement and liveness under eventual stability:** partitions may create competing same-epoch timelines. Once delivery and membership stabilize, every peer uses one locale-independent total ordering over normalized semantic state. The loser visibly rolls back. Strict no-rollback consensus is outside MVP.
+4. **Termination dominance:** a validated completed-end certificate for `(sessionId, epoch)` ends that same session even if peers migrated its controller or progressed after missing the original end. It never ends a different session or a higher epoch.
 
 ## Non-negotiable invariants
 
-- One novella provider and one replica per group room; DM `Room` instances mount none.
-- No second WebRTC room, microphone, central session API, account, analytics, or cloud progress store.
-- Story content is declarative JSON; no raw HTML or executable code.
-- Receiver order: normalize → transport identity → gate decision → semantic validation → action authorization → application → duplicate commit.
-- Start proposals never install state. Only an authorized start decision or decision gossip can install/reconcile a fresh epoch.
-- `START_PROPOSE` is stale at `candidate.epoch <= highWaterEpoch`; start decisions are stale only at `< highWaterEpoch`, allowing same-epoch recovery.
-- Every solicited snapshot is bound to an outstanding request record containing the request ID, exact target peer, expected epoch, and recovery kind.
-- Controller migration retains its original departed-controller identity through the whole supersession window.
-- Termination finalizes only after every frozen recipient has acknowledged or left; completed end notices remain in persistent tombstones.
-- `RoomMeta` is loaded and validated before any novella receiver attaches. A failed critical metadata write leaves novella read-only and surfaces an error.
-- Engine output is always transport-legal. Authored numeric loops may fail one action with a clear authoring/runtime error but cannot strand the room in an untransmittable state.
+- Exactly one novella provider per group-room page; DM room instances mount none.
+- No second WebRTC room, central state service, account, analytics, or cloud progress database.
+- Story packages are declarative JSON; no raw HTML or executable content.
+- Receiver order: structural normalization → transport identity → typed gate → semantic validation → action authorization → awaited safety-metadata mutation → atomic state application → duplicate commit.
+- No receiver attaches until room scope, validated RoomMeta, and validated latest checkpoint baseline are loaded.
+- Start proposals never install. Same-epoch start decisions and gossip remain admissible for recovery.
+- Every full-state replacement uses the shared comparator, including equal-revision divergence inside the same session.
+- Active migration authority persists until its session ends or a higher epoch installs; retry timers never change authorization.
+- Retained original envelopes are never forwarded directly by another peer. Holder gossip always has a new outer envelope naming the holder.
+- RoomMeta mutations are serialized and built from the latest validated metadata; state is not exposed before the write succeeds.
+- Recovery requests are stored by action ID and bind exact target, expected epoch/session, recovery kind, conflict identity, and expiry.
+- Engine output is transport-legal; authored numeric loops can reject one transition before mutation but cannot create an untransmittable canonical state.
 
-## Controller lifecycle
+## Lifecycle summary
 
-1. **Fresh start:** proposals go to a locally selected coordinator. The coordinator emits `START_COMMITTED`. Any honest holder may forward the normalized decision using `START_DECISION_GOSSIP`; outer transport identity is the holder, not the original coordinator.
-2. **Progression:** participants request; controller serializes, runs the engine, applies locally, and broadcasts the exact next revision. Replicas replay before applying.
-3. **Same-epoch reconciliation:** compare `(revision, controllerPeerId, sessionId, canonicalState)` deterministically. The winning full state arrives through an explicit reconciliation action or an exact-target solicited snapshot. Losing peers display reconciliation and replace atomically.
-4. **Story switch:** current controller tombstones the old session and creates exactly `epoch + 1` through `SESSION_STARTED`.
-5. **Migration:** controller departure creates a migration record keyed by departed peer and epoch. Competing announcements are ordered by full state priority while that record remains open.
-6. **End:** controller freezes recipients, repeatedly sends one `SESSION_ENDED`, gathers `SESSION_END_ACK`, then stores the completed end notice in `RoomMeta` and clears the live checkpoint.
+1. **Fresh start:** coordinator collects `START_PROPOSE`, emits `START_COMMITTED`, and persists the winning start decision before installation. Holders use `START_DECISION_GOSSIP`.
+2. **Progression:** participants request; controller serializes, runs the engine, applies, and broadcasts exact-next-revision events. Replicas replay.
+3. **Reconciliation:** complete normalized states are compared bytewise after epoch/revision and stable ID tie-breaks. A winning replacement is persisted first, then installed with visible rollback UI.
+4. **Story switch:** controller tombstones the old session and installs exactly `epoch + 1`, clearing old start/migration records.
+5. **Migration:** controller departure creates a persisted `MigrationRecord`. Competing announcements for that departure remain comparable until end or higher epoch.
+6. **End:** controller gathers ACKs. Any tombstone holder can later send `SESSION_END_NOTICE_GOSSIP`; its embedded certificate dominates same-session/same-epoch migration and progression.
 
 ## Milestones
 
-- **M1 — Local safety:** models, validators, engine, bundled story, local UI.
-- **M2 — Canonical progression:** transport, bootstrapped receiver, starts, requests, replay, exact-target recovery.
-- **M3 — Lifecycle:** reconciliation, migration, termination, participation, checkpoints, persistent room metadata.
-- **M4 — Production UI:** story/video/chat layout, conflict and termination states, accessibility, audio.
-- **M5 — Hardening:** adversarial mesh tests, multi-browser E2E, visible CI, README, optional signed chain.
+- **M1:** models, validators, engine, bundled story, local UI.
+- **M2:** bootstrapped receiver, starts, progression, exact-target recovery.
+- **M3:** reconciliation, durable migration, termination certificates, participation, persistence.
+- **M4:** production layout, conflict/rollback/termination UI, accessibility, audio.
+- **M5:** adversarial mesh, multi-browser E2E, visible CI, README, optional signatures.
 
 ## Definition of done
 
-- Normal connected operation produces identical state on all peers after each canonical event.
-- Concurrent starts converge after delivery stabilizes; same-epoch decisions are not blocked by the epoch gate and cannot reset a progressed session merely because a revision-0 commit arrives.
-- Retained decisions and reconciliation messages pass transport identity validation because the forwarder is represented by the outer envelope.
-- Controller-change supersession remains authorized after the first announcement and is total over full state, not only epoch/revision/controller.
-- Lost termination acknowledgements recover through duplicate-end re-acknowledgement.
-- A full-room reload restores the epoch high-water mark, tombstones, retained end notices, and retained start decision before network processing starts.
-- The failure-injection mesh can model one-way links, divergent peer views, queued/reordered/dropped delivery, partial broadcast followed by crash, and send-resolves-before-delivery.
-- `npm test -- --run`, `npm run check:types`, `npm run lint`, `npm run build`, and focused E2E run as visible CI checks.
+- Connected operation produces identical state after each canonical event.
+- Partial start commits recover after coordinator crash without forwarding an invalid original envelope.
+- Equal-revision divergent states, including the same session ID, converge deterministically.
+- Delayed migration announcements remain authorized after timers and reloads.
+- A retained completed-end certificate can be forwarded by any holder and ends only its exact `(sessionId, epoch)`.
+- Full reload restores all safety records and the checkpoint baseline before processing network messages.
+- Critical writes are serialized; failed writes leave novella read-only and do not expose the new state.
+- The mesh models one-way views, delayed lifecycle events, drops, reorder, partial broadcast/crash, and send-resolves-before-delivery.
+- Unit, type, lint, build, and focused E2E checks are visible on implementation PRs.

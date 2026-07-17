@@ -1,159 +1,91 @@
-# 08 — Sync service, gate decisions, and authorization
+# 08 — Sync service, typed gate, serialized metadata, and authorization
 
-> **Revision 7 changes:** replaces boolean pre-dispatch checks with a typed gate result, separates proposal and decision epoch rules, restores all persisted safety state, binds solicited snapshots to exact targets, and makes tombstoned-session replay explicit.
+> **Revision 8 changes:** adds identity-safe end-certificate gating, a serialized RoomMeta mutation store, one authoritative source for active records, and complete kind-specific recovery authorization.
 
-## Subject-state helpers
+## Subject helpers and gate
 
-The session carried by bootstrap-scoped start actions is inside the payload:
-
-```ts
-subjectState(envelope: VisualNovelActionEnvelope): VisualNovelSessionState | null {
-  switch (envelope.actionType) {
-    case 'START_PROPOSE': return envelope.payload.candidate
-    case 'START_COMMITTED': return envelope.payload.decision.state
-    case 'START_DECISION_GOSSIP': return envelope.payload.knownState
-    case 'SESSION_RECONCILE': return envelope.payload.state
-    case 'STATE_SNAPSHOT':
-    case 'SESSION_STARTED':
-    case 'RESTARTED':
-    case 'ELECTION_ADVERTISE':
-    case 'CONTROLLER_CHANGED': return envelope.payload.state
-    default: return null
-  }
-}
-
-subjectSessionId(envelope: VisualNovelActionEnvelope): string {
-  return this.subjectState(envelope)?.sessionId ?? envelope.sessionId
-}
-```
-
-## Gate result
-
-A boolean gate cannot express “drop but re-ack” or “do not dispatch; replay retained end.” Use:
+`subjectState` returns embedded state for start, reconcile, snapshot, switch, restart, election, and controller-change actions. `subjectSessionId` additionally returns `ended.sessionId` for `SESSION_END_NOTICE_GOSSIP`.
 
 ```ts
 export type GateDecision =
   | { kind: 'dispatch' }
   | { kind: 'drop'; reason: string }
   | { kind: 'reack-end' }
-  | { kind: 'reply-ended'; notice: EnvelopeFor<'SESSION_ENDED'> }
+  | { kind: 'reply-ended'; ended: PersistedEndNotice }
 ```
 
+Gate order:
+
+1. duplicate original `SESSION_ENDED` → `reack-end` before tombstone suppression;
+2. duplicate other action → drop;
+3. tombstoned request/progression → `reply-ended` certificate;
+4. other tombstoned traffic → drop, except a new `SESSION_END_NOTICE_GOSSIP` may dispatch when its exact certificate is not already retained;
+5. proposal at `<= highWater` → drop;
+6. decision/gossip at `< highWater` → drop;
+7. other state traffic at `< highWater` → drop;
+8. dispatch.
+
+`reply-ended` sends a fresh `SESSION_END_NOTICE_GOSSIP`, never the original end envelope.
+
+## Serialized metadata store
+
+All safety mutations go through one queue and read the latest validated value inside the queue:
+
 ```ts
-inspectGate(envelope: VisualNovelActionEnvelope): GateDecision {
-  // Duplicate SESSION_ENDED is handled before tombstone suppression so a lost
-  // acknowledgement can recover.
-  if (this.isDuplicate(envelope.actionId)) {
-    return envelope.actionType === 'SESSION_ENDED'
-      ? { kind: 'reack-end' }
-      : { kind: 'drop', reason: 'duplicate' }
+class RoomMetaStore {
+  private tail = Promise.resolve()
+  constructor(private current: RoomMeta, private write: (meta: RoomMeta) => Promise<void>) {}
+
+  mutate(change: (current: RoomMeta) => RoomMeta): Promise<RoomMeta> {
+    const run = this.tail.then(async () => {
+      const next = validateRoomMetaOrThrow(change(this.current))
+      const withGeneration = { ...next, generation: this.current.generation + 1 }
+      await this.write(withGeneration)
+      this.current = withGeneration
+      return withGeneration
+    })
+    this.tail = run.then(() => undefined, () => undefined)
+    return run
   }
 
-  const embedded = this.subjectState(envelope)
-  const sessionId = embedded?.sessionId ?? envelope.sessionId
-  const retained = this.retainedEndNotices.get(sessionId)
-  if (retained) {
-    if (envelope.actionType === 'SESSION_ENDED' &&
-        retained.actionId === envelope.actionId) {
-      return { kind: 'reack-end' }
-    }
-    if (envelope.actionType === 'STATE_REQUEST' ||
-        envelope.actionType === 'ADVANCE_REQUEST' ||
-        envelope.actionType === 'CHOICE_REQUEST' ||
-        envelope.actionType === 'RESTART_REQUEST') {
-      return { kind: 'reply-ended', notice: retained }
-    }
-    return { kind: 'drop', reason: 'tombstoned' }
-  }
-
-  if (embedded) {
-    if (envelope.actionType === 'START_PROPOSE' &&
-        embedded.sessionEpoch <= this.latestEpoch) {
-      return { kind: 'drop', reason: 'decided-epoch-proposal' }
-    }
-    if ((envelope.actionType === 'START_COMMITTED' ||
-         envelope.actionType === 'START_DECISION_GOSSIP') &&
-        embedded.sessionEpoch < this.latestEpoch) {
-      return { kind: 'drop', reason: 'older-start-decision' }
-    }
-    if (!['START_PROPOSE', 'START_COMMITTED', 'START_DECISION_GOSSIP'].includes(
-          envelope.actionType) && embedded.sessionEpoch < this.latestEpoch) {
-      return { kind: 'drop', reason: 'stale-epoch' }
-    }
-  }
-
-  return { kind: 'dispatch' }
+  snapshot = () => this.current
 }
 ```
 
-Same-epoch start decisions and gossip reach the reconciliation handler. Only proposals use `<=`.
+Handlers never build independent stale metadata snapshots. A failed write leaves state unchanged/read-only. The service exposes authoritative getters for active start decision, migration record, retained ends, and high water; React does not mirror them in separate refs.
 
-## Persistent initialization
+For multiple same-origin tabs, the persistence adapter performs the queued read/merge/write under a room-scoped Web Lock when available. If an existing browser cannot provide the required lock semantics, novella safety writes are blocked rather than pretending cross-tab durability.
 
-```ts
-constructor(
-  meta: RoomMeta,
-  private readonly persistMeta: (next: RoomMeta) => Promise<void>
-) {
-  this.latestEpoch = meta.highWaterEpoch
-  for (const ended of meta.endedSessions) {
-    this.endedSessions.set(ended.sessionId, ended.epoch)
-    this.retainedEndNotices.set(ended.sessionId, ended.endEnvelope)
-  }
-  this.activeStartDecision = meta.activeStartDecision
-}
-```
+## Exact recovery map
 
-Critical mutations are asynchronous and complete before exposing the resulting canonical state:
+Store at most `maxOutstandingRecoveries` records in a map keyed by request action ID. Remove on success, cancellation, expiry, room change, or unmount.
 
-```ts
-async noteEpoch(epoch: number, activeStartDecision = this.activeStartDecision) {
-  if (epoch < this.latestEpoch) return
-  const next = this.buildMeta({ highWaterEpoch: Math.max(epoch, this.latestEpoch), activeStartDecision })
-  await this.persistMeta(next)
-  this.installMeta(next)
-}
-```
+Authorization by kind:
 
-If the write fails, the operation stays pending/read-only and the UI reports that local safety metadata could not be saved.
-
-## Exact-target recovery
-
-```ts
-authorizeSolicitedSnapshot(
-  snapshot: VisualNovelSessionState,
-  contextPeerId: string,
-  requestActionId: string | undefined,
-  outstanding: OutstandingRecovery | null
-): boolean {
-  if (!outstanding || requestActionId !== outstanding.actionId) return false
-  if (contextPeerId !== outstanding.targetPeerId) return false
-  if (snapshot.sessionEpoch < outstanding.expectedEpoch) return false
-  return true
-}
-```
-
-This permits an explicitly requested cross-session reconciliation snapshot from the selected target without opening unsolicited cross-session snapshot acceptance.
+- `revision-gap`: exact target, request ID, session ID, epoch, revision not behind;
+- `bootstrap`: exact target, epoch >= high water, then compare against boot baseline/active decision;
+- `start-reconcile`: matching open `StartConflict.conflictId`, same epoch, incoming state wins comparator;
+- `migration-reconcile`: matching active migration ID/session/epoch, incoming state wins comparator;
+- every kind: `now <= expiresAt` and exact transport sender.
 
 ## Authorization matrix
 
-| Action | Sender and preconditions | Result |
-| --- | --- | --- |
-| `START_PROPOSE` | candidate controller = sender; local state null; self is current local coordinator; candidate epoch = highWater + 1 | collect |
-| `START_COMMITTED` | sender = embedded coordinator; coordinator is current local coordinator or the coordinator targeted by our pending proposal | apply/reconcile decision |
-| `START_DECISION_GOSSIP` | any honest holder; normalized embedded decision and known state; epoch not older | apply/reconcile under provenance concession |
-| `SESSION_RECONCILE` | any honest peer during a recorded same-epoch conflict; incoming state wins total comparator | replace atomically |
-| `STATE_REQUEST` | any peer | controller snapshot, exact recovery response, held decision, or retained end |
-| `STATE_SNAPSHOT` | current controller, or exact outstanding target echoing request ID | apply if comparator/recovery rules allow |
-| request actions | self is controller; exact session/story/revision; no termination | serialize engine transition |
-| progression events | sender is current controller; exact next revision; replay matches | apply |
-| `SESSION_STARTED` | current controller; epoch exactly +1; revision 0 | tombstone old, switch |
-| `SESSION_ENDED` | current controller; exact next revision | persist tombstone, ack, clear |
-| `SESSION_END_ACK` | sender is frozen recipient; exact pending end action ID | mark acked |
-| `ELECTION_ADVERTISE` | local electorate member to local winner; local round/epoch match | collect |
-| `CONTROLLER_CHANGED` | sender is min of canonical advertised electorate; migration record matches original departure; state wins supersession comparator | replace atomically |
-| unimplemented control actions | none | reject without commit |
+| Action | Required authority/result |
+| --- | --- |
+| `START_PROPOSE` | proposer owns candidate; self is local coordinator; null live state; exact next epoch |
+| `START_COMMITTED` | outer sender is decision coordinator and acceptable coordinator; compare/install |
+| `START_DECISION_GOSSIP` | any honest holder; embedded decision valid; compare/install |
+| `SESSION_RECONCILE` | matching recorded conflict; complete state strictly wins |
+| `STATE_REQUEST` | answer with end certificate, held decision, or exact controller snapshot |
+| `STATE_SNAPSHOT` | current controller or exact outstanding target; kind-specific rules above |
+| requests | self current controller; exact session/revision; no pending termination |
+| progression | outer sender current controller; exact next revision; engine replay matches |
+| `SESSION_STARTED` | current controller; revision 0; exact `epoch + 1` |
+| original `SESSION_ENDED` | current controller; exact next revision; persist tombstone then ack/clear |
+| `SESSION_END_ACK` | frozen recipient and exact pending action ID |
+| `SESSION_END_NOTICE_GOSSIP` | any holder; normalized certificate; exact session/epoch dominance rules in 11 |
+| election advertise | local round member to local winner; round/epoch match |
+| controller changed | winner of canonical electorate; active persisted migration; state wins comparator |
+| control actions | reject until implemented |
 
-## Session comparator
-
-`compareSessionPriority` from 01 is used by start gossip, `SESSION_RECONCILE`, and migration supersession. Do not implement slightly different orderings in each handler.
+The comparator from 01 is the only distributed state ordering.

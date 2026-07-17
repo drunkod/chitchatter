@@ -1,35 +1,33 @@
 # 17 — Regression, validation, and rollout
 
-> **Revision 7 changes:** adds gates for metadata-before-receiver bootstrap, same-epoch decision recovery, election supersession after first apply, termination re-ack, and user-visible reconciliation rollback.
+> **Revision 8 changes:** rollout gates now require identity-safe end certificates, non-expiring durable migration authority, boot-baseline receiver ordering, bytewise comparison, serialized metadata, and realistic crash queues.
 
 ## Existing-feature regression
 
-- text chat before, during, and after story transitions;
-- microphone, video, screen share, file transfer, and DM navigation;
-- `RoomVideoDisplay userId width height` remains mounted correctly;
-- group room owns exactly one novella provider; keep-mounted DMs own none;
-- keyed novella handler cleanup never flushes chat/media handlers;
-- public and password-protected rooms store no raw invite URL or secret.
+- text chat, voice, video, screen share, file transfer, and DM navigation before/during/after novella actions;
+- exactly one group-room provider and no DM provider;
+- `RoomVideoDisplay` keeps real props;
+- keyed novella cleanup never flushes shared handlers;
+- no raw room secret/invite URL or analytics storage.
 
 ## Manual multi-window matrix
 
-1. Join the same room in isolated browser profiles and verify chat/media.
-2. Start one story and progress normally.
-3. Start concurrently; verify one normal decision when connected.
-4. Partition the profiles in the failure harness, progress different timelines, heal, and verify the deterministic winner plus visible rollback notice.
-5. Crash a coordinator after delivering a start commit to one peer; verify holder gossip and convergence.
-6. Disconnect the controller with peers holding divergent membership views; verify a later migration announcement can supersede the first and all peers converge.
-7. Drop the first termination ACK; verify duplicate end re-acks and finalization.
-8. Reload every browser after epoch/tombstone creation; verify metadata restores before any network event is processed.
-9. Corrupt RoomMeta; verify blocking recovery UI rather than an empty-safety receiver.
-10. Leave and rejoin as a participant; verify no stale React closure drops the synchronous recovery snapshot.
+1. normal start and branch progression;
+2. concurrent start and partial commit/coordinator crash;
+3. partition, progress same session to equal revision with different branches, heal and observe rollback;
+4. controller migration with divergent views; delay the winning announcement well beyond retry cadence and reload one peer before delivery;
+5. begin termination, drop ACK, crash controller, migrate/progress stale population, then deliver holder certificate and observe rollback-to-lobby;
+6. reload every peer with active start/migration/tombstones and verify no message processes before metadata/checkpoint bootstrap;
+7. force metadata write/lock failure and verify state remains unchanged/read-only;
+8. navigate rapidly between rooms and verify no old-room receiver or provisional state survives;
+9. leave/rejoin participation with synchronous exact-target snapshot.
 
-## Rollout sequence
+## Milestone gates
 
-1. **M1:** models, validators, engine, example story. Gate: validator and engine matrices.
-2. **M2:** bootstrap runtime, start proposal/decision/gossip, progression, exact-target snapshots. Gate: partial-commit and sender-identity tests.
-3. **M3:** start reconciliation, migration record/supersession, termination ACKs, RoomMeta, participation. Gate: partition and reload matrices.
-4. **M4:** production UI including `reconciling`, rollback explanation, provisional discard, termination state, accessibility, audio.
+1. **M1:** validator/engine/property matrices.
+2. **M2:** complete bootstrap, start/gossip, progression, exact recovery. Gate: partial commit, baseline race, target-bound recovery.
+3. **M3:** full-state reconciliation, durable migration, ACK/end certificate, serialized RoomMeta. Gate: partition, delayed migration, termination crash, write races.
+4. **M4:** production rollback/end/provisional UI, accessibility, audio.
 5. **M5:** E2E, fuzz/negative tests, README, visible CI, optional signatures.
 
 ## Command gate
@@ -42,14 +40,14 @@ npm run build
 npm run test:e2e -- e2e/tests/visual-novel.test.ts
 ```
 
-All commands must run in CI for implementation changes.
+## Final checklist
 
-## Final review checklist
-
-- no secrets, raw room URLs, trackers, analytics, or executable story content;
-- no unbounded envelopes or storage records;
-- no second room/microphone/provider;
-- all action types have normalization, gate behavior, authorization, dispatch, and tests;
-- all critical metadata writes are awaited;
-- all reconciliation behavior is described as deterministic rollback, not strict consensus;
-- no unrelated formatting changes.
+- every action has model, structural normalization, semantic boundary, gate behavior, authorization, dispatch, persistence ordering, and tests;
+- no timer is an authorization deadline under unbounded delay;
+- no retained original envelope is forwarded directly by another peer;
+- all distributed ordering is canonical byte ordering, never locale collation;
+- all RoomMeta writes are serialized from latest validated state;
+- metadata plus checkpoint baseline load before receiver;
+- rollback behavior is visible and accurately described;
+- test crash helpers cannot accidentally deliver dropped coordinator traffic;
+- no unrelated feature regression.

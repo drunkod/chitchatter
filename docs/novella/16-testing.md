@@ -1,227 +1,84 @@
 # 16 — Test matrices and failure-injection transport
 
-> **Revision 7 changes:** the concrete test transport now uses the link network it describes, and matrices cover the corrected gate ordering, identity-safe gossip, full-state election ordering, metadata bootstrap, and visible rollback.
+> **Revision 8 changes:** adds end-certificate forwarding/dominance, delayed durable migration, bootstrap-baseline races, metadata write serialization, equal-revision same-session conflicts, and realistic crash/lifecycle queue behavior.
 
 ## Required matrices
 
 ### Validation
 
-- fresh-object normalization for every nested payload;
-- start decision ID binding and sender/coordinator checks;
-- gossip outer identity independent of embedded coordinator;
-- reconciliation state semantic validation;
-- canonical election electorate and digest binding;
-- RoomMeta normalization, retained end envelopes, active start decision, count and byte bounds.
+- alias-free normalization of every payload and persisted record;
+- start/migration/digest IDs and canonical electorate;
+- completed-end certificate outer holder identity independent of original sender;
+- all RoomMeta cross-field contradictions;
+- canonical byte ordering property across shuffled object insertion order and mocked locales.
 
-### Gate and recovery
+### Bootstrap and persistence
 
-- `START_PROPOSE@epoch n` drops when high-water is `n`;
-- `START_COMMITTED@epoch n` and gossip reach reconciliation when high-water is `n`;
-- older decisions drop;
-- duplicate `SESSION_ENDED` returns `reack-end` before tombstone handling;
-- tombstoned requests/progression return `reply-ended`;
-- solicited snapshot requires request ID **and exact target peer**.
+- metadata plus checkpoint baseline load before receiver;
+- conflicting same-epoch gossip queued during bootstrap cannot overwrite active decision;
+- overlapping start/tombstone/migration mutations serialize and retain all safety data;
+- critical write/lock failure exposes no replacement;
+- room change unmounts old receiver before new digest resolves.
 
-### Start reconciliation
+### Start/reconciliation
 
-- original commit envelope forwarded by a holder fails identity validation in a negative test;
-- `START_DECISION_GOSSIP` from that holder succeeds;
-- partial commit + coordinator crash + replacement decision converges after heal;
-- revision and full-state tie-breaks are delivery-order independent;
-- losing partition enters `reconciling`, clears checkpoint, and reports rollback;
-- active decision survives reload.
+- partial commit + coordinator crash + identity-safe gossip;
+- equal-revision different session and equal-revision same-session divergence;
+- full semantic bytes decide independently of delivery order;
+- persistence precedes `setState`;
+- restored active decision is the sole gossip source.
 
-### Election
+### Migration
 
-- first announcement changes controller; second announcement for the same original departure can still supersede;
-- same epoch/revision/controller but different session/content has a deterministic winner;
-- divergent local electorates converge after delivery;
-- stale epoch and connected departed peer are rejected.
+- first announcement installs, later better announcement supersedes;
+- delay beyond any retry timer still admissible;
+- reload preserves original departure record;
+- end/higher epoch clears record;
+- same metadata but different state content converges.
 
 ### Termination
 
-- send resolves on enqueue but no finalization without ACKs;
-- first ACK dropped, duplicate end causes re-ack;
-- stale progression receives retained end;
-- critical metadata write failure keeps controller in terminating state;
-- retained notice survives reload.
+- ACK round and duplicate original re-ACK;
+- holder with changed peer ID forwards `SESSION_END_NOTICE_GOSSIP` successfully;
+- certificate clears migrated/progressed exact session/epoch but not other session/higher epoch;
+- persistence failure preserves state/round;
+- retained certificate survives reload.
 
-## Link network
+### Recovery
+
+- overlapping request IDs coexist;
+- exact target, expiry, session/epoch, conflict ID, and recovery kind enforced;
+- revision-gap cannot authorize cross-session snapshot;
+- bootstrap/start/migration reconciliation each use their own comparator baseline.
+
+## Link-aware test network
+
+Each `TestTransport` owns a `knownPeers` view. The network stores ordered links and refreshes affected views after register, unregister, link change, partition, and heal. Tests can suppress a lifecycle notification while still changing link visibility to model missed leave/join events.
 
 ```ts
-type LinkState = 'up' | 'down'
-
-interface QueuedDelivery {
-  id: number
-  from: string
-  to: string
-  key: string
-  data: unknown
-  deliver: () => void
-}
-
-export class TestMeshNetwork {
-  private peers = new Set<string>()
-  private links = new Map<string, LinkState>()
-  private queue: QueuedDelivery[] = []
-  private nextId = 1
-  auto = false
-
-  private peerIds = () => [...this.peers]
-
-  registerPeer(peerId: string) {
-    for (const other of this.peerIds()) {
-      this.links.set(`${peerId}->${other}`, 'up')
-      this.links.set(`${other}->${peerId}`, 'up')
-    }
-    this.peers.add(peerId)
+crash(peerId, { preserveBuffered = false } = {}) {
+  if (!preserveBuffered) {
+    queue = queue.filter(item => item.from !== peerId && item.to !== peerId)
   }
-
-  unregisterPeer(peerId: string) {
-    this.peers.delete(peerId)
-  }
-
-  setLink(from: string, to: string, state: LinkState) {
-    this.links.set(`${from}->${to}`, state)
-  }
-
-  canSee(from: string, to: string) {
-    return this.links.get(`${from}->${to}`) !== 'down'
-  }
-
-  enqueue(input: Omit<QueuedDelivery, 'id'>) {
-    if (!this.canSee(input.from, input.to)) return
-    this.queue.push({ ...input, id: this.nextId++ })
-    if (this.auto) this.pump()
-  }
-
-  pump(count = Number.POSITIVE_INFINITY) {
-    for (let i = 0; i < count && this.queue.length > 0; i++) {
-      this.queue.shift()!.deliver()
-    }
-  }
-
-  pumpIds(ids: number[]) {
-    for (const id of ids) {
-      const index = this.queue.findIndex(item => item.id === id)
-      if (index >= 0) this.queue.splice(index, 1)[0]!.deliver()
-    }
-  }
-
-  dropWhere(predicate: (item: QueuedDelivery) => boolean) {
-    this.queue = this.queue.filter(item => !predicate(item))
-  }
-
-  partition(a: string[], b: string[]) {
-    for (const left of a) for (const right of b) {
-      this.setLink(left, right, 'down')
-      this.setLink(right, left, 'down')
-    }
-  }
-
-  heal() {
-    for (const from of this.peerIds()) for (const to of this.peerIds()) {
-      if (from !== to) this.setLink(from, to, 'up')
-    }
-  }
-
-  deliverPartiallyThenCrash(sender: TestTransport, recipients: string[]) {
-    const allowed = new Set(recipients)
-    const ids = this.queue
-      .filter(item => item.from === sender.peerId && allowed.has(item.to))
-      .map(item => item.id)
-    this.pumpIds(ids)
-    sender.disconnect()
-  }
+  unregister(peerId)
+  refreshAllViews()
 }
 ```
 
-## Concrete transport
+Default crash drops every undelivered delivery from/to the peer. A test that intentionally models already-buffered network delivery opts into `preserveBuffered` explicitly.
 
-```ts
-export class TestTransport implements VisualNovelTransport {
-  private receivers = new Map<string, Set<Receiver>>()
-  private joinHandlers = new Map<PeerHookType, (peerId: string) => void>()
-  private leaveHandlers = new Map<PeerHookType, (peerId: string) => void>()
+`send` resolves on enqueue. Delivery is manually pumped/reordered/dropped. One-way `setLink` controls `getPeers` and receiver delivery. Lifecycle callbacks are derived from each transport's prior `knownPeers` versus refreshed visibility, with an explicit suppression option for missed-event scenarios.
 
-  constructor(
-    readonly peerId: string,
-    private readonly peers: Map<string, TestTransport>,
-    private readonly network: TestMeshNetwork,
-  ) {
-    peers.set(peerId, this)
-    network.registerPeer(peerId)
-    for (const other of peers.values()) {
-      if (other === this) continue
-      for (const handler of other.joinHandlers.values()) handler(peerId)
-    }
-  }
+`deliverPartiallyThenCrash` pumps only selected target deliveries, removes all remaining sender deliveries, then crashes the sender.
 
-  getSelfId = () => this.peerId
-  getPeers = () => [...this.peers.keys()].filter(
-    id => id !== this.peerId && this.network.canSee(this.peerId, id)
-  )
+## Concrete transport requirements
 
-  makeAction = <T extends DataPayload>(
-    peerAction: PeerAction,
-    namespace: string,
-  ): PeerRoomAction<T> => {
-    const key = `${namespace}.${peerAction}`
-    if (!this.receivers.has(key)) this.receivers.set(key, new Set())
-
-    const send: PeerRoomAction<T>[0] = async (data, options) => {
-      const targets = options?.target
-        ? (Array.isArray(options.target) ? options.target : [options.target])
-        : this.getPeers()
-      for (const target of targets) {
-        const remote = this.peers.get(target)
-        if (!remote) continue
-        this.network.enqueue({
-          from: this.peerId,
-          to: target,
-          key,
-          data: structuredClone(data),
-          deliver: () => {
-            for (const receiver of remote.receivers.get(key) ?? []) {
-              receiver(structuredClone(data), { peerId: this.peerId } as MessageContext)
-            }
-          },
-        })
-      }
-      // Resolve on enqueue intentionally; tests control actual delivery.
-    }
-
-    const connectReceiver: PeerRoomAction<T>[1] = receiver => {
-      this.receivers.get(key)!.add(receiver as Receiver)
-      return () => { this.receivers.get(key)!.delete(receiver as Receiver) }
-    }
-    const progress: PeerRoomAction<T>[2] = () => undefined
-    return [send, connectReceiver, progress]
-  }
-
-  onPeerJoin = (type: PeerHookType, handler: (peerId: string) => void) => {
-    this.joinHandlers.set(type, handler)
-  }
-
-  onPeerLeave = (type: PeerHookType, handler: (peerId: string) => void) => {
-    this.leaveHandlers.set(type, handler)
-  }
-
-  removePeerJoinHandler = (type: PeerHookType) => { this.joinHandlers.delete(type) }
-  removePeerLeaveHandler = (type: PeerHookType) => { this.leaveHandlers.delete(type) }
-
-  disconnect = () => {
-    this.peers.delete(this.peerId)
-    this.network.unregisterPeer(this.peerId)
-    for (const other of this.peers.values()) {
-      for (const handler of other.leaveHandlers.values()) handler(this.peerId)
-    }
-  }
-}
-```
-
-The test network, not the global peer map, now controls `getPeers()` and delivery.
+- `makeAction<T extends DataPayload>` routes every delivery through network enqueue;
+- receiver sets and keyed lifecycle handler maps;
+- insert-before-join notification;
+- disconnect delegates to network crash;
+- compile-only assignment to `VisualNovelTransport` locks type compatibility.
 
 ## CI
 
-Unit, type, lint, build, and focused E2E suites must appear as status checks on the feature branch. Documentation-only commits may have no runs, but implementation merge gates may not.
+Unit, type, lint, build, and focused E2E suites appear as status checks on implementation PRs. Documentation-only plan commits may have no runs.

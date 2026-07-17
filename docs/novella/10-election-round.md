@@ -1,121 +1,82 @@
-# 10 — Controller migration and supersession
+# 10 — Durable controller migration and supersession
 
-> **Revision 7 changes:** preserves the original departed-controller identity after the first announcement, makes supersession total over the complete adopted state, and reuses the shared reconciliation comparator.
+> **Revision 8 changes:** migration authorization no longer expires by local time, the active migration record is persisted, and controller-change replacement persists before state exposure.
 
-## Local election round
+## Local collection round
 
-Each peer opens a local round when its current controller leaves:
+On current-controller departure, freeze the local canonical electorate and derive the bounded round ID. Local round timers control advertisement collection and retry only; they do not decide whether a later announcement is authorized.
 
-```ts
-const electorate = [...new Set([selfId, ...transport.getPeers()])]
-  .filter(id => id !== departedControllerPeerId)
-  .sort()
-
-const roundId = deriveRoundId(
-  `${state.sessionEpoch}:${departedControllerPeerId}:${electorate.join(',')}`
-)
-```
-
-The local round controls advertisement collection only. It is not assumed to be a globally agreed membership certificate.
-
-## Durable migration record
-
-The first accepted announcement must not erase the departure that authorizes later supersession:
+## Persisted migration authority
 
 ```ts
-interface MigrationRecord {
-  sessionEpoch: number
-  departedControllerPeerId: string
-  openedAt: number
-  closesAt: number
-  lastAppliedState: VisualNovelSessionState | null
+const migrationId = deriveRoundId(
+  `migration:${state.sessionEpoch}:${state.sessionId}:${departedControllerPeerId}`)
+
+const record: MigrationRecord = {
+  migrationId,
+  sessionEpoch: state.sessionEpoch,
+  sessionId: state.sessionId,
+  departedControllerPeerId,
+  lastAppliedState: null,
 }
 ```
 
-Open it on the leave event. If a peer missed the leave event, it may create the record from an internally consistent announcement only when:
+Persist the record before sending/accepting controller-change announcements. If a peer missed the leave event, it may create the record from an internally consistent announcement only when the announcement concerns its current session/controller, the departed peer is absent from its transport view, and the state is not older.
 
-- `payload.departedControllerPeerId === current.controllerPeerId`;
-- the departed peer is absent from its transport view;
-- the state epoch is not older.
+The record remains authoritative until:
 
-After applying the first announcement, authorization continues to compare against `migration.departedControllerPeerId`, not the newly installed `current.controllerPeerId`.
+- that exact session/epoch is tombstoned;
+- a higher epoch installs;
+- local safety metadata is explicitly reset.
 
-## Advertisement and announcement
+`migrationRetryMs` stops active retries; it never makes a delayed valid announcement inadmissible. Reload restores the record before receivers attach.
 
-```text
-remaining peers → local winner: ELECTION_ADVERTISE(local round, own state)
-local winner: choose best state, change controller, broadcast CONTROLLER_CHANGED
-```
+## Announcement authorization
 
-The announcement includes canonical electorate fields and a digest-bound `roundId`. The announced controller must be the minimum ID in that electorate and the transport sender.
+Require:
 
-## Authorization
+- outer sender = announced controller = state controller;
+- announced controller = minimum canonical electorate ID;
+- digest-bound round fields valid;
+- departed peer absent from receiver transport view;
+- active migration ID/session/epoch/departed controller match;
+- incoming state is equal to or strictly wins over `record.lastAppliedState ?? current` using the shared bytewise comparator.
 
-```ts
-authorizeControllerChange(
-  payload: VisualNovelPayloadByAction['CONTROLLER_CHANGED'],
-  current: VisualNovelSessionState,
-  contextPeerId: string,
-  connectedPeers: string[],
-  migration: MigrationRecord | null,
-  now: number,
-): boolean {
-  if (payload.controllerPeerId !== contextPeerId) return false
-  if (payload.controllerPeerId !== electController(payload.electorate)) return false
-  if (connectedPeers.includes(payload.departedControllerPeerId)) return false
+A delayed competing announcement remains comparable after arbitrary delay and after reload because authorization uses the persisted migration record, not `current.controllerPeerId` or a deadline.
 
-  const active = migration && now <= migration.closesAt ? migration : null
-  if (active) {
-    if (payload.departedControllerPeerId !== active.departedControllerPeerId) return false
-    if (payload.state.sessionEpoch !== active.sessionEpoch) return false
-  } else {
-    if (payload.departedControllerPeerId !== current.controllerPeerId) return false
-  }
-
-  if (payload.state.sessionEpoch < current.sessionEpoch) return false
-
-  const baseline = active?.lastAppliedState ?? current
-  return compareSessionPriority(payload.state, baseline) > 0 ||
-    stableStateString(payload.state) === stableStateString(baseline)
-}
-```
-
-Equal normalized state is an idempotent no-op. A genuinely different state must strictly win the shared comparator.
-
-## Applying and superseding
+## Application
 
 ```ts
 const applyControllerChange = async (envelope, context) => {
+  const current = stateRef.current!
   const incoming = envelope.payload.state
-  const record = ensureMigrationRecord(envelope.payload, stateRef.current)
-  if (!authorizeControllerChange(/* ... */)) return
+  const migration = sync.requireActiveMigration(envelope.payload)
+  if (!authorizeControllerChange(envelope, context, migration, current)) return
 
-  if (stableStateString(incoming) !== stableStateString(stateRef.current!)) {
-    setPhase('reconciling')
-    clearCheckpointIfSessionChanged(stateRef.current!, incoming)
-    setState(incoming)
+  if (canonicalStateEqual(incoming, migration.lastAppliedState ?? current)) {
+    sync.commit(envelope)
+    return
   }
-  record.lastAppliedState = incoming
-  record.closesAt = now() + visualNovelLimits.migrationSupersessionMs
+
+  await sync.persistMigrationWinner(migration.migrationId, incoming)
+  setPhase('reconciling')
+  await clearCheckpointIfLosing(current, incoming)
+  installState(incoming)
   sync.commit(envelope)
 }
 ```
 
-`lastAppliedState` survives local round restarts and the first controller replacement until the supersession window closes.
-
-## Divergent local views
-
-B may announce from `{B,C}` while C announces from `{C}`. Both are internally consistent. Once both announcements are delivered, every peer compares the complete adopted states using the same total comparator. The lower-ID winner is only one tie-break; differing session IDs or state content cannot remain arrival-order-dependent.
+Persist before installation. Same session/epoch/revision with different content still uses the comparator.
 
 ## Interaction with start conflicts
 
-If migration occurs while populations hold different same-epoch sessions, announcements carry those complete states. The shared comparator chooses one. Losing peers show reconciliation and replace atomically. This is the same availability-with-rollback behavior documented in 00/09.
+Announcements may carry competing same-epoch sessions. The shared comparator selects one complete state. The active migration then follows the winning session record persisted by the metadata mutation; losing peers display rollback.
 
 ## Tests
 
-- second announcement remains authorized after the first controller is installed;
-- two equal epoch/revision/controller announcements with different session or content converge deterministically;
-- local electorate disagreement does not cause `wrong-round` deadlock;
-- departed peer still connected is rejected;
-- announcement fields and digest binding are normalized and checked;
-- migration record expires only after the supersession window and is not overwritten by unrelated join/leave events.
+- second announcement supersedes after first apply;
+- announcement delayed beyond retry timer still applies;
+- reload preserves original departure authorization;
+- same metadata but different session/content converges;
+- persistence failure exposes no replacement;
+- higher epoch/end clears migration; unrelated join/leave does not.

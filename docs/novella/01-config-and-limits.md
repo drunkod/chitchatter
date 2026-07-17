@@ -1,8 +1,8 @@
-# 01 — Protocol constants, epochs, and deterministic ordering
+# 01 — Protocol constants, epochs, and canonical ordering
 
-> **Revision 7 changes:** separates proposal staleness from decision staleness, adds reconciliation and metadata timing limits, and defines canonical state comparison used by both start and election convergence.
+> **Revision 8 changes:** replaces locale-sensitive comparison with canonical UTF-8 byte ordering, adds recovery-record bounds, and states that authorization records are cleared by protocol events rather than wall-clock expiry.
 
-## `src/config/visualNovel.ts`
+## Limits
 
 ```ts
 export const visualNovelProtocolVersion = 1 as const
@@ -12,6 +12,7 @@ export const visualNovelLimits = {
   maxSnapshotBytes: 64 * 1024,
   maxVariablesBytes: 24 * 1024,
   maxHistoryBytes: 16 * 1024,
+  maxRoomMetaBytes: 2 * 1024 * 1024,
 
   maxHistoryEntries: 256,
   maxSnapshotHistoryEntries: 32,
@@ -26,100 +27,84 @@ export const visualNovelLimits = {
   maxTextLength: 8 * 1024,
   maxSeenActionIds: 2048,
   maxPersistedTombstones: 16,
-  maxRoomMetaBytes: 2 * 1024 * 1024,
+  maxOutstandingRecoveries: 16,
 
   requestTimeoutMs: 10_000,
   startRoundMs: 1_500,
   startReconcileRetryMs: 3_000,
   electionRoundMs: 2_000,
-  migrationSupersessionMs: 8_000,
+  migrationRetryMs: 8_000, // retry cadence only; never an authorization deadline
   terminationAckTimeoutMs: 8_000,
+  recoveryRecordTtlMs: 30_000,
   canonicalSendRetries: 1,
 } as const
 
 export const visualNovelBootstrapScope = {
-  sessionId: 'bootstrap',
-  storyId: 'bootstrap',
-  storyVersion: '0.0.0',
+  sessionId: 'bootstrap', storyId: 'bootstrap', storyVersion: '0.0.0',
 } as const
 ```
 
-## Byte budgets
-
-All encoded sizes use one non-throwing helper:
-
-```ts
-export const utf8Bytes = (value: unknown): number => {
-  try {
-    return new TextEncoder().encode(JSON.stringify(value)).byteLength
-  } catch {
-    return Number.POSITIVE_INFINITY
-  }
-}
-```
-
-Variables and truncated history have independent aggregate limits, followed by a final `maxSnapshotBytes` check. The engine applies the variable checks before committing a transition.
-
 ## Epoch rules
 
-`sessionEpoch` is room-monotonic safety metadata:
+- first committed session is epoch 1;
+- start and switch create `highWaterEpoch + 1`;
+- proposal epoch is stale at `<= highWaterEpoch`;
+- decision/gossip epoch is stale only at `< highWaterEpoch`;
+- other state-carrying traffic is stale at `< highWaterEpoch`;
+- higher epoch clears older active-start and active-migration records;
+- ending a session clears records for that exact epoch.
 
-- first committed session: epoch 1;
-- fresh start or controller switch: `highWaterEpoch + 1`;
-- `noteEpoch` persists before the new state becomes interactive;
-- tombstoning persists the same or newer epoch;
-- other state-carrying events are stale at `embeddedEpoch < highWaterEpoch`.
+## Bounded identifiers
 
-Start actions are intentionally split:
+`deriveRoundId` remains the synchronous 64-bit FNV-1a digest encoded as `r` plus sixteen lowercase hex characters. Raw authoritative fields remain in the payload and are revalidated; the digest is bookkeeping, not a signature.
 
-```ts
-const isStaleStartProposal = (epoch: number, highWater: number) =>
-  epoch <= highWater
+## Canonical semantic-state bytes
 
-const isStaleStartDecision = (epoch: number, highWater: number) =>
-  epoch < highWater
-```
-
-A same-epoch decision must reach reconciliation. Treating decisions as stale at `<=` would make partial-commit recovery impossible.
-
-## Bounded round and decision IDs
+Distributed ordering must never use `localeCompare`, host locale, insertion order, or engine-specific collation. Canonicalize recursively, omit non-semantic `updatedAt`, and compare UTF-8 bytes unsigned:
 
 ```ts
-export const deriveRoundId = (canonical: string): string => {
-  let hash = 0xcbf29ce484222325n
-  for (let i = 0; i < canonical.length; i++) {
-    hash ^= BigInt(canonical.charCodeAt(i))
-    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => key !== 'updatedAt')
+        .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+        .map(([key, item]) => [key, canonicalize(item)])
+    )
   }
-  return `r${hash.toString(16).padStart(16, '0')}`
+  return value
 }
-```
 
-Raw fields remain in payloads and validators recompute the ID. The digest is a bounded bookkeeping key, not a security signature.
+export const canonicalStateBytes = (state: VisualNovelSessionState): Uint8Array =>
+  new TextEncoder().encode(JSON.stringify(canonicalize(state)))
 
-## Canonical state comparison
+const compareBytes = (a: Uint8Array, b: Uint8Array): number => {
+  const length = Math.min(a.length, b.length)
+  for (let i = 0; i < length; i++) {
+    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1
+}
 
-All same-epoch start reconciliation and migration supersession use one comparator. It must be total over the complete normalized state:
+const compareAscii = (a: string, b: string): number =>
+  a === b ? 0 : a < b ? -1 : 1
 
-```ts
-export const stableStateString = (state: VisualNovelSessionState): string =>
-  JSON.stringify({
-    ...state,
-    variables: Object.fromEntries(
-      Object.entries(state.variables).sort(([a], [b]) => a.localeCompare(b))
-    ),
-  })
-
+// Positive means a wins. Higher epoch/revision wins; lower stable IDs and
+// lower canonical bytes win ties.
 export const compareSessionPriority = (
   a: VisualNovelSessionState,
-  b: VisualNovelSessionState
+  b: VisualNovelSessionState,
 ): number =>
   a.sessionEpoch - b.sessionEpoch ||
   a.revision - b.revision ||
-  // Lower IDs win ties; invert for a “positive means a wins” comparator.
-  -a.controllerPeerId.localeCompare(b.controllerPeerId) ||
-  -a.sessionId.localeCompare(b.sessionId) ||
-  -stableStateString(a).localeCompare(stableStateString(b))
+  -compareAscii(a.controllerPeerId, b.controllerPeerId) ||
+  -compareAscii(a.sessionId, b.sessionId) ||
+  -compareBytes(canonicalStateBytes(a), canonicalStateBytes(b))
 ```
 
-History order is already canonical; variable keys are sorted. An equal comparator result therefore means equal normalized state, not merely equal revision metadata.
+An equality result means equal normalized semantic state. History arrays retain protocol order; every object key is sorted recursively.
+
+## Byte budgets
+
+Use the non-throwing `utf8Bytes` helper for aggregate collections and final envelopes. Engine variable guards run before a transition commits. Snapshot history is truncated by count and encoded bytes before final `maxSnapshotBytes` validation.

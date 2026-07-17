@@ -1,123 +1,69 @@
-# 12 — Sync runtime, dispatch, and recovery
+# 12 — Sync runtime, dispatch, exact recovery, and lifecycle
 
-> **Revision 7 changes:** receiver attachment is explicitly delayed until metadata bootstrap, gate decisions can perform re-ack/reply work, start gossip and session reconciliation have dedicated handlers, and snapshot recovery is bound to an exact target record.
+> **Revision 8 changes:** receiver mount waits for metadata plus checkpoint baseline, dispatch includes end-certificate gossip, recovery records are mapped and kind-specific, and room/lifecycle cleanup cannot leak prior-room state.
 
-## Runtime options
+## Ready-runtime inputs
 
 ```ts
 interface Options {
   transport: VisualNovelTransport
   initialMeta: RoomMeta
-  persistMeta: (meta: RoomMeta) => Promise<void>
-  story: VisualNovelManifest | null
-  state: VisualNovelSessionState | null
+  initialCheckpoint: VisualNovelSessionState | null
+  persistMetaMutation: MetaMutationAdapter
+  storyCatalog: StoryCatalog
   setState: (state: VisualNovelSessionState | null) => void
-  onParticipationChange: (value: VisualNovelParticipation) => void
   onSessionEnded: (sessionId: string) => Promise<void>
   onProtocolError: (message: string) => void
 }
 ```
 
-`useVisualNovelSync` is mounted only after `initialMeta` exists. The receiver is connected inside an effect in this mounted child; there is no disabled service that processed early envelopes with empty metadata.
+No receiver exists before all inputs are validated. The sync service seeds high water, tombstones, end certificates, active start, active migration, and boot baseline synchronously before connecting the transport receiver.
 
 ## Receive path
 
 ```ts
-const onReceive = async (input: unknown, context: MessageContext) => {
-  const validated = validateEnvelope(input)
-  if (!validated.ok) return warn(validated.errors)
-  const envelope = validated.value
-  if (envelope.senderPeerId !== context.peerId) return
-
-  const gate = sync.inspectGate(envelope)
-  if (gate.kind === 'reack-end') {
-    await resendEndAck(envelope as EnvelopeFor<'SESSION_ENDED'>, context.peerId)
-    return
-  }
-  if (gate.kind === 'reply-ended') {
-    await send(gate.notice, { target: context.peerId })
-    return
-  }
-  if (gate.kind === 'drop') return
-
-  const subjectSessionId = sync.subjectSessionId(envelope)
-  if (participationRef.current.kind === 'left-current-session' &&
-      subjectSessionId === participationRef.current.sessionId) return
-
-  switch (envelope.actionType) {
-    case 'START_PROPOSE': return handleStartPropose(envelope, context)
-    case 'START_COMMITTED': return handleStartCommitted(envelope, context)
-    case 'START_DECISION_GOSSIP': return handleStartDecisionGossip(envelope, context)
-    case 'SESSION_RECONCILE': return applySessionReconcile(envelope, context)
-    case 'STATE_REQUEST':
-    case 'ADVANCE_REQUEST':
-    case 'CHOICE_REQUEST':
-    case 'RESTART_REQUEST':
-      return enqueue(() => handleRequest(envelope, context))
-    case 'STATE_SNAPSHOT':
-    case 'RESTARTED': return applySnapshotClass(envelope, context)
-    case 'SESSION_STARTED': return applySwitch(envelope, context)
-    case 'SESSION_ENDED': return applySessionEnded(envelope, context)
-    case 'SESSION_END_ACK': return handleSessionEndAck(envelope, context)
-    case 'ADVANCED':
-    case 'CHOICE_RESOLVED': return applyProgression(envelope, context)
-    case 'CONTROLLER_CHANGED': return applyControllerChange(envelope, context)
-    case 'ELECTION_ADVERTISE': return collectElectionAdvertisement(envelope, context)
-    case 'ERROR': return surfaceError(envelope)
-    case 'CONTROL_REQUEST':
-    case 'CONTROL_PASSED': return rejectUnimplemented(envelope)
-  }
-}
+normalize → outer transport identity → typed gate → participation guard
+→ semantic validation → exhaustive dispatch → awaited metadata mutation
+→ atomic state apply → duplicate commit
 ```
 
-## Recovery requests
+Dispatch adds `SESSION_END_NOTICE_GOSSIP` beside start gossip and reconciliation. `reply-ended` gate results call `sendEndNoticeGossip`, not `send(originalEndEnvelope)`.
 
-Never store only one request ID without its target:
+## Recovery map
 
 ```ts
-const requestState = async (
-  targetPeerId: string,
-  expectedEpoch: number,
-  kind: RecoveryKind,
-) => {
-  const envelope = makeStateRequest(kind)
-  outstandingRecoveryRef.current = {
-    actionId: envelope.actionId,
-    targetPeerId,
-    expectedEpoch,
-    kind,
-    createdAt: now(),
-  }
-  await send(envelope, { target: targetPeerId })
-}
+const outstandingRecoveries = new Map<string, OutstandingRecovery>()
 ```
 
-`STATE_SNAPSHOT` is solicited only when both the echoed action ID and `context.peerId` match this record. Cross-session replacement is then allowed only for bootstrap/reconciliation kinds and only when the incoming state wins the relevant ordering.
+Creating a request inserts a bounded record before send. Snapshot handling looks up by echoed action ID, verifies exact target/context and expiry, then applies the kind rules from 08. Success deletes only that record; overlapping bootstrap and revision-gap requests do not overwrite one another.
 
-## Start handlers
+Periodic cleanup removes expired records. Room change/unmount clears all.
 
-- `START_COMMITTED`: authorize origin coordinator, then call `acceptStartDecision(..., context.peerId)`.
-- `START_DECISION_GOSSIP`: outer sender is the holder; validate embedded decision and known state, then call the same acceptance routine with `context.peerId`.
-- `SESSION_RECONCILE`: require an open conflict record for the epoch and apply only if the incoming complete state wins `compareSessionPriority`.
-- On a losing local state whose winning controller is reachable, prefer exact-target `STATE_REQUEST`; otherwise accept the normalized full reconciliation state under the honest-peer concession.
+## Start and migration handlers
 
-## Migration handler
+- start commit/gossip call the same baseline-aware acceptance routine;
+- reconciliation requires exact conflict ID and winning full state;
+- controller change requires persisted active migration, not a timer or newly installed current controller;
+- every canonical replacement persists the metadata winner before calling `setState`.
 
-Semantic validation precedes `authorizeControllerChange`. The handler uses the retained `MigrationRecord`, not `current.controllerPeerId`, for supersession. It records the complete applied state and keeps the record until `migrationSupersessionMs` expires.
+## End handlers
 
-## Request handling
+- original end: current-controller/exact-revision path, persist then ACK/clear;
+- duplicate original: re-ACK before tombstone suppression;
+- retained gossip: exact certificate dominance rules in 11;
+- stale requests: send fresh holder envelope containing retained certificate.
 
-Priority order:
+## Request priority
 
-1. retained end notice for a tombstoned session;
-2. pending termination end notice;
-3. held start decision gossip for bootstrap/confused proposal;
-4. controller snapshot or serialized progression request.
+1. retained completed-end certificate;
+2. pending termination envelope from the original controller;
+3. active start-decision gossip;
+4. controller snapshot or serialized progression response.
 
-## Canonical send failure
+## Peer lifecycle
 
-Progression still applies locally, retries, then advertises repair. Repairs should target known lagging peers when possible. A generic snapshot broadcast is not sufficient proof of delivery, but eventual subsequent requests and exact-target recovery close the gap under the stated model.
+Local membership events open/retry elections but never expire persistent migration authority. Joins receive current snapshot, pending end, or retained certificate as appropriate. The participation guard uses `subjectSessionId`, including embedded start and end certificate subjects.
 
-## Lifecycle cleanup
+## Cleanup
 
-Timers for requests, start collection, reconciliation retry, migration supersession, and termination ACK cycles are cleared on unmount. Remove only novella’s keyed peer handlers; never flush shared room handlers.
+Clear request, start, retry, migration, termination, and UI timers. Remove only novella keyed handlers. On room-key change the ready runtime unmounts immediately before a new bootstrap begins; no previous room receiver remains active.
