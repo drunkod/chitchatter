@@ -117,7 +117,10 @@ export const Shell = ({ appNeedsUpdate, children, userPeerId }: ShellProps) => {
   const messageLog = shellMessageLog
 
   const setMessageLog = useCallback(
-    (messageLogUpdate: SetStateAction<MessageLog>, targetPeerId: string | null) => {
+    (
+      messageLogUpdate: SetStateAction<MessageLog>,
+      targetPeerId: string | null
+    ) => {
       setShellMessageLog(prev => {
         const isDirectMessageLog = typeof targetPeerId === 'string'
         const previousMessageLog = isDirectMessageLog

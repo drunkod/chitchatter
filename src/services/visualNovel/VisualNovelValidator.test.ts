@@ -1,4 +1,5 @@
 import harbourLightsData from '../../stories/harbour-lights/story.json'
+
 import {
   toSnapshotState,
   validateAssetPath,
@@ -28,6 +29,7 @@ describe('VisualNovelValidator', () => {
     })
 
     const input = structuredClone(harbourLightsData)
+
     input.scenes.pier.dialogue[1].choices![0].nextSceneId = 'missing'
     const result = validateStory(input, origin)
 
@@ -44,6 +46,7 @@ describe('VisualNovelValidator', () => {
     const scenes = input.scenes as Record<string, Record<string, unknown>>
     const pier = scenes.pier
     const dialogue = pier.dialogue as Record<string, unknown>[]
+
     dialogue[1].choices = {}
     dialogue[0].portrait = 42
     pier.characters = {}
@@ -65,6 +68,7 @@ describe('VisualNovelValidator', () => {
 
   it('rejects duplicate dialogue identifiers', () => {
     const input = structuredClone(harbourLightsData)
+
     input.scenes['dawn-ending'].dialogue[0].id = 'pier-1'
     const result = validateStory(input, origin)
 
@@ -79,6 +83,7 @@ describe('VisualNovelValidator', () => {
       unknown
     >
     const scenes = input.scenes as Record<string, unknown>
+
     scenes.pier = null
 
     const result = validateStory(input, origin)
@@ -93,6 +98,7 @@ describe('VisualNovelValidator', () => {
 
   it('validates and normalizes session state against its story', () => {
     const storyResult = validateStory(harbourLightsData, origin)
+
     expect(storyResult.ok).toBe(true)
     if (!storyResult.ok) return
 
@@ -111,6 +117,7 @@ describe('VisualNovelValidator', () => {
 
   it('rejects history at or above the current revision', () => {
     const storyResult = validateStory(harbourLightsData, origin)
+
     expect(storyResult.ok).toBe(true)
     if (!storyResult.ok) return
 
@@ -136,6 +143,7 @@ describe('VisualNovelValidator', () => {
 
   it('rejects an unknown history choice', () => {
     const storyResult = validateStory(harbourLightsData, origin)
+
     expect(storyResult.ok).toBe(true)
     if (!storyResult.ok) return
 
@@ -168,6 +176,7 @@ describe('VisualNovelValidator', () => {
 
   it('creates a detached bounded snapshot', () => {
     const storyResult = validateStory(harbourLightsData, origin)
+
     expect(storyResult.ok).toBe(true)
     if (!storyResult.ok) return
 
@@ -175,6 +184,7 @@ describe('VisualNovelValidator', () => {
       now: () => 1000,
     })
     let state = engine.start('session-1', 'peer-a')
+
     for (let index = 0; index < 40; index += 1) {
       state = {
         ...state,
@@ -191,6 +201,7 @@ describe('VisualNovelValidator', () => {
     }
 
     const snapshot = toSnapshotState(state)
+
     expect(snapshot.history).toHaveLength(32)
     expect(snapshot.history).not.toBe(state.history)
     expect(snapshot.variables).not.toBe(state.variables)

@@ -15,7 +15,7 @@ export const backoffMultiplier = 2
 // successive room mounts.
 
 export function useThrottledRoomMount(roomId: string) {
-  const [canMount, setCanMount] = useState(false)
+  const [mountableRoomId, setMountableRoomId] = useState<string | null>(null)
   // Delay before allowing room mount (null means no delay)
   const [backoffDelay, setBackoffDelay] = useState<number | null>(null)
   // Delay before resetting the backoff counter (null means no reset scheduled)
@@ -23,7 +23,7 @@ export function useThrottledRoomMount(roomId: string) {
 
   // Timer that allows room mounting after the backoff delay
   useTimeout(() => {
-    setCanMount(true)
+    setMountableRoomId(roomId)
     setResetDelay(backoffResetPeriod) // Schedule backoff reset after allowing mount
   }, backoffDelay)
 
@@ -33,8 +33,6 @@ export function useThrottledRoomMount(roomId: string) {
   }, resetDelay)
 
   useEffect(() => {
-    setCanMount(false)
-
     const now = Date.now()
 
     const lastMountTime =
@@ -63,10 +61,10 @@ export function useThrottledRoomMount(roomId: string) {
       setBackoffDelay(backoff)
     } else {
       // No backoff needed, allow immediate mounting and schedule backoff reset
-      setCanMount(true)
+      setMountableRoomId(roomId)
       setResetDelay(backoffResetPeriod)
     }
   }, [roomId])
 
-  return canMount
+  return mountableRoomId === roomId
 }

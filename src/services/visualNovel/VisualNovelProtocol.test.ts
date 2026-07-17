@@ -1,4 +1,5 @@
 import { getBundledStory } from '../../stories/catalog'
+
 import { VisualNovelEngine } from './VisualNovelEngine'
 import { validateVisualNovelEnvelope } from './VisualNovelProtocol'
 
@@ -32,6 +33,24 @@ describe('VisualNovelProtocol', () => {
     expect(result.value).toMatchObject(bootstrapRequest)
   })
 
+  it('accepts a no-active-session bootstrap response', () => {
+    const result = validateVisualNovelEnvelope(
+      {
+        ...bootstrapRequest,
+        actionId: 'response-1',
+        actionType: 'ERROR',
+        payload: {
+          code: 'NO_ACTIVE_SESSION',
+          requestActionId: bootstrapRequest.actionId,
+        },
+      },
+      'peer-a',
+      resolveStory
+    )
+
+    expect(result).toMatchObject({ ok: true })
+  })
+
   it('rejects sender identity mismatches', () => {
     const result = validateVisualNovelEnvelope(
       bootstrapRequest,
@@ -60,15 +79,16 @@ describe('VisualNovelProtocol', () => {
     expect(result).toMatchObject({ ok: false })
     if (result.ok) return
     expect(result.errors).toContain(
-      'Only state requests may omit session identity'
+      'Only bootstrap messages may omit session identity'
     )
     expect(result.errors).toContain(
-      'Only bootstrap state requests may use revision -1'
+      'Only bootstrap messages may use revision -1'
     )
   })
 
   it('rejects malformed payloads and state/envelope identity mismatch', () => {
     const story = getBundledStory('harbour-lights', '1.0.0')
+
     expect(story).not.toBeNull()
     if (!story) return
     const state = new VisualNovelEngine(story, { now: () => 1000 }).start(
@@ -89,6 +109,7 @@ describe('VisualNovelProtocol', () => {
       'peer-a',
       resolveStory
     )
+
     expect(malformed).toMatchObject({ ok: false })
 
     const mismatch = validateVisualNovelEnvelope(
@@ -104,6 +125,7 @@ describe('VisualNovelProtocol', () => {
       'peer-a',
       resolveStory
     )
+
     expect(mismatch).toMatchObject({ ok: false })
     if (mismatch.ok) return
     expect(mismatch.errors).toContain(

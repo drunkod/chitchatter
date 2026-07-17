@@ -177,9 +177,12 @@ describe('Room', () => {
     await userEvent.click(sendButton)
 
     await waitFor(() => {
-      expect(sendButton).not.toBeDisabled()
+      expect(screen.queryByText('hello')).not.toBeInTheDocument()
     })
-    expect(screen.queryByText('hello')).not.toBeInTheDocument()
+
+    await userEvent.type(textInput, 'retry')
+
+    expect(sendButton).not.toBeDisabled()
 
     consoleError.mockRestore()
   })

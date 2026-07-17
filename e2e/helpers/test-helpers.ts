@@ -62,11 +62,27 @@ export const sendMessage = async (
   page: Page,
   message: string
 ): Promise<void> => {
-  const chatInput = page.getByPlaceholder('Your message')
+  const chatInput = page.getByPlaceholder('Your message').first()
 
   await chatInput.fill(message)
   await chatInput.press('Enter')
-  await expect(page.getByText(message)).toBeVisible()
+  await expect(page.getByText(message).first()).toBeVisible()
+}
+
+export const waitForPeerConnected = async (
+  page: Page,
+  peerUserId: string
+): Promise<void> => {
+  const peerName = page.getByText(peerUserId, { exact: true }).first()
+  const closePeerListButton = page.getByRole('button', {
+    name: 'Close peer list',
+  })
+
+  if (!(await closePeerListButton.isVisible())) {
+    await page.getByRole('button', { name: 'Peer list' }).click()
+  }
+
+  await expect(peerName).toBeVisible({ timeout: 45_000 })
 }
 
 export const waitForPeerMessage = async (
@@ -75,5 +91,7 @@ export const waitForPeerMessage = async (
   message: string
 ): Promise<void> => {
   await sendMessage(sender, message)
-  await expect(receiver.getByText(message)).toBeVisible({ timeout: 25_000 })
+  await expect(receiver.getByText(message).first()).toBeVisible({
+    timeout: 25_000,
+  })
 }

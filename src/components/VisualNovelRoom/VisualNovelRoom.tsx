@@ -10,6 +10,7 @@ import { useMemo } from 'react'
 import type { PeerRoom } from '../../lib/PeerRoom'
 import { VisualNovelEngine } from '../../services/visualNovel'
 import { getBundledStories, getBundledStory } from '../../stories/catalog'
+
 import { useVisualNovelRoom } from './useVisualNovelRoom'
 
 export interface VisualNovelRoomProps {

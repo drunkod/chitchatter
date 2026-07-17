@@ -10,19 +10,35 @@ import {
   useThrottledRoomMount,
 } from './useThrottledRoomMount'
 
-const mockSessionStorage = (() => {
-  let store: Record<string, string> = {}
+let sessionStorageStore: Record<string, string> = {}
 
-  return {
-    getItem: vi.fn((key: string) => store[key] || null),
-    setItem: vi.fn((key: string, value: string) => {
-      store[key] = value
-    }),
-    clear: vi.fn(() => {
-      store = {}
-    }),
-  }
-})()
+const mockSessionStorage = {
+  getItem: vi.fn((key: string) => sessionStorageStore[key] || null),
+  setItem: vi.fn((key: string, value: string) => {
+    sessionStorageStore[key] = value
+  }),
+  clear: vi.fn(() => {
+    sessionStorageStore = {}
+  }),
+}
+
+const resetSessionStorageMock = (): void => {
+  sessionStorageStore = {}
+  mockSessionStorage.getItem.mockReset()
+  mockSessionStorage.getItem.mockImplementation(
+    (key: string) => sessionStorageStore[key] || null
+  )
+  mockSessionStorage.setItem.mockReset()
+  mockSessionStorage.setItem.mockImplementation(
+    (key: string, value: string) => {
+      sessionStorageStore[key] = value
+    }
+  )
+  mockSessionStorage.clear.mockReset()
+  mockSessionStorage.clear.mockImplementation(() => {
+    sessionStorageStore = {}
+  })
+}
 
 Object.defineProperty(window, 'sessionStorage', {
   value: mockSessionStorage,
@@ -31,7 +47,7 @@ Object.defineProperty(window, 'sessionStorage', {
 describe('useThrottledRoomMount', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockSessionStorage.clear()
+    resetSessionStorageMock()
     vi.useFakeTimers()
   })
 

@@ -11,6 +11,7 @@ import type {
   VisualNovelActionType,
   VisualNovelRecoveryReason,
 } from '../../models/visualNovelProtocol'
+
 import { isId, isRecord, isRevision, utf8ByteLength } from './validationUtils'
 import {
   validateSessionState,
@@ -57,12 +58,14 @@ const normalizeState = (
   }
 
   const story = resolveStory(input.storyId, input.storyVersion)
+
   if (!story) {
     errors.push('Envelope references an unknown story')
     return null
   }
 
   const result = validateSessionState(input, story)
+
   if (!result.ok) {
     errors.push(
       ...result.errors.map(error => `Invalid envelope state: ${error}`)
@@ -141,6 +144,7 @@ export const validateVisualNovelEnvelope = (
   const identityValues = [input.sessionId, input.storyId, input.storyVersion]
   const hasNullIdentity = identityValues.some(value => value === null)
   const hasStringIdentity = identityValues.some(value => value !== null)
+
   if (
     (hasNullIdentity && hasStringIdentity) ||
     identityValues.some(value => value !== null && !isId(value))
@@ -170,12 +174,25 @@ export const validateVisualNovelEnvelope = (
   const payload = input.payload
   const hasCompleteIdentity = identityValues.every(value => value !== null)
   const hasEmptyIdentity = identityValues.every(value => value === null)
+  const isNoActiveSessionResponse =
+    actionType === 'ERROR' &&
+    payload.code === 'NO_ACTIVE_SESSION' &&
+    hasEmptyIdentity &&
+    input.revision === -1
 
-  if (actionType !== 'STATE_REQUEST' && !hasCompleteIdentity) {
-    errors.push('Only state requests may omit session identity')
+  if (
+    actionType !== 'STATE_REQUEST' &&
+    !isNoActiveSessionResponse &&
+    !hasCompleteIdentity
+  ) {
+    errors.push('Only bootstrap messages may omit session identity')
   }
-  if (actionType !== 'STATE_REQUEST' && input.revision < 0) {
-    errors.push('Only bootstrap state requests may use revision -1')
+  if (
+    actionType !== 'STATE_REQUEST' &&
+    !isNoActiveSessionResponse &&
+    input.revision < 0
+  ) {
+    errors.push('Only bootstrap messages may use revision -1')
   }
   if (
     actionType === 'STATE_REQUEST' &&
@@ -190,6 +207,7 @@ export const validateVisualNovelEnvelope = (
   switch (actionType) {
     case 'SESSION_STARTED': {
       const state = normalizeState(payload.state, resolveStory, errors)
+
       if (state) normalizedPayload = { state }
       break
     }
@@ -210,6 +228,7 @@ export const validateVisualNovelEnvelope = (
     }
     case 'STATE_SNAPSHOT': {
       const state = normalizeState(payload.state, resolveStory, errors)
+
       if (!isId(payload.requestActionId)) {
         errors.push('Payload requestActionId is invalid')
       }
@@ -221,6 +240,7 @@ export const validateVisualNovelEnvelope = (
     case 'ADVANCE_REQUEST':
     case 'RESTART_REQUEST': {
       const expectedRevision = requireExpectedRevision(payload, errors)
+
       if (expectedRevision !== null) normalizedPayload = { expectedRevision }
       break
     }
@@ -228,11 +248,13 @@ export const validateVisualNovelEnvelope = (
     case 'RESTARTED':
     case 'SESSION_ENDED': {
       const previousRevision = requirePreviousRevision(payload, errors)
+
       if (previousRevision !== null) normalizedPayload = { previousRevision }
       break
     }
     case 'CHOICE_REQUEST': {
       const expectedRevision = requireExpectedRevision(payload, errors)
+
       if (!isId(payload.choiceId)) errors.push('Payload choiceId is invalid')
       if (expectedRevision !== null && isId(payload.choiceId)) {
         normalizedPayload = {
@@ -244,6 +266,7 @@ export const validateVisualNovelEnvelope = (
     }
     case 'CHOICE_RESOLVED': {
       const previousRevision = requirePreviousRevision(payload, errors)
+
       if (!isId(payload.choiceId)) errors.push('Payload choiceId is invalid')
       if (previousRevision !== null && isId(payload.choiceId)) {
         normalizedPayload = {
@@ -255,6 +278,7 @@ export const validateVisualNovelEnvelope = (
     }
     case 'CONTROL_CLAIMED': {
       const state = normalizeState(payload.state, resolveStory, errors)
+
       if (!isId(payload.previousControllerPeerId)) {
         errors.push('Payload previousControllerPeerId is invalid')
       }

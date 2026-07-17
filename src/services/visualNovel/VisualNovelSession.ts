@@ -12,6 +12,7 @@ import type {
   VisualNovelRuntimeSnapshot,
 } from '../../models/visualNovelProtocol'
 import { getBundledStory } from '../../stories/catalog'
+
 import { VisualNovelEngine } from './VisualNovelEngine'
 import { validateVisualNovelEnvelope } from './VisualNovelProtocol'
 import { toSnapshotState } from './VisualNovelValidator'
@@ -155,6 +156,7 @@ export class VisualNovelSession {
     if (this.state) return
 
     const story = this.dependencies.resolveStory(storyId, storyVersion)
+
     if (!story) {
       this.fail('The selected story is unavailable')
       return
@@ -212,6 +214,7 @@ export class VisualNovelSession {
   endSession = () => {
     if (!this.state || !this.isController()) return
     const previousState = this.state
+
     void this.send(
       'SESSION_ENDED',
       { previousRevision: previousState.revision },
@@ -229,6 +232,7 @@ export class VisualNovelSession {
     if (!this.state || !this.canClaimControl()) return
     const previousControllerPeerId = this.state.controllerPeerId
     const engine = this.engineForState(this.state)
+
     if (!engine) return
 
     const changed = engine.changeController(
@@ -240,6 +244,7 @@ export class VisualNovelSession {
       { previousControllerPeerId, state: toSnapshotState(changed) },
       changed
     )
+
     this.rememberAction(envelope.actionId)
     this.lastControlClaimActionId = envelope.actionId
     this.installState(changed)
@@ -251,6 +256,7 @@ export class VisualNovelSession {
 
   retryRecovery = () => {
     const target = this.state?.controllerPeerId ?? undefined
+
     this.requestSnapshot('timeout', target)
   }
 
@@ -296,19 +302,25 @@ export class VisualNovelSession {
   private lowestConnectedPeerId = () =>
     [...new Set(this.connectedPeerIds())].sort(compareId)[0]
 
-  private createEngine = (story: VisualNovelManifest) =>
-    new VisualNovelEngine(story, { now: this.dependencies.now })
+  private createEngine = (
+    story: VisualNovelManifest,
+    now: () => number = this.dependencies.now
+  ) => new VisualNovelEngine(story, { now })
 
-  private engineForState = (state: VisualNovelSessionState) => {
+  private engineForState = (
+    state: VisualNovelSessionState,
+    now: () => number = this.dependencies.now
+  ) => {
     const story = this.dependencies.resolveStory(
       state.storyId,
       state.storyVersion
     )
+
     if (!story) {
       this.fail('The room is using an unavailable story')
       return null
     }
-    return this.createEngine(story)
+    return this.createEngine(story, now)
   }
 
   private installState = (state: VisualNovelSessionState) => {
@@ -330,6 +342,7 @@ export class VisualNovelSession {
     this.seenActionOrder.push(actionId)
     while (this.seenActionOrder.length > visualNovelLimits.maxSeenActionIds) {
       const removed = this.seenActionOrder.shift()
+
       if (removed) this.seenActionIds.delete(removed)
     }
     return true
@@ -338,7 +351,8 @@ export class VisualNovelSession {
   private envelopeFor = <T extends VisualNovelActionType>(
     actionType: T,
     payload: VisualNovelPayloadByAction[T],
-    state: VisualNovelSessionState | null
+    state: VisualNovelSessionState | null,
+    timestamp: number = this.dependencies.now()
   ): VisualNovelEnvelopeFor<T> => ({
     protocol: 'visual-novel',
     protocolVersion: 1,
@@ -349,7 +363,7 @@ export class VisualNovelSession {
     storyId: state?.storyId ?? null,
     storyVersion: state?.storyVersion ?? null,
     revision: state?.revision ?? -1,
-    timestamp: this.dependencies.now(),
+    timestamp,
     payload,
   })
 
@@ -357,9 +371,11 @@ export class VisualNovelSession {
     actionType: T,
     payload: VisualNovelPayloadByAction[T],
     state: VisualNovelSessionState | null,
-    targetPeerId?: string
+    targetPeerId?: string,
+    timestamp?: number
   ) => {
-    const envelope = this.envelopeFor(actionType, payload, state)
+    const envelope = this.envelopeFor(actionType, payload, state, timestamp)
+
     this.rememberAction(envelope.actionId)
     try {
       await this.transport.send(envelope, targetPeerId)
@@ -379,6 +395,7 @@ export class VisualNovelSession {
   ) => {
     if (!this.state || this.commandRequest) return
     const envelope = this.envelopeFor(actionType, payload, this.state)
+
     this.rememberAction(envelope.actionId)
     this.error = null
 
@@ -386,6 +403,7 @@ export class VisualNovelSession {
       actionId: envelope.actionId,
       timer: 0,
     }
+
     commandRequest.timer = this.dependencies.timers.setTimeout(() => {
       if (this.commandRequest?.actionId !== commandRequest.actionId) return
       this.commandRequest = null
@@ -413,12 +431,14 @@ export class VisualNovelSession {
       peerId,
       this.dependencies.resolveStory
     )
+
     if (!result.ok) {
       console.warn('Discarded invalid visual novel message', result.errors)
       return
     }
 
     const envelope = result.value
+
     if (this.seenActionIds.has(envelope.actionId)) return
 
     if (
@@ -435,6 +455,7 @@ export class VisualNovelSession {
     }
 
     let handled = false
+
     switch (envelope.actionType) {
       case 'SESSION_STARTED':
         handled = this.receiveSessionStarted(
@@ -503,6 +524,7 @@ export class VisualNovelSession {
     envelope: VisualNovelEnvelopeFor<'SESSION_STARTED'>
   ) => {
     const incoming = envelope.payload.state
+
     if (
       incoming.revision !== 0 ||
       incoming.controllerPeerId !== envelope.senderPeerId
@@ -512,6 +534,7 @@ export class VisualNovelSession {
 
     if (this.state) {
       const decided = this.state.revision > 0
+
       if (
         decided ||
         this.state.sessionId === incoming.sessionId ||
@@ -528,7 +551,28 @@ export class VisualNovelSession {
   private receiveStateRequest = (
     envelope: VisualNovelEnvelopeFor<'STATE_REQUEST'>
   ) => {
-    if (!this.state || !this.isController()) return false
+    if (!this.state) {
+      if (
+        envelope.sessionId === null &&
+        envelope.payload.knownRevision === -1
+      ) {
+        this.clearRecovery()
+        this.phase = 'idle'
+        this.error = null
+        this.emit()
+        void this.send(
+          'ERROR',
+          {
+            code: 'NO_ACTIVE_SESSION',
+            requestActionId: envelope.actionId,
+          },
+          null,
+          envelope.senderPeerId
+        )
+      }
+      return false
+    }
+    if (!this.isController()) return false
     if (envelope.sessionId !== null && !sameSubject(this.state, envelope)) {
       return false
     }
@@ -556,6 +600,7 @@ export class VisualNovelSession {
       this.lastSnapshotRequestActionId === envelope.payload.requestActionId
     const matchesClaimCorrection =
       this.lastControlClaimActionId === envelope.payload.requestActionId
+
     if (
       !matchesActiveRequest &&
       !matchesRecentRequest &&
@@ -566,6 +611,7 @@ export class VisualNovelSession {
     const expectedTarget = matchesActiveRequest
       ? this.recovery?.targetPeerId
       : this.lastSnapshotRequestTargetPeerId
+
     if (
       !matchesClaimCorrection &&
       expectedTarget &&
@@ -575,12 +621,14 @@ export class VisualNovelSession {
     }
 
     const incoming = envelope.payload.state
+
     if (matchesClaimCorrection) {
       if (!this.state) return false
       const sameSession =
         incoming.sessionId === this.state.sessionId &&
         incoming.storyId === this.state.storyId &&
         incoming.storyVersion === this.state.storyVersion
+
       if (!sameSession) return false
       if (incoming.revision <= this.state.revision) return true
       if (this.connectedPeerIds().includes(incoming.controllerPeerId)) {
@@ -595,6 +643,7 @@ export class VisualNovelSession {
         incoming.sessionId === this.state.sessionId &&
         incoming.storyId === this.state.storyId &&
         incoming.storyVersion === this.state.storyVersion
+
       if (sameSession && incoming.revision < this.state.revision) return true
       if (!sameSession && compareStartIdentity(incoming, this.state) >= 0)
         return true
@@ -624,7 +673,8 @@ export class VisualNovelSession {
       return false
     }
 
-    const engine = this.engineForState(this.state)
+    const engine = this.engineForState(this.state, () => envelope.timestamp)
+
     if (!engine) return false
     try {
       this.installState(engine.advance(this.state))
@@ -657,7 +707,8 @@ export class VisualNovelSession {
       return false
     }
 
-    const engine = this.engineForState(this.state)
+    const engine = this.engineForState(this.state, () => envelope.timestamp)
+
     if (!engine) return false
     try {
       this.installState(engine.choose(this.state, envelope.payload.choiceId))
@@ -690,7 +741,8 @@ export class VisualNovelSession {
       return false
     }
 
-    const engine = this.engineForState(this.state)
+    const engine = this.engineForState(this.state, () => envelope.timestamp)
+
     if (!engine) return false
     this.installState(engine.restart(this.state))
     return true
@@ -754,6 +806,26 @@ export class VisualNovelSession {
   }
 
   private receiveError = (envelope: VisualNovelEnvelopeFor<'ERROR'>) => {
+    if (envelope.payload.code === 'NO_ACTIVE_SESSION') {
+      if (this.state) return false
+      const recovery = this.recovery
+
+      if (!recovery || envelope.payload.requestActionId !== recovery.actionId) {
+        return false
+      }
+      if (
+        recovery.targetPeerId &&
+        envelope.senderPeerId !== recovery.targetPeerId
+      ) {
+        return false
+      }
+      this.clearRecovery()
+      this.phase = 'idle'
+      this.error = null
+      this.emit()
+      return true
+    }
+
     if (envelope.payload.code !== 'REVISION_MISMATCH') return false
     if (this.state?.controllerPeerId !== envelope.senderPeerId) return false
     if (
@@ -793,19 +865,28 @@ export class VisualNovelSession {
   private authorizeControllerEvent = (envelope: VisualNovelActionEnvelope) =>
     Boolean(
       this.state &&
-      envelope.senderPeerId === this.state.controllerPeerId &&
-      sameSubject(this.state, envelope)
+        envelope.senderPeerId === this.state.controllerPeerId &&
+        sameSubject(this.state, envelope)
     )
 
   private commitAdvance = () => {
     if (!this.state || !this.isController()) return false
     const previousRevision = this.state.revision
-    const engine = this.engineForState(this.state)
+    const transitionTimestamp = this.dependencies.now()
+    const engine = this.engineForState(this.state, () => transitionTimestamp)
+
     if (!engine) return false
     try {
       const next = engine.advance(this.state)
+
       this.installState(next)
-      void this.send('ADVANCED', { previousRevision }, next)
+      void this.send(
+        'ADVANCED',
+        { previousRevision },
+        next,
+        undefined,
+        transitionTimestamp
+      )
       return true
     } catch (error) {
       this.fail(error instanceof Error ? error.message : 'Story advance failed')
@@ -816,12 +897,21 @@ export class VisualNovelSession {
   private commitChoice = (choiceId: string) => {
     if (!this.state || !this.isController()) return false
     const previousRevision = this.state.revision
-    const engine = this.engineForState(this.state)
+    const transitionTimestamp = this.dependencies.now()
+    const engine = this.engineForState(this.state, () => transitionTimestamp)
+
     if (!engine) return false
     try {
       const next = engine.choose(this.state, choiceId)
+
       this.installState(next)
-      void this.send('CHOICE_RESOLVED', { choiceId, previousRevision }, next)
+      void this.send(
+        'CHOICE_RESOLVED',
+        { choiceId, previousRevision },
+        next,
+        undefined,
+        transitionTimestamp
+      )
       return true
     } catch (error) {
       this.fail(error instanceof Error ? error.message : 'Choice failed')
@@ -832,11 +922,20 @@ export class VisualNovelSession {
   private commitRestart = () => {
     if (!this.state || !this.isController()) return false
     const previousRevision = this.state.revision
-    const engine = this.engineForState(this.state)
+    const transitionTimestamp = this.dependencies.now()
+    const engine = this.engineForState(this.state, () => transitionTimestamp)
+
     if (!engine) return false
     const next = engine.restart(this.state)
+
     this.installState(next)
-    void this.send('RESTARTED', { previousRevision }, next)
+    void this.send(
+      'RESTARTED',
+      { previousRevision },
+      next,
+      undefined,
+      transitionTimestamp
+    )
     return true
   }
 
@@ -865,6 +964,7 @@ export class VisualNovelSession {
       },
       this.state
     )
+
     this.rememberAction(envelope.actionId)
     this.lastSnapshotRequestActionId = envelope.actionId
     this.lastSnapshotRequestTargetPeerId = targetPeerId ?? null
@@ -876,6 +976,7 @@ export class VisualNovelSession {
       targetPeerId: targetPeerId ?? null,
       timer: 0,
     }
+
     recovery.timer = this.dependencies.timers.setTimeout(() => {
       if (this.recovery?.actionId !== recovery.actionId) return
       this.recovery = null

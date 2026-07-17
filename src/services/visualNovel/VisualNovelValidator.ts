@@ -8,6 +8,7 @@ import type {
   VisualNovelSessionState,
   VisualNovelValue,
 } from '../../models/visualNovel'
+
 import {
   isId,
   isRecord,
@@ -61,6 +62,7 @@ export const validateSessionState = (
 ): ValidationResult<VisualNovelSessionState> => {
   const errors: string[] = []
   const warnings: string[] = []
+
   if (!isRecord(input)) {
     return { ok: false, errors: ['State must be an object'], warnings }
   }
@@ -86,6 +88,7 @@ export const validateSessionState = (
   }
 
   const variables: Record<string, VisualNovelValue> = {}
+
   if (!isRecord(input.variables)) {
     errors.push('Invalid state.variables')
   } else if (
@@ -103,6 +106,7 @@ export const validateSessionState = (
   }
 
   const history: VisualNovelHistoryEntry[] = []
+
   if (!Array.isArray(input.history)) {
     errors.push('Invalid state.history')
   } else if (input.history.length > visualNovelLimits.maxHistoryEntries) {
@@ -110,6 +114,7 @@ export const validateSessionState = (
   } else {
     input.history.forEach((item, index) => {
       const normalized = historyEntry(item, index, errors)
+
       if (normalized) history.push(normalized)
     })
     if (
@@ -136,6 +141,7 @@ export const validateSessionState = (
     const currentScene = isId(input.sceneId)
       ? story.scenes[input.sceneId]
       : undefined
+
     if (!currentScene) {
       errors.push('State scene does not exist')
     } else if (
@@ -149,6 +155,7 @@ export const validateSessionState = (
       const priorEntry = priorScene?.dialogue.find(
         entry => entry.id === item.dialogueEntryId
       )
+
       if (!priorEntry) {
         errors.push('State history references an unknown entry')
       } else if (

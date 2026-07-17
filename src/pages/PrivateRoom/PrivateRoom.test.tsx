@@ -1,12 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { PropsWithChildren } from 'react'
-import {
-  MemoryRouter,
-  Route,
-  Routes,
-  useNavigate,
-} from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { ShellContext, ShellContextProps } from 'contexts/ShellContext'

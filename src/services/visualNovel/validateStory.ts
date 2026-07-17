@@ -12,6 +12,7 @@ import type {
   VisualNovelScene,
   VisualNovelTransition,
 } from '../../models/visualNovel'
+
 import type { ValidationResult } from './VisualNovelValidator'
 import {
   isId,
@@ -36,6 +37,7 @@ export const validateAssetPath = (
   applicationOrigin: string
 ): ValidationResult<string> => {
   const warnings: string[] = []
+
   if (!isString(input, 1024)) {
     return { ok: false, errors: ['Invalid asset path'], warnings }
   }
@@ -52,6 +54,7 @@ export const validateAssetPath = (
     const extension = url.pathname
       .slice(url.pathname.lastIndexOf('.'))
       .toLowerCase()
+
     if (url.origin !== expectedOrigin) {
       return {
         ok: false,
@@ -165,6 +168,7 @@ const transition = (
   const dialogueEntryId = isId(input.dialogueEntryId)
     ? input.dialogueEntryId
     : undefined
+
   if (!sceneId && !dialogueEntryId) {
     errors.push(`${path} must select a scene or entry`)
     return null
@@ -207,6 +211,7 @@ const choice = (
         .map((item, index) => effect(item, `${path}.effects[${index}]`, errors))
         .filter((item): item is VisualNovelEffect => item !== null)
     : []
+
   return {
     id: input.id,
     label: input.label,
@@ -254,6 +259,7 @@ const entry = (
         .map((item, index) => choice(item, `${path}.choices[${index}]`, errors))
         .filter((item): item is VisualNovelChoice => item !== null)
     : []
+
   if (choices.length > visualNovelLimits.maxChoicesPerEntry) {
     errors.push(`${path}.choices exceeds the limit`)
   }
@@ -308,6 +314,7 @@ const scene = (
   const dialogue = input.dialogue
     .map((item, index) => entry(item, `${path}.dialogue[${index}]`, errors))
     .filter((item): item is VisualNovelDialogueEntry => item !== null)
+
   if (
     Array.isArray(input.characters) &&
     input.characters.length > visualNovelLimits.maxCharactersPerScene
@@ -322,6 +329,7 @@ const scene = (
         )
         .filter((item): item is VisualNovelCharacterPlacement => item !== null)
     : []
+
   return {
     id: input.id,
     ...(isId(input.background) ? { background: input.background } : {}),
@@ -337,6 +345,7 @@ export const validateStory = (
 ): ValidationResult<VisualNovelManifest> => {
   const errors: string[] = []
   const warnings: string[] = []
+
   if (utf8ByteLength(input) > visualNovelLimits.maxStoryBytes) {
     return { ok: false, errors: ['Story is too large'], warnings }
   }
@@ -357,6 +366,7 @@ export const validateStory = (
   if (!isId(input.startSceneId)) errors.push('Invalid story.startSceneId')
 
   const assets: Record<string, string> = {}
+
   if (isRecord(input.assets)) {
     if (Object.keys(input.assets).length > visualNovelLimits.maxAssets) {
       errors.push('Story has too many assets')
@@ -365,6 +375,7 @@ export const validateStory = (
       .slice(0, visualNovelLimits.maxAssets + 1)
       .forEach(([assetId, assetPath]) => {
         const result = validateAssetPath(assetPath, applicationOrigin)
+
         if (!isId(assetId) || !result.ok) {
           errors.push(`Invalid asset: ${assetId}`)
         } else {
@@ -376,6 +387,7 @@ export const validateStory = (
   }
 
   const scenes: Record<string, VisualNovelScene> = {}
+
   if (!isRecord(input.scenes)) {
     errors.push('Invalid story.scenes')
   } else if (
@@ -386,6 +398,7 @@ export const validateStory = (
   } else {
     Object.entries(input.scenes).forEach(([sceneId, value]) => {
       const normalized = scene(value, `scenes.${sceneId}`, errors)
+
       if (!normalized) return
       if (normalized.id !== sceneId) {
         errors.push(`Scene key ${sceneId} does not match scene.id`)
@@ -398,6 +411,7 @@ export const validateStory = (
   const entryIds = new Set<string>()
   const choiceIds = new Set<string>()
   const assetIds = new Set(Object.keys(assets))
+
   Object.values(scenes).forEach(currentScene => {
     for (const assetId of [currentScene.background, currentScene.music]) {
       if (assetId && !assetIds.has(assetId)) {
@@ -454,6 +468,7 @@ export const validateStory = (
         const targetScene = currentEntry.next.sceneId
           ? scenes[currentEntry.next.sceneId]
           : currentScene
+
         if (!targetScene) {
           errors.push(`Entry ${currentEntry.id} targets unknown scene`)
         } else if (

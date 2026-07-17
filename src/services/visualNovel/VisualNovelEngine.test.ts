@@ -1,5 +1,6 @@
 import type { VisualNovelManifest } from '../../models/visualNovel'
 import { getBundledStories } from '../../stories/catalog'
+
 import { VisualNovelEngine, VisualNovelEngineError } from './VisualNovelEngine'
 
 const story = getBundledStories()[0]

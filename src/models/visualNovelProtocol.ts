@@ -16,10 +16,8 @@ export type VisualNovelActionType =
 
 export type VisualNovelRecoveryReason = 'join' | 'gap' | 'timeout'
 
-export interface VisualNovelActionEnvelope<T = any> extends Record<
-  string,
-  any
-> {
+export interface VisualNovelActionEnvelope<T = any>
+  extends Record<string, any> {
   protocol: 'visual-novel'
   protocolVersion: 1
   actionId: string
@@ -61,7 +59,12 @@ export type VisualNovelEnvelopeFor<T extends VisualNovelActionType> =
   VisualNovelActionEnvelope<VisualNovelPayloadByAction[T]> & { actionType: T }
 
 export type VisualNovelRuntimePhase =
-  'idle' | 'syncing' | 'active' | 'paused' | 'ended' | 'error'
+  | 'idle'
+  | 'syncing'
+  | 'active'
+  | 'paused'
+  | 'ended'
+  | 'error'
 
 export interface VisualNovelRuntimeSnapshot {
   phase: VisualNovelRuntimePhase

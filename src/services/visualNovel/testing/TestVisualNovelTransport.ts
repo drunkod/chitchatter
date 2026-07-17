@@ -30,6 +30,7 @@ export class TestVisualNovelNetwork {
 
     const transport = new TestVisualNovelTransport(this, peerId)
     const existing = [...this.transports.values()]
+
     this.transports.set(peerId, transport)
     existing.forEach(item => item.emitPeerJoin(peerId))
     return transport
@@ -65,6 +66,7 @@ export class TestVisualNovelNetwork {
 
     for (const toPeerId of targets) {
       const target = this.transports.get(toPeerId)
+
       if (!target) continue
       this.sentMessages.push({
         envelope: structuredClone(envelope),
@@ -85,8 +87,10 @@ export class TestVisualNovelNetwork {
 
   async replayMessage(index: number) {
     const message = this.sentMessages[index]
+
     if (!message) throw new Error('Unknown test message')
     const target = this.transports.get(message.toPeerId)
+
     await target?.emitMessage(
       structuredClone(message.envelope),
       message.fromPeerId

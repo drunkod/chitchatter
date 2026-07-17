@@ -5,6 +5,7 @@ import {
 } from '../../lib/PeerRoom'
 import type { VisualNovelActionEnvelope } from '../../models/visualNovelProtocol'
 import { PeerAction } from '../../models/network'
+
 import type { VisualNovelTransport } from './VisualNovelTransport'
 
 export class PeerRoomVisualNovelTransport implements VisualNovelTransport {
@@ -18,6 +19,7 @@ export class PeerRoomVisualNovelTransport implements VisualNovelTransport {
         PeerAction.VISUAL_NOVEL,
         ActionNamespace.GROUP
       )
+
     this.sendAction = sendAction
     this.connectReceiver = connectReceiver
   }

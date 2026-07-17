@@ -1,11 +1,5 @@
 import { useDebounce } from '@react-hook/debounce'
-import {
-  SetStateAction,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-} from 'react'
+import { SetStateAction, useContext, useEffect, useMemo, useState } from 'react'
 import { v4 as uuid } from 'uuid'
 
 import { getPeerName, usePeerNameDisplay } from 'components/PeerNameDisplay'
@@ -26,10 +20,8 @@ import {
   AudioChannelName,
   AudioState,
   FileOfferMetadata,
-  InlineMedia,
   isInlineMedia,
   isMessageReceived,
-  Message,
   Peer,
   PeerVerificationState,
   ReceivedInlineMedia,
@@ -480,10 +472,7 @@ export function useRoom(
 
     setIsTyping(false)
     setIsMessageSending(true)
-    setMessageLog(previousMessageLog => [
-      ...previousMessageLog,
-      unsentMessage,
-    ])
+    setMessageLog(previousMessageLog => [...previousMessageLog, unsentMessage])
 
     try {
       await sendPeerMessage(

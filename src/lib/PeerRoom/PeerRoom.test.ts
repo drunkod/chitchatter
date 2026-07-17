@@ -7,7 +7,9 @@ import { ActionNamespace, PeerRoom } from './PeerRoom'
 const mocks = vi.hoisted(() => {
   const action = {
     send: vi.fn(),
-    onMessage: null as ((data: { value: string }, context: { peerId: string }) => void) | null,
+    onMessage: null as
+      | ((data: { value: string }, context: { peerId: string }) => void)
+      | null,
     onReceiveProgress: null,
   }
 
@@ -41,7 +43,7 @@ describe('PeerRoom', () => {
   })
 
   test('disconnects only the receiver associated with an unsubscribe callback', () => {
-    const peerRoom = new PeerRoom({}, 'room-id')
+    const peerRoom = new PeerRoom({ appId: 'test-app' }, 'room-id')
     const [, connectReceiver] = peerRoom.makeAction<{ value: string }>(
       PeerAction.MESSAGE,
       ActionNamespace.DIRECT_MESSAGE

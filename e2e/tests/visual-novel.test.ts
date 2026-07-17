@@ -3,6 +3,7 @@ import { BrowserContext, Page, expect, test } from '@playwright/test'
 import {
   joinExistingRoom,
   joinPublicRoom,
+  waitForPeerConnected,
   waitForPeerMessage,
 } from '../helpers/test-helpers'
 
@@ -29,12 +30,15 @@ test.describe('Novella MVP', () => {
         permissions: ['camera', 'microphone'],
       })
       const controller = await controllerContext.newPage()
-      const { roomUrl } = await joinPublicRoom(controller)
+      const { roomUrl, userId: controllerUserId } =
+        await joinPublicRoom(controller)
 
       participantContext = await browser.newContext()
       const participant = await participantContext.newPage()
       const participantUserId = await joinExistingRoom(participant, roomUrl)
 
+      await waitForPeerConnected(controller, participantUserId)
+      await waitForPeerConnected(participant, controllerUserId)
       await waitForPeerMessage(
         controller,
         participant,
@@ -158,7 +162,8 @@ test.describe('Novella MVP', () => {
     try {
       controllerContext = await browser.newContext()
       const controller = await controllerContext.newPage()
-      const { roomUrl } = await joinPublicRoom(controller)
+      const { roomUrl, userId: controllerUserId } =
+        await joinPublicRoom(controller)
 
       await expect(novella(controller)).toBeVisible()
       await controller.getByRole('button', { name: 'Start story' }).click()
@@ -176,7 +181,10 @@ test.describe('Novella MVP', () => {
       participantContext = await browser.newContext()
       const participant = await participantContext.newPage()
 
-      await joinExistingRoom(participant, roomUrl)
+      const participantUserId = await joinExistingRoom(participant, roomUrl)
+
+      await waitForPeerConnected(controller, participantUserId)
+      await waitForPeerConnected(participant, controllerUserId)
       await expectDialogue(
         participant,
         'The lens catches, then floods the water with gold.'
@@ -184,6 +192,7 @@ test.describe('Novella MVP', () => {
 
       await participant.reload()
       await participant.waitForLoadState('networkidle')
+      await waitForPeerConnected(participant, controllerUserId)
       await expectDialogue(
         participant,
         'The lens catches, then floods the water with gold.'

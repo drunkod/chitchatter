@@ -38,6 +38,7 @@ export class VisualNovelEngine {
     this.assertIdentifier(controllerPeerId, 'controllerPeerId')
     const scene = this.requireScene(this.story.startSceneId)
     const entry = scene.dialogue[0]
+
     if (!entry) {
       throw new VisualNovelEngineError(
         'EMPTY_START_SCENE',
@@ -80,6 +81,7 @@ export class VisualNovelEngine {
 
   isChoiceDeadEnd(state: VisualNovelSessionState): boolean {
     const entry = this.getEntry(state)
+
     return (
       (entry.choices ?? []).length > 0 &&
       this.getAvailableChoices(state).length === 0
@@ -88,20 +90,23 @@ export class VisualNovelEngine {
 
   canAdvance(state: VisualNovelSessionState): boolean {
     const entry = this.getEntry(state)
+
     if (this.getAvailableChoices(state).length > 0) return false
     if ((entry.choices ?? []).length > 0) return false
 
     const scene = this.getScene(state)
     const currentIndex = scene.dialogue.findIndex(item => item.id === entry.id)
+
     return Boolean(
       entry.next?.sceneId ||
-      entry.next?.dialogueEntryId ||
-      scene.dialogue[currentIndex + 1]
+        entry.next?.dialogueEntryId ||
+        scene.dialogue[currentIndex + 1]
     )
   }
 
   isAtEnd(state: VisualNovelSessionState): boolean {
     const entry = this.getEntry(state)
+
     return (
       (entry.choices ?? []).length === 0 &&
       this.getAvailableChoices(state).length === 0 &&
@@ -111,6 +116,7 @@ export class VisualNovelEngine {
 
   advance(state: VisualNovelSessionState): VisualNovelSessionState {
     const entry = this.getEntry(state)
+
     if (this.getAvailableChoices(state).length > 0) {
       throw new VisualNovelEngineError(
         'CHOICE_REQUIRED',
@@ -155,6 +161,7 @@ export class VisualNovelEngine {
     const choice = this.getAvailableChoices(state).find(
       item => item.id === choiceId
     )
+
     if (!choice) {
       throw new VisualNovelEngineError(
         'CHOICE_UNAVAILABLE',
@@ -163,6 +170,7 @@ export class VisualNovelEngine {
     }
     const nextScene = this.requireScene(choice.nextSceneId)
     const firstEntry = nextScene.dialogue[0]
+
     if (!firstEntry) {
       throw new VisualNovelEngineError(
         'EMPTY_TARGET_SCENE',
@@ -184,6 +192,7 @@ export class VisualNovelEngine {
   restart(state: VisualNovelSessionState): VisualNovelSessionState {
     this.assertCompatible(state)
     const initial = this.start(state.sessionId, state.controllerPeerId)
+
     return {
       ...initial,
       revision: state.revision + 1,
@@ -220,6 +229,7 @@ export class VisualNovelEngine {
     const variables = options.variables
       ? { ...options.variables }
       : { ...state.variables }
+
     this.assertVariables(variables)
 
     const history = [
@@ -304,6 +314,7 @@ export class VisualNovelEngine {
 
   private requireScene(sceneId: string): VisualNovelScene {
     const scene = this.story.scenes[sceneId]
+
     if (!scene) {
       throw new VisualNovelEngineError(
         'SCENE_NOT_FOUND',
@@ -320,6 +331,7 @@ export class VisualNovelEngine {
     const entry = this.requireScene(sceneId).dialogue.find(
       item => item.id === entryId
     )
+
     if (!entry) {
       throw new VisualNovelEngineError(
         'ENTRY_NOT_FOUND',
@@ -334,6 +346,7 @@ export class VisualNovelEngine {
     condition: VisualNovelCondition
   ): boolean {
     const actual = variables[condition.variable]
+
     switch (condition.operator) {
       case 'eq':
         return actual === condition.value
@@ -374,6 +387,7 @@ export class VisualNovelEngine {
       return { ...variables, [effect.variable]: effect.value }
     }
     const current = variables[effect.variable]
+
     if (current !== undefined && typeof current !== 'number') {
       throw new VisualNovelEngineError(
         'INVALID_INCREMENT',
@@ -381,6 +395,7 @@ export class VisualNovelEngine {
       )
     }
     const value = (current ?? 0) + effect.amount
+
     if (!Number.isFinite(value)) {
       throw new VisualNovelEngineError(
         'INVALID_INCREMENT',

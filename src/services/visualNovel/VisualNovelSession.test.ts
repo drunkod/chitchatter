@@ -1,4 +1,5 @@
 import { getBundledStory } from '../../stories/catalog'
+
 import { VisualNovelEngine } from './VisualNovelEngine'
 import { VisualNovelSession } from './VisualNovelSession'
 import { TestVisualNovelNetwork } from './testing/TestVisualNovelTransport'
@@ -10,6 +11,7 @@ const settle = async () => {
 
 const makeDependencies = (peerId: string) => {
   let id = 0
+
   return {
     createId: () => `${peerId}-${++id}`,
     now: () => 1000 + id,
@@ -25,6 +27,7 @@ const makeDependencies = (peerId: string) => {
 
 const createStartedState = (controllerPeerId: string, sessionId: string) => {
   const story = getBundledStory('harbour-lights', '1.0.0')
+
   if (!story) throw new Error('Missing test story')
   return new VisualNovelEngine(story, { now: () => 1000 }).start(
     sessionId,
@@ -42,12 +45,33 @@ const connectPair = () => {
     network.createTransport('peer-b'),
     makeDependencies('b')
   )
+
   a.connect()
   b.connect()
   return { network, a, b }
 }
 
 describe('VisualNovelSession', () => {
+  it('leaves idle peers ready to start after checking for an active session', async () => {
+    const { a, b } = connectPair()
+
+    await settle()
+
+    expect(a.getSnapshot()).toMatchObject({
+      phase: 'idle',
+      pendingRequest: false,
+      state: null,
+    })
+    expect(b.getSnapshot()).toMatchObject({
+      phase: 'idle',
+      pendingRequest: false,
+      state: null,
+    })
+
+    a.destroy()
+    b.destroy()
+  })
+
   it('round-trips participant actions through the controller', async () => {
     const { a, b } = connectPair()
 
@@ -75,6 +99,7 @@ describe('VisualNovelSession', () => {
 
   it('recovers a late joiner with a targeted snapshot', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     b.requestAdvance()
     await settle()
@@ -83,6 +108,7 @@ describe('VisualNovelSession', () => {
       network.createTransport('peer-c'),
       makeDependencies('c')
     )
+
     c.connect()
     await settle()
 
@@ -96,6 +122,7 @@ describe('VisualNovelSession', () => {
 
   it('requests a snapshot after a revision gap', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
 
@@ -125,6 +152,7 @@ describe('VisualNovelSession', () => {
       network.createTransport('peer-c'),
       makeDependencies('c')
     )
+
     c.connect()
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
@@ -179,6 +207,7 @@ describe('VisualNovelSession', () => {
           message.fromPeerId === 'peer-b' &&
           message.toPeerId === 'peer-a'
       )
+
     expect(delayedStartIndex).toBeGreaterThanOrEqual(0)
     await network.replayMessage(delayedStartIndex)
     expect(a.getSnapshot().state).toEqual(b.getSnapshot().state)
@@ -189,17 +218,20 @@ describe('VisualNovelSession', () => {
 
   it('keeps a progressed session when a lower start arrives late', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     a.requestAdvance()
     await settle()
 
     const decided = b.getSnapshot().state
+
     expect(decided?.revision).toBe(1)
 
     b.startStory('harbour-lights', '1.0.0', 'session-0')
     expect(b.getSnapshot().state).toEqual(decided)
 
     const lateStart = createStartedState('peer-0', 'session-0')
+
     await network.send(
       'peer-0',
       {
@@ -227,6 +259,7 @@ describe('VisualNovelSession', () => {
 
   it('ignores duplicate action delivery', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     b.requestAdvance()
     await settle()
@@ -237,6 +270,7 @@ describe('VisualNovelSession', () => {
         message.envelope.actionType === 'ADVANCED' &&
         message.toPeerId === 'peer-b'
     )
+
     expect(advancedIndex).toBeGreaterThanOrEqual(0)
     await network.replayMessage(advancedIndex)
 
@@ -249,6 +283,7 @@ describe('VisualNovelSession', () => {
   it('surfaces snapshot request timeout', () => {
     let timeoutHandler: () => void = () => undefined
     const network = new TestVisualNovelNetwork()
+
     network.createTransport('silent-peer')
     const session = new VisualNovelSession(network.createTransport('peer-a'), {
       ...makeDependencies('a'),
@@ -290,6 +325,7 @@ describe('VisualNovelSession', () => {
         clearTimeout: () => undefined,
       },
     })
+
     a.connect()
     b.connect()
     a.startStory('harbour-lights', '1.0.0', 'session-a')
@@ -317,6 +353,7 @@ describe('VisualNovelSession', () => {
 
   it('resumes when the departed controller rejoins before a claim', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
 
@@ -339,6 +376,7 @@ describe('VisualNovelSession', () => {
       network.createTransport('peer-c'),
       makeDependencies('c')
     )
+
     c.connect()
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
@@ -392,6 +430,7 @@ describe('VisualNovelSession', () => {
   it('recovers a null-state peer after it overhears live traffic', async () => {
     let timeoutHandler: () => void = () => undefined
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
     network.disconnect('peer-a')
@@ -407,6 +446,7 @@ describe('VisualNovelSession', () => {
         clearTimeout: () => undefined,
       },
     })
+
     c.connect()
     timeoutHandler()
     expect(c.getSnapshot()).toMatchObject({ phase: 'idle', state: null })
@@ -436,6 +476,7 @@ describe('VisualNovelSession', () => {
 
   it('ends a behind replica without requesting an impossible snapshot', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
 
@@ -466,11 +507,13 @@ describe('VisualNovelSession', () => {
 
   it('ignores stale canonical replay without requesting a snapshot', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     b.requestAdvance()
     await settle()
 
     const state = b.getSnapshot().state
+
     expect(state?.revision).toBe(1)
     if (!state) return
     const requestsBefore = network
@@ -507,6 +550,7 @@ describe('VisualNovelSession', () => {
           message.envelope.actionType === 'STATE_REQUEST' &&
           message.fromPeerId === 'peer-b'
       ).length
+
     expect(requestsAfter).toBe(requestsBefore)
     expect(b.getSnapshot().state?.revision).toBe(1)
 
@@ -516,10 +560,12 @@ describe('VisualNovelSession', () => {
 
   it('does not suppress an out-of-order event before it can apply', async () => {
     const { network, a, b } = connectPair()
+
     a.startStory('harbour-lights', '1.0.0', 'session-a')
     await settle()
 
     const state = a.getSnapshot().state
+
     expect(state).not.toBeNull()
     if (!state) return
     const restarted = {
