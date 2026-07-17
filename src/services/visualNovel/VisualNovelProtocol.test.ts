@@ -51,6 +51,43 @@ describe('VisualNovelProtocol', () => {
     expect(result).toMatchObject({ ok: true })
   })
 
+  it('rejects no-active-session responses without a request action ID', () => {
+    const result = validateVisualNovelEnvelope(
+      {
+        ...bootstrapRequest,
+        actionId: 'response-1',
+        actionType: 'ERROR',
+        payload: { code: 'NO_ACTIVE_SESSION' },
+      },
+      'peer-a',
+      resolveStory
+    )
+
+    expect(result).toMatchObject({ ok: false })
+    if (result.ok) return
+    expect(result.errors).toContain('Payload requestActionId is invalid')
+  })
+
+  it('rejects unknown error codes', () => {
+    const result = validateVisualNovelEnvelope(
+      {
+        ...bootstrapRequest,
+        actionId: 'response-1',
+        actionType: 'ERROR',
+        payload: {
+          code: 'UNKNOWN_ERROR',
+          requestActionId: bootstrapRequest.actionId,
+        },
+      },
+      'peer-a',
+      resolveStory
+    )
+
+    expect(result).toMatchObject({ ok: false })
+    if (result.ok) return
+    expect(result.errors).toContain('Payload error code is invalid')
+  })
+
   it('rejects sender identity mismatches', () => {
     const result = validateVisualNovelEnvelope(
       bootstrapRequest,

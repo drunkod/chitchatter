@@ -291,19 +291,18 @@ export const validateVisualNovelEnvelope = (
       break
     }
     case 'ERROR': {
-      if (!isId(payload.code)) errors.push('Payload error code is invalid')
-      if (
-        payload.requestActionId !== undefined &&
-        !isId(payload.requestActionId)
-      ) {
+      const isKnownErrorCode =
+        payload.code === 'NO_ACTIVE_SESSION' ||
+        payload.code === 'REVISION_MISMATCH'
+
+      if (!isKnownErrorCode) errors.push('Payload error code is invalid')
+      if (!isId(payload.requestActionId)) {
         errors.push('Payload requestActionId is invalid')
       }
-      if (isId(payload.code)) {
+      if (isKnownErrorCode && isId(payload.requestActionId)) {
         normalizedPayload = {
           code: payload.code,
-          ...(isId(payload.requestActionId)
-            ? { requestActionId: payload.requestActionId }
-            : {}),
+          requestActionId: payload.requestActionId,
         }
       }
       break

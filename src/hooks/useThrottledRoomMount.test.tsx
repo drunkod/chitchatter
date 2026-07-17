@@ -219,6 +219,25 @@ describe('useThrottledRoomMount', () => {
     expect(result.current).toBe(true)
   })
 
+  test('does not reuse an old allowance when returning to a room', () => {
+    const baseTime = 1000000
+
+    vi.setSystemTime(baseTime)
+
+    const { result, rerender } = renderHook(
+      ({ roomId }) => useThrottledRoomMount(roomId),
+      { initialProps: { roomId: 'room-a' } }
+    )
+
+    expect(result.current).toBe(true)
+
+    rerender({ roomId: 'room-b' })
+    expect(result.current).toBe(false)
+
+    rerender({ roomId: 'room-a' })
+    expect(result.current).toBe(false)
+  })
+
   test('schedules backoff reset after successful mount', async () => {
     const { result } = renderHook(() => useThrottledRoomMount('room1'))
 

@@ -31,6 +31,16 @@ export interface VisualNovelActionEnvelope<T = any>
   payload: T
 }
 
+export type VisualNovelErrorPayload =
+  | {
+      code: 'NO_ACTIVE_SESSION'
+      requestActionId: string
+    }
+  | {
+      code: 'REVISION_MISMATCH'
+      requestActionId: string
+    }
+
 export type VisualNovelPayloadByAction = {
   SESSION_STARTED: { state: VisualNovelSessionState }
   STATE_REQUEST: {
@@ -52,7 +62,7 @@ export type VisualNovelPayloadByAction = {
     previousControllerPeerId: string
     state: VisualNovelSessionState
   }
-  ERROR: { code: string; requestActionId?: string }
+  ERROR: VisualNovelErrorPayload
 }
 
 export type VisualNovelEnvelopeFor<T extends VisualNovelActionType> =

@@ -72,6 +72,147 @@ describe('VisualNovelSession', () => {
     b.destroy()
   })
 
+  it('keeps recovery active after another bootstrapper reports no state', async () => {
+    const network = new TestVisualNovelNetwork()
+    const controller = new VisualNovelSession(
+      network.createTransport('peer-a'),
+      makeDependencies('a')
+    )
+
+    controller.connect()
+    controller.startStory('harbour-lights', '1.0.0', 'session-a')
+    controller.requestAdvance()
+    await settle()
+
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'STATE_SNAPSHOT' &&
+        fromPeerId === 'peer-a' &&
+        toPeerId === 'peer-b'
+    )
+    const b = new VisualNovelSession(
+      network.createTransport('peer-b'),
+      makeDependencies('b')
+    )
+
+    b.connect()
+    await settle()
+    expect(b.getSnapshot()).toMatchObject({
+      state: null,
+      pendingRequest: true,
+    })
+
+    const c = new VisualNovelSession(
+      network.createTransport('peer-c'),
+      makeDependencies('c')
+    )
+
+    c.connect()
+    await settle()
+
+    expect(b.getSnapshot().pendingRequest).toBe(true)
+    expect(c.getSnapshot().state).toEqual(controller.getSnapshot().state)
+
+    const snapshotIndex = network
+      .getSentMessages()
+      .findIndex(
+        message =>
+          message.envelope.actionType === 'STATE_SNAPSHOT' &&
+          message.fromPeerId === 'peer-a' &&
+          message.toPeerId === 'peer-b'
+      )
+
+    await network.replayMessage(snapshotIndex)
+    expect(b.getSnapshot().state).toEqual(controller.getSnapshot().state)
+
+    controller.destroy()
+    b.destroy()
+    c.destroy()
+  })
+
+  it('waits for every expected peer before concluding the room is empty', async () => {
+    const network = new TestVisualNovelNetwork()
+    const controller = new VisualNovelSession(
+      network.createTransport('peer-a'),
+      makeDependencies('a')
+    )
+
+    controller.connect()
+    controller.startStory('harbour-lights', '1.0.0', 'session-a')
+    controller.requestAdvance()
+    await settle()
+
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'STATE_SNAPSHOT' &&
+        fromPeerId === 'peer-a' &&
+        toPeerId === 'peer-c'
+    )
+    const emptyPeer = new VisualNovelSession(
+      network.createTransport('peer-c'),
+      makeDependencies('c')
+    )
+
+    emptyPeer.connect()
+    await settle()
+    expect(emptyPeer.getSnapshot().state).toBeNull()
+
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'STATE_SNAPSHOT' &&
+        fromPeerId === 'peer-a' &&
+        toPeerId === 'peer-b'
+    )
+    const b = new VisualNovelSession(
+      network.createTransport('peer-b'),
+      makeDependencies('b')
+    )
+
+    b.connect()
+    await settle()
+
+    expect(b.getSnapshot()).toMatchObject({
+      phase: 'syncing',
+      pendingRequest: true,
+      state: null,
+    })
+
+    controller.destroy()
+    emptyPeer.destroy()
+    b.destroy()
+  })
+
+  it('completes empty recovery after the remaining expected peer leaves', async () => {
+    const network = new TestVisualNovelNetwork()
+
+    network.createTransport('silent-peer')
+    const emptyPeer = new VisualNovelSession(
+      network.createTransport('peer-c'),
+      makeDependencies('c')
+    )
+
+    emptyPeer.connect()
+    const b = new VisualNovelSession(
+      network.createTransport('peer-b'),
+      makeDependencies('b')
+    )
+
+    b.connect()
+    await settle()
+    expect(b.getSnapshot().pendingRequest).toBe(true)
+
+    network.disconnect('silent-peer')
+
+    expect(b.getSnapshot()).toMatchObject({
+      phase: 'idle',
+      pendingRequest: false,
+      state: null,
+    })
+
+    emptyPeer.destroy()
+    b.destroy()
+  })
+
   it('round-trips participant actions through the controller', async () => {
     const { a, b } = connectPair()
 
@@ -255,6 +396,56 @@ describe('VisualNovelSession', () => {
 
     a.destroy()
     b.destroy()
+  })
+
+  it('accepts a progressed snapshot over a local revision-zero start', async () => {
+    const network = new TestVisualNovelNetwork()
+    const controller = new VisualNovelSession(
+      network.createTransport('peer-z'),
+      makeDependencies('z')
+    )
+
+    controller.connect()
+    controller.startStory('harbour-lights', '1.0.0', 'session-z')
+    controller.requestAdvance()
+    await settle()
+
+    network.dropNext(
+      (envelope, fromPeerId, toPeerId) =>
+        envelope.actionType === 'STATE_SNAPSHOT' &&
+        fromPeerId === 'peer-z' &&
+        toPeerId === 'peer-a'
+    )
+    const participant = new VisualNovelSession(
+      network.createTransport('peer-a'),
+      makeDependencies('a')
+    )
+
+    participant.connect()
+    await settle()
+    participant.startStory('harbour-lights', '1.0.0', 'session-a')
+    expect(participant.getSnapshot().state).toMatchObject({
+      controllerPeerId: 'peer-a',
+      revision: 0,
+    })
+
+    const snapshotIndex = network
+      .getSentMessages()
+      .findIndex(
+        message =>
+          message.envelope.actionType === 'STATE_SNAPSHOT' &&
+          message.fromPeerId === 'peer-z' &&
+          message.toPeerId === 'peer-a'
+      )
+
+    await network.replayMessage(snapshotIndex)
+
+    expect(participant.getSnapshot().state).toEqual(
+      controller.getSnapshot().state
+    )
+
+    controller.destroy()
+    participant.destroy()
   })
 
   it('ignores duplicate action delivery', async () => {

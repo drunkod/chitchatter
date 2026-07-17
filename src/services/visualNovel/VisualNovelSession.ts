@@ -41,6 +41,8 @@ interface CommandRequest {
 interface RecoveryRequest {
   actionId: string
   targetPeerId: string | null
+  expectedPeerIds: Set<string>
+  noSessionPeerIds: Set<string>
   timer: unknown
 }
 
@@ -556,10 +558,6 @@ export class VisualNovelSession {
         envelope.sessionId === null &&
         envelope.payload.knownRevision === -1
       ) {
-        this.clearRecovery()
-        this.phase = 'idle'
-        this.error = null
-        this.emit()
         void this.send(
           'ERROR',
           {
@@ -569,6 +567,11 @@ export class VisualNovelSession {
           null,
           envelope.senderPeerId
         )
+
+        if (this.recovery?.expectedPeerIds.has(envelope.senderPeerId)) {
+          this.recovery.noSessionPeerIds.add(envelope.senderPeerId)
+          this.completeEmptyRecoveryIfReady()
+        }
       }
       return false
     }
@@ -644,9 +647,20 @@ export class VisualNovelSession {
         incoming.storyId === this.state.storyId &&
         incoming.storyVersion === this.state.storyVersion
 
-      if (sameSession && incoming.revision < this.state.revision) return true
-      if (!sameSession && compareStartIdentity(incoming, this.state) >= 0)
-        return true
+      if (sameSession) {
+        if (incoming.revision < this.state.revision) return true
+      } else {
+        const localDecided = this.state.revision > 0
+        const incomingDecided = incoming.revision > 0
+
+        if (localDecided) return true
+        if (
+          !incomingDecided &&
+          compareStartIdentity(incoming, this.state) >= 0
+        ) {
+          return true
+        }
+      }
     }
 
     this.installState(incoming)
@@ -813,25 +827,16 @@ export class VisualNovelSession {
       if (!recovery || envelope.payload.requestActionId !== recovery.actionId) {
         return false
       }
-      if (
-        recovery.targetPeerId &&
-        envelope.senderPeerId !== recovery.targetPeerId
-      ) {
-        return false
-      }
-      this.clearRecovery()
-      this.phase = 'idle'
-      this.error = null
-      this.emit()
+      if (!recovery.expectedPeerIds.has(envelope.senderPeerId)) return false
+
+      recovery.noSessionPeerIds.add(envelope.senderPeerId)
+      this.completeEmptyRecoveryIfReady()
       return true
     }
 
     if (envelope.payload.code !== 'REVISION_MISMATCH') return false
     if (this.state?.controllerPeerId !== envelope.senderPeerId) return false
-    if (
-      envelope.payload.requestActionId &&
-      envelope.payload.requestActionId !== this.commandRequest?.actionId
-    ) {
+    if (envelope.payload.requestActionId !== this.commandRequest?.actionId) {
       return false
     }
     this.clearCommandRequest()
@@ -974,6 +979,10 @@ export class VisualNovelSession {
     const recovery: RecoveryRequest = {
       actionId: envelope.actionId,
       targetPeerId: targetPeerId ?? null,
+      expectedPeerIds: new Set(
+        targetPeerId ? [targetPeerId] : this.transport.getPeers()
+      ),
+      noSessionPeerIds: new Set(),
       timer: 0,
     }
 
@@ -994,6 +1003,25 @@ export class VisualNovelSession {
         this.fail('The state request could not be sent')
       }
     })
+  }
+
+  private completeEmptyRecoveryIfReady = () => {
+    const recovery = this.recovery
+
+    if (
+      !recovery ||
+      [...recovery.expectedPeerIds].some(
+        peerId => !recovery.noSessionPeerIds.has(peerId)
+      )
+    ) {
+      return false
+    }
+
+    this.clearRecovery()
+    this.phase = 'idle'
+    this.error = null
+    this.emit()
+    return true
   }
 
   private clearRecovery = () => {
@@ -1025,6 +1053,12 @@ export class VisualNovelSession {
   }
 
   private handlePeerLeave = (peerId: string) => {
+    if (this.recovery?.expectedPeerIds.has(peerId)) {
+      this.recovery.expectedPeerIds.delete(peerId)
+      this.recovery.noSessionPeerIds.delete(peerId)
+      if (this.completeEmptyRecoveryIfReady()) return
+    }
+
     if (this.state?.controllerPeerId !== peerId) {
       this.emit()
       return

@@ -1,5 +1,4 @@
-import { useState, useEffect } from 'react'
-import { useTimeout } from 'usehooks-ts'
+import { useEffect, useRef, useState } from 'react'
 
 // Session storage keys for persisting throttling state
 export const LAST_MOUNT_TIME_KEY = 'room-mount-throttle:last-mount-time'
@@ -15,56 +14,53 @@ export const backoffMultiplier = 2
 // successive room mounts.
 
 export function useThrottledRoomMount(roomId: string) {
-  const [mountableRoomId, setMountableRoomId] = useState<string | null>(null)
-  // Delay before allowing room mount (null means no delay)
-  const [backoffDelay, setBackoffDelay] = useState<number | null>(null)
-  // Delay before resetting the backoff counter (null means no reset scheduled)
-  const [resetDelay, setResetDelay] = useState<number | null>(null)
+  const visitRef = useRef({ roomId, id: 0 })
 
-  // Timer that allows room mounting after the backoff delay
-  useTimeout(() => {
-    setMountableRoomId(roomId)
-    setResetDelay(backoffResetPeriod) // Schedule backoff reset after allowing mount
-  }, backoffDelay)
+  if (visitRef.current.roomId !== roomId) {
+    visitRef.current = {
+      roomId,
+      id: visitRef.current.id + 1,
+    }
+  }
 
-  // Timer that resets the backoff counter to 0 after the reset period
-  useTimeout(() => {
-    sessionStorage.setItem(BACKOFF_KEY, '0')
-  }, resetDelay)
+  const visitId = visitRef.current.id
+  const [allowedVisitId, setAllowedVisitId] = useState<number | null>(null)
 
   useEffect(() => {
     const now = Date.now()
-
     const lastMountTime =
       Number(sessionStorage.getItem(LAST_MOUNT_TIME_KEY) || '0') || 0
-
     const timeSinceLastMount = now - lastMountTime
 
-    sessionStorage.setItem(LAST_MOUNT_TIME_KEY, now.toString())
+    sessionStorage.setItem(LAST_MOUNT_TIME_KEY, String(now))
 
     let backoff = Number(sessionStorage.getItem(BACKOFF_KEY) || '0') || 0
 
-    // If the user is rejoining too quickly (within the reset period)
-    if (timeSinceLastMount < backoffResetPeriod) {
-      // Apply exponential backoff: start with base delay, then multiply by 2 each time
-      backoff = backoff === 0 ? baseBackoff : backoff * backoffMultiplier
-    } else {
-      // Enough time has passed, reset backoff to 0
-      backoff = 0
+    backoff =
+      timeSinceLastMount < backoffResetPeriod
+        ? backoff === 0
+          ? baseBackoff
+          : backoff * backoffMultiplier
+        : 0
+
+    sessionStorage.setItem(BACKOFF_KEY, String(backoff))
+
+    const mountTimer =
+      backoff > 0
+        ? window.setTimeout(() => setAllowedVisitId(visitId), backoff)
+        : null
+
+    if (backoff === 0) setAllowedVisitId(visitId)
+
+    const resetTimer = window.setTimeout(() => {
+      sessionStorage.setItem(BACKOFF_KEY, '0')
+    }, backoff + backoffResetPeriod)
+
+    return () => {
+      if (mountTimer !== null) window.clearTimeout(mountTimer)
+      window.clearTimeout(resetTimer)
     }
+  }, [roomId, visitId])
 
-    // Save the updated backoff value
-    sessionStorage.setItem(BACKOFF_KEY, backoff.toString())
-
-    // If there's a backoff delay, start the timer to allow mounting later
-    if (backoff > 0) {
-      setBackoffDelay(backoff)
-    } else {
-      // No backoff needed, allow immediate mounting and schedule backoff reset
-      setMountableRoomId(roomId)
-      setResetDelay(backoffResetPeriod)
-    }
-  }, [roomId])
-
-  return mountableRoomId === roomId
+  return allowedVisitId === visitId
 }
