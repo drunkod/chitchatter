@@ -9,6 +9,8 @@ import { v4 as uuid } from 'uuid'
 import { ChatTranscript } from 'components/ChatTranscript'
 import { WholePageLoading } from 'components/Loading'
 import { MessageForm } from 'components/MessageForm'
+import { VisualNovelRoom } from 'components/VisualNovelRoom'
+import { isVisualNovelEnabled } from 'config/visualNovelFeature'
 import { trackerUrls } from 'config/trackerUrls'
 import { RoomContext } from 'contexts/RoomContext'
 import { SettingsContext } from 'contexts/SettingsContext'
@@ -161,6 +163,9 @@ const RoomCore = ({
                 </Zoom>
               </Box>
             </Zoom>
+          )}
+          {!isDirectMessageRoom && isVisualNovelEnabled && (
+            <VisualNovelRoom peerRoom={peerRoom} />
           )}
           <Box
             sx={{

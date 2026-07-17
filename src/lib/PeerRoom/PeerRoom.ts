@@ -5,6 +5,7 @@ import {
   ActionProgressHandler,
   MessageContext,
   MessageAction,
+  selfId,
 } from '@trystero-p2p/torrent'
 import { joinRoom as baseJoinRoom } from 'trystero'
 
@@ -17,6 +18,7 @@ export enum PeerHookType {
   VIDEO = 'VIDEO',
   SCREEN = 'SCREEN',
   FILE_SHARE = 'FILE_SHARE',
+  VISUAL_NOVEL = 'VISUAL_NOVEL',
 }
 
 export enum PeerStreamType {
@@ -125,11 +127,17 @@ export class PeerRoom {
     this.flush()
   }
 
+  getSelfId = () => selfId
+
   onPeerJoin = (
     peerHookType: PeerHookType,
     fn: Exclude<Room['onPeerJoin'], null>
   ) => {
     this.peerJoinHandlers.set(peerHookType, fn)
+  }
+
+  removePeerJoinHandler = (peerHookType: PeerHookType) => {
+    this.peerJoinHandlers.delete(peerHookType)
   }
 
   onPeerJoinFlush = () => {
@@ -141,6 +149,10 @@ export class PeerRoom {
     fn: Exclude<Room['onPeerLeave'], null>
   ) => {
     this.peerLeaveHandlers.set(peerHookType, fn)
+  }
+
+  removePeerLeaveHandler = (peerHookType: PeerHookType) => {
+    this.peerLeaveHandlers.delete(peerHookType)
   }
 
   onPeerLeaveFlush = () => {

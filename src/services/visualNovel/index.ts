@@ -1,2 +1,6 @@
+export * from './PeerRoomVisualNovelTransport'
 export * from './VisualNovelEngine'
+export * from './VisualNovelProtocol'
+export * from './VisualNovelSession'
+export * from './VisualNovelTransport'
 export * from './VisualNovelValidator'

@@ -9,4 +9,5 @@ export enum PeerAction {
   SCREEN_SHARE,
   FILE_OFFER,
   TYPING_STATUS_CHANGE,
+  VISUAL_NOVEL,
 }
