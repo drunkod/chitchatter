@@ -38,7 +38,7 @@ test.describe('Novella MVP', () => {
       await waitForPeerMessage(
         controller,
         participant,
-        `novella-ready-${Date.now()}`,
+        `novella-ready-${Date.now()}`
       )
 
       await expect(novella(controller)).toBeVisible()
@@ -47,11 +47,11 @@ test.describe('Novella MVP', () => {
       await controller.getByRole('button', { name: 'Start story' }).click()
       await expectDialogue(
         controller,
-        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.',
+        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
       )
       await expectDialogue(
         participant,
-        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.',
+        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
       )
 
       await participant
@@ -59,11 +59,11 @@ test.describe('Novella MVP', () => {
         .click()
       await expectDialogue(
         controller,
-        'We have time for one signal. What should we do?',
+        'We have time for one signal. What should we do?'
       )
       await expectDialogue(
         participant,
-        'We have time for one signal. What should we do?',
+        'We have time for one signal. What should we do?'
       )
 
       await participant
@@ -71,11 +71,11 @@ test.describe('Novella MVP', () => {
         .click()
       await expectDialogue(
         controller,
-        'The lens catches, then floods the water with gold.',
+        'The lens catches, then floods the water with gold.'
       )
       await expectDialogue(
         participant,
-        'The lens catches, then floods the water with gold.',
+        'The lens catches, then floods the water with gold.'
       )
 
       await participant
@@ -83,17 +83,17 @@ test.describe('Novella MVP', () => {
         .click()
       await expectDialogue(
         controller,
-        'The boat answers with two flashes. They found the channel.',
+        'The boat answers with two flashes. They found the channel.'
       )
       await expectDialogue(
         participant,
-        'The boat answers with two flashes. They found the channel.',
+        'The boat answers with two flashes. They found the channel.'
       )
 
       await controller.getByRole('button', { name: 'Read again' }).click()
       await expectDialogue(
         participant,
-        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.',
+        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
       )
 
       await participant
@@ -104,11 +104,11 @@ test.describe('Novella MVP', () => {
         .click()
       await expectDialogue(
         controller,
-        'The first light draws a silver road across the water.',
+        'The first light draws a silver road across the water.'
       )
       await expectDialogue(
         participant,
-        'The first light draws a silver road across the water.',
+        'The first light draws a silver road across the water.'
       )
 
       await participant
@@ -138,10 +138,10 @@ test.describe('Novella MVP', () => {
 
       await expect(directMessageDialog).toBeVisible()
       await expect(
-        directMessageDialog.getByPlaceholder('Your message'),
+        directMessageDialog.getByPlaceholder('Your message')
       ).toBeVisible()
       await expect(
-        directMessageDialog.getByRole('region', { name: 'Novella' }),
+        directMessageDialog.getByRole('region', { name: 'Novella' })
       ).toHaveCount(0)
     } finally {
       await controllerContext?.close()
@@ -170,7 +170,7 @@ test.describe('Novella MVP', () => {
         .click()
       await expectDialogue(
         controller,
-        'The lens catches, then floods the water with gold.',
+        'The lens catches, then floods the water with gold.'
       )
 
       participantContext = await browser.newContext()
@@ -179,20 +179,20 @@ test.describe('Novella MVP', () => {
       await joinExistingRoom(participant, roomUrl)
       await expectDialogue(
         participant,
-        'The lens catches, then floods the water with gold.',
+        'The lens catches, then floods the water with gold.'
       )
 
       await participant.reload()
       await participant.waitForLoadState('networkidle')
       await expectDialogue(
         participant,
-        'The lens catches, then floods the water with gold.',
+        'The lens catches, then floods the water with gold.'
       )
 
       await waitForPeerMessage(
         controller,
         participant,
-        `novella-refresh-ready-${Date.now()}`,
+        `novella-refresh-ready-${Date.now()}`
       )
 
       await controllerContext.close()
@@ -200,22 +200,22 @@ test.describe('Novella MVP', () => {
 
       await expect(
         novella(participant).getByText(
-          'The storyteller left. The story is paused.',
-        ),
+          'The storyteller left. The story is paused.'
+        )
       ).toBeVisible({ timeout: 25_000 })
       await participant
         .getByRole('button', { name: 'Continue the story' })
         .click()
 
       await expect(
-        novella(participant).getByText('Storyteller', { exact: true }),
+        novella(participant).getByText('Storyteller', { exact: true })
       ).toBeVisible()
       await participant
         .getByRole('button', { name: 'Continue', exact: true })
         .click()
       await expectDialogue(
         participant,
-        'The boat answers with two flashes. They found the channel.',
+        'The boat answers with two flashes. They found the channel.'
       )
     } finally {
       await controllerContext?.close()

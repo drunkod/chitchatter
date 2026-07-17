@@ -41,7 +41,7 @@ export const joinPublicRoom = async (page: Page): Promise<JoinedRoom> => {
 
 export const joinExistingRoom = async (
   page: Page,
-  roomUrl: string,
+  roomUrl: string
 ): Promise<string> => {
   await page.goto('/')
   await page.waitForLoadState('networkidle')
@@ -60,7 +60,7 @@ export const joinExistingRoom = async (
  */
 export const sendMessage = async (
   page: Page,
-  message: string,
+  message: string
 ): Promise<void> => {
   const chatInput = page.getByPlaceholder('Your message')
 
@@ -72,7 +72,7 @@ export const sendMessage = async (
 export const waitForPeerMessage = async (
   sender: Page,
   receiver: Page,
-  message: string,
+  message: string
 ): Promise<void> => {
   await sendMessage(sender, message)
   await expect(receiver.getByText(message)).toBeVisible({ timeout: 25_000 })
