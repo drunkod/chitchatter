@@ -37,6 +37,18 @@ This version has no persistence, checkpoints, epochs, cross-tab coordination, ba
 
 The archived Revision 13 documents describe a possible durability layer. They are not MVP requirements.
 
+## Playbooks
+
+Use the narrowest playbook that matches the task:
+
+- [`demo-playbook.md`](./demo-playbook.md) — demonstrate the feature and run the complete human happy-path and recovery checklist.
+- [`release-playbook.md`](./release-playbook.md) — perform the release gate, enabled/disabled build checks, go/no-go decision, limited rollout, and rollback.
+- [`failure-injection-playbook.md`](./failure-injection-playbook.md) — exercise delays, simultaneous joins, timeouts, controller departure, refresh, and rapid navigation in disposable rooms.
+- [`incident-triage-playbook.md`](./incident-triage-playbook.md) — classify connectivity versus Novella failures, capture evidence, assign severity, reproduce, and close defects.
+- [`compatibility-accessibility-playbook.md`](./compatibility-accessibility-playbook.md) — test browser combinations, responsive layouts, keyboard navigation, screen-reader basics, zoom, permissions, and media regressions.
+
+The demo playbook is the release candidate's canonical human walkthrough. The other playbooks extend it without changing the MVP's intentionally ephemeral guarantees.
+
 ## Tests
 
 Run the complete gate:
