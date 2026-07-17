@@ -1,6 +1,6 @@
-# 02 — Data models, transition certificates, supersession, and recovery
+# 02 — Data models, compact transitions, paginated proofs, and election transcripts
 
-> **Revision 12 changes:** stores full epoch-transition provenance, adds generic supersession and safety-recovery actions, binds election advertisements to migration records, and generation-fences checkpoints.
+> **Revision 13 changes:** separates immutable transition origin from mutable current outcome, replaces monolithic supersession evidence with bounded proof pages, defines transcript-bound migration, and makes checkpoint blobs immutable.
 
 ## Core state
 
@@ -27,6 +27,16 @@ export interface VisualNovelSessionState extends Record<string, unknown> {
   controllerPeerId: string
   revision: number
   updatedAt: number
+}
+
+export interface CanonicalStateFloor extends Record<string, unknown> {
+  sessionId: string
+  sessionEpoch: number
+  storyId: string
+  storyVersion: string
+  controllerPeerId: string
+  revision: number
+  stateDigest: string
 }
 
 export interface ValidatedState {
@@ -69,74 +79,14 @@ export type VisualNovelActionType =
   | 'RESTART_REQUEST' | 'RESTARTED' | 'ERROR'
 ```
 
-## Origin and transition evidence
+## Subjects, outcomes, and origins
 
 ```ts
-export interface StartDecisionRecord extends Record<string, unknown> {
-  decisionId: string
-  coordinatorPeerId: string
-  originActionId: string
-  state: VisualNovelSessionState // revision 0
-}
-
-export type SessionOriginEvidence =
-  | { kind: 'start-decision'; decision: StartDecisionRecord }
-  | { kind: 'epoch-transition'; transitionId: string }
-
 export interface SessionSubject {
   sessionId: string
   sessionEpoch: number
   storyId: string
   storyVersion: string
-}
-
-export interface SessionStartedCertificate extends Record<string, unknown> {
-  envelope: EnvelopeFor<'SESSION_STARTED'>
-  predecessor: SessionSubject
-  predecessorRevision: number
-}
-
-export interface EpochTransitionCertificate extends Record<string, unknown> {
-  transitionId: string
-  kind: 'initial-start' | 'start-after-ended' | 'switch'
-  predecessorOutcome: EpochOutcome | null
-  successorOutcome: EpochOutcome // active, revision-0 floor
-  successorOrigin:
-    | { kind: 'start-decision'; decision: StartDecisionRecord }
-    | { kind: 'session-started'; certificate: SessionStartedCertificate }
-}
-```
-
-`transitionId` is recomputed from the normalized raw certificate fields. `SESSION_STARTED` payload binds predecessor subject/revision and successor state so the action ID cannot be mixed with another state.
-
-## Durable evidence
-
-```ts
-export interface SessionDisposition extends Record<string, unknown> {
-  sessionId: string
-  sessionEpoch: number
-  storyId: string
-  storyVersion: string
-  reason: 'ended' | 'switched' | 'reconciled'
-  evidenceId: string // end action ID, transition ID, or conflict ID
-}
-
-export interface CompletedEndCertificate extends Record<string, unknown> {
-  sessionId: string
-  sessionEpoch: number
-  storyId: string
-  storyVersion: string
-  endEnvelope: EnvelopeFor<'SESSION_ENDED'>
-}
-
-export interface CanonicalStateFloor extends Record<string, unknown> {
-  sessionId: string
-  sessionEpoch: number
-  storyId: string
-  storyVersion: string
-  controllerPeerId: string
-  revision: number
-  stateDigest: string
 }
 
 export interface EpochOutcome extends Record<string, unknown> {
@@ -145,24 +95,124 @@ export interface EpochOutcome extends Record<string, unknown> {
   status: 'active' | 'ended'
   floor: CanonicalStateFloor
 }
-```
 
-## Supersession evidence
+export interface StartDecisionCertificate extends Record<string, unknown> {
+  decisionId: string
+  coordinatorPeerId: string
+  originActionId: string
+  successorOriginFloor: CanonicalStateFloor
+}
 
-```ts
-export interface SupersessionEvidence extends Record<string, unknown> {
-  requestedSession: SessionSubject
-  transitions: EpochTransitionCertificate[] // contiguous after requested epoch
-  currentOutcome: EpochOutcome
-  currentOrigin: SessionOriginEvidence | null
-  currentKnownState: VisualNovelSessionState | null
-  currentEndCertificate: CompletedEndCertificate | null
+export interface SessionStartedCertificate extends Record<string, unknown> {
+  actionId: string
+  predecessor: SessionSubject
+  predecessorRevision: number
+  predecessorControllerPeerId: string
+  successorOriginFloor: CanonicalStateFloor
+}
+
+export type EpochOriginCertificate =
+  | { kind: 'start-decision'; certificate: StartDecisionCertificate }
+  | { kind: 'session-started'; certificate: SessionStartedCertificate }
+
+export interface SessionOriginEvidence extends Record<string, unknown> {
+  kind: 'epoch-transition'
+  transitionId: string
 }
 ```
 
-The chain’s final successor equals `currentOutcome`. Active outcome requires matching origin; ended outcome requires matching end certificate. Known state, when present, exactly matches the final floor.
+Full revision-0 state is not embedded in compact origin certificates. It is verified when originally accepted and can later be recovered by digest through the snapshot protocol.
 
-## Conflicts and migration
+## End and transition evidence
+
+```ts
+export interface CompletedEndCertificate extends Record<string, unknown> {
+  sessionId: string
+  sessionEpoch: number
+  storyId: string
+  storyVersion: string
+  endEnvelope: EnvelopeFor<'SESSION_ENDED'>
+}
+
+export interface TransitionPredecessor extends Record<string, unknown> {
+  subject: SessionSubject
+  outcomeAtTransition: EpochOutcome
+  completedEndCertificate: CompletedEndCertificate | null
+}
+
+export interface EpochTransitionCertificate extends Record<string, unknown> {
+  transitionId: string
+  kind: 'initial-start' | 'start-after-ended' | 'switch'
+  predecessor: TransitionPredecessor | null
+  successorSubject: SessionSubject
+  successorOriginFloor: CanonicalStateFloor // revision 0
+  origin: EpochOriginCertificate
+}
+```
+
+Rules:
+
+- `initial-start` has null predecessor and successor epoch 1.
+- `switch` predecessor is active and has no completed-end certificate.
+- `start-after-ended` predecessor is ended and embeds its exact completed-end certificate.
+- successor subject/floor/origin agree exactly.
+- transition ID uses the `epoch-transition` domain over the certificate without `transitionId`.
+- slots below high water are sealed;
+- the active high-water slot may be replaced only by a winning same-epoch different-session reconciliation carrying its full compact `originTransition`;
+- replacing the active slot updates the predecessor switched disposition to the winning transition ID before that slot becomes historical.
+
+## Dispositions
+
+```ts
+export interface SessionDisposition extends Record<string, unknown> {
+  sessionId: string
+  sessionEpoch: number
+  storyId: string
+  storyVersion: string
+  reason: 'ended' | 'switched' | 'reconciled'
+  evidenceId: string
+}
+```
+
+`ended` references an end action/certificate, `switched` references the transition that created the immediate successor, and `reconciled` references a conflict ID.
+
+## Paginated transition proofs
+
+```ts
+export interface CurrentOutcomeEvidence extends Record<string, unknown> {
+  outcome: EpochOutcome
+  origin: SessionOriginEvidence | null
+  endCertificate: CompletedEndCertificate | null
+  recoveryTargets: string[]
+}
+
+export interface TransitionProofManifest extends Record<string, unknown> {
+  proofId: string
+  purpose: 'supersession' | 'safety-recovery'
+  requestedSubject: SessionSubject
+  fromEpochExclusive: number
+  toEpochInclusive: number
+  pageCount: number
+  sourceGeneration: number
+  finalPageDigest: string
+  currentEvidenceDigest: string
+}
+
+export interface TransitionProofPage extends Record<string, unknown> {
+  manifest: TransitionProofManifest
+  pageIndex: number
+  previousPageDigest: string | null
+  pageDigest: string
+  transitions: EpochTransitionCertificate[]
+  currentEvidence: CurrentOutcomeEvidence | null // final page only
+}
+```
+
+`currentEvidenceDigest` uses the `current-outcome-evidence` domain over normalized current evidence. Define `manifestCore` as purpose, requested subject, epoch range, page count, source generation, and current-evidence digest—excluding `proofId` and `finalPageDigest`. Each `pageDigest` uses the `transition-proof-page` domain over `manifestCore`, page index, previous digest, transitions, and the final-page current-evidence marker. `proofId` uses the `transition-proof` domain over `manifestCore` plus `finalPageDigest`. This ordering has no circular hash dependency.
+
+Pages never contain a current full state. After proof application, an active receiver uses ordinary exact snapshot recovery.
+
+## Conflict descriptors
 
 ```ts
 export type ConflictKind = 'start' | 'migration'
@@ -177,9 +227,16 @@ export interface ConflictDescriptor extends Record<string, unknown> {
   higherStateDigest: string
   conflictId: string
 }
+```
 
+`conflictId` uses the exact protocol-ID contract over sorted session IDs, sorted digests, epoch, kind, and optional migration ID.
+
+## Migration lineage and election transcript
+
+```ts
 export interface MigrationRecord extends Record<string, unknown> {
   migrationId: string
+  migrationRoundId: string
   sessionEpoch: number
   sessionId: string
   departedControllerPeerId: string
@@ -192,7 +249,24 @@ export interface MigrationLineage extends Record<string, unknown> {
   sessionId: string
   records: MigrationRecord[]
 }
+
+export interface ElectionAdvertisementSummary extends Record<string, unknown> {
+  advertisementId: string
+  migrationRoundId: string
+  senderPeerId: string
+  candidatePeerId: string
+  priority: CanonicalStateFloor
+}
+
+export interface ElectionTranscript extends Record<string, unknown> {
+  transcriptId: string
+  migrationRoundId: string
+  advertisements: ElectionAdvertisementSummary[] // sorted by sender ID
+  winnerAdvertisementId: string
+}
 ```
+
+The winner is the greatest state priority, then lower candidate peer ID, then lower advertisement ID. The transcript ID is derived from the normalized transcript without `transcriptId`.
 
 ## Payload map
 
@@ -202,12 +276,18 @@ export type EnvelopeFor<T extends VisualNovelActionType> =
 
 export type VisualNovelPayloadByAction = {
   START_PROPOSE: { proposalId: string; candidate: VisualNovelSessionState }
-  START_COMMITTED: { decision: StartDecisionRecord }
-  START_DECISION_GOSSIP: { decision: StartDecisionRecord; knownState: VisualNovelSessionState }
+  START_COMMITTED: {
+    decision: StartDecisionCertificate
+    state: VisualNovelSessionState
+  }
+  START_DECISION_GOSSIP: {
+    decision: StartDecisionCertificate
+    state: VisualNovelSessionState
+  }
   SESSION_RECONCILE: {
     descriptor: ConflictDescriptor
     state: VisualNovelSessionState
-    origin?: SessionOriginEvidence
+    originTransition?: EpochTransitionCertificate
   }
 
   STATE_REQUEST: { knownRevision: number; recoveryKind: RecoveryKind }
@@ -238,25 +318,31 @@ export type VisualNovelPayloadByAction = {
   SESSION_END_ACK: { endActionId: string }
   SESSION_END_NOTICE_GOSSIP: { certificate: CompletedEndCertificate }
   SESSION_RETIREMENT_GOSSIP: { disposition: SessionDisposition }
-  SESSION_SUPERSESSION_GOSSIP: { evidence: SupersessionEvidence }
+  SESSION_SUPERSESSION_GOSSIP: {
+    requestActionId: string
+    page: TransitionProofPage
+  }
 
-  SAFETY_RECOVERY_REQUEST: { lockKind: 'capacity'; knownEpoch: number; knownGeneration: number }
-  SAFETY_RECOVERY_GOSSIP: { evidence: SupersessionEvidence }
+  SAFETY_RECOVERY_REQUEST: {
+    lockCode: 'evidence-limit' | 'lineage-limit' | 'operational-bytes'
+    knownEpoch: number
+    knownGeneration: number
+  }
+  SAFETY_RECOVERY_GOSSIP: {
+    requestActionId: string
+    page: TransitionProofPage
+  }
 
   ELECTION_ADVERTISE: {
-    roundId: string
-    migrationId: string
-    departedControllerPeerId: string
-    openedAtRevision: number
+    migrationRoundId: string
+    advertisementId: string
+    candidatePeerId: string
     state: VisualNovelSessionState
   }
   CONTROLLER_CHANGED: {
-    roundId: string
-    migrationId: string
-    departedControllerPeerId: string
-    electorate: string[]
-    controllerPeerId: string
-    state: VisualNovelSessionState
+    migrationRoundId: string
+    transcript: ElectionTranscript
+    winningState: VisualNovelSessionState
   }
 
   CONTROL_REQUEST: Record<string, never>
@@ -267,6 +353,8 @@ export type VisualNovelPayloadByAction = {
 }
 ```
 
+`CONTROLLER_CHANGED` carries the winning pre-change state only. Receivers deterministically apply the pure engine `changeController(winningCandidate)` to derive the installed state, avoiding two full states in one envelope.
+
 ## Runtime and persistence records
 
 ```ts
@@ -274,38 +362,34 @@ export type RecoveryKind =
   | 'bootstrap' | 'revision-gap' | 'start-reconcile'
   | 'migration-reconcile' | 'supersession' | 'safety-recovery'
 
-export interface OutstandingRecovery {
-  actionId: string
-  targetPeerId: string
-  expectedEpoch: number
-  expectedSessionId: string | null
-  expectedFloorDigest: string | null
-  kind: RecoveryKind
-  conflictId: string | null
-  migrationId: string | null
+export interface ProofAssembly {
+  proofId: string
+  purpose: 'supersession' | 'safety-recovery'
+  requestActionId: string
+  sourcePeerId: string
+  manifest: TransitionProofManifest
+  pages: Map<number, TransitionProofPage>
+  encodedBytes: number
   createdAt: number
   expiresAt: number
 }
 
 export interface DurableSafetyLock {
   kind: 'capacity' | 'digest-collision'
-  code: string
+  code: DurableSafetyLockCode
   lockedAtEpoch: number
   lockedAtGeneration: number
 }
 
-export interface RuntimeSafetyState {
-  kind: 'lock-unavailable' | 'storage-failure'
-  code: string
-}
-
 export interface CheckpointRecord {
+  storageKey: string
   sourceGeneration: number
   floorDigest: string
   state: VisualNovelSessionState
 }
 
 export interface LatestCheckpointPointer {
+  storageKey: string
   sessionId: string
   sourceGeneration: number
   floorDigest: string
@@ -324,5 +408,3 @@ export interface RoomMeta {
   safetyLock: DurableSafetyLock | null
 }
 ```
-
-Cross-field invariants include contiguous transitions through high water, transition successor/origin/floor agreement, switched disposition evidence matching one transition, ended disposition/certificate bijection, current origin matching the final transition, and reserved-capacity lock validity.

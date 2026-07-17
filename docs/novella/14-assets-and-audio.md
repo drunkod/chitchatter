@@ -1,28 +1,37 @@
-# 14 — Safe assets and local audio
+# 14 — Assets, audio, and nonprotocol UI resources
 
-> **Revision 12 changes:** asset behavior remains isolated from protocol state; supersession and safety recovery never auto-play stale media.
+> **Revision 13 changes:** proof and safety phases must not leak or unnecessarily reload assets, and protocol pages carry no asset data.
 
-## Assets
+Story manifests may reference bundled assets and explicitly allowlisted same-origin/HTTPS extensions. Reject executable URLs, raw HTML, oversized data URLs, unsafe MIME types, and path traversal.
 
-- bundled or explicitly permitted same-origin URLs only;
-- reject scriptable/HTML/SVG content unless separately sanitized and allowlisted;
-- bounded URL/text/media metadata;
-- no room secrets, invite URLs, peer IDs, or progress values embedded in asset requests;
-- failed image/audio loads do not change canonical story state.
+## Images
+
+- preload only current/next scene assets;
+- set bounded dimensions and safe fallbacks;
+- never persist image bytes in protocol metadata, transitions, proofs, or checkpoints;
+- proof assembly and safety phases keep the current safe background or neutral placeholder.
 
 ## Audio
 
-- playback is local UI behavior, never replicated authority;
-- require user gesture before audio context activation;
-- stop/fade on scene change, rollback, supersession, end, room navigation, and safety lock;
-- floor-only recovery displays no speculative successor audio;
-- stale checkpoint or transition chain does not trigger audio until exact canonical state installs;
-- cleanup touches only novella-owned nodes/timers.
+- user gesture starts playback;
+- one novella-owned audio controller;
+- stop/fade on story/session change, end, navigation, or unmount;
+- proof assembly does not repeatedly restart audio;
+- after supersession proof, wait for exact active state before selecting successor audio;
+- audio failures remain local and never affect state digest or protocol authorization.
+
+## Accessibility
+
+- dialogue and recovery messages use appropriate live regions;
+- controls remain keyboard operable;
+- motion/audio preferences are respected;
+- proof page counts and reset-required states are understandable without color;
+- rollback, ended, and safety messages describe what actually happened.
 
 ## Tests
 
-- safe/unsafe URL and media-type validation;
-- rollback/supersession/end/safety lock stops audio;
-- room navigation removes old audio;
-- recovery/floor evidence alone never starts playback;
-- existing chat/media streams remain unaffected.
+- unsafe asset URLs reject;
+- audio cleanup is novella-scoped;
+- page reorder does not trigger repeated asset/audio transitions;
+- state recovery changes assets only after canonical state install;
+- chat/media/file features remain usable during proof and safety phases.

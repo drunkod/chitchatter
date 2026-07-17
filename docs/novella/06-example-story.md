@@ -1,42 +1,42 @@
 # 06 — Bundled example story and protocol fixtures
 
-> **Revision 12 changes:** the example remains local and declarative, while its tests now provide RFC 8785, transition-chain, and supersession fixtures.
+> **Revision 13 changes:** adds compact-certificate, proof-page, derived-ID, and transcript fixtures alongside the bundled story.
 
-Bundle one versioned story such as `lantern-room@1` with:
+Ship one local declarative story that exercises:
 
-- at least three scenes;
-- linear dialogue plus one required choice;
-- boolean, string, and numeric variables;
-- conditional branches and effects;
-- one safe same-origin image and optional local audio cue;
-- deterministic restart and ending paths.
+- linear dialogue and explicit choices;
+- conditional branches;
+- string, boolean, and numeric variables;
+- restart and controller change;
+- audio/image assets through local or allowlisted URLs;
+- enough history and variables to test snapshot truncation.
 
-Story JSON contains no executable code, raw HTML, remote scripts, room secrets, or user data.
+## Catalog
 
-## Required fixtures
+The catalog resolves exact `(storyId, storyVersion)` and rejects duplicates, unknown versions, malformed manifests, raw HTML, executable content, unsafe URLs, and impossible transitions.
 
-- exact revision-0 initial state;
-- two equal-priority divergent states whose SHA-256 tie-break is known;
-- control-character, non-ASCII, `-0`, and exponent-number JCS vectors;
-- A→B→C transition certificates across two bundled story versions;
-- A→B followed by B completed-end evidence;
-- one floor-only state and matching `STATE_FLOOR_GOSSIP` fixture;
-- two migration records with interleaved advertisements;
-- metadata near operational byte limit with reserved durable capacity lock.
+## Canonical fixtures
 
-## Catalog rules
+Commit byte-exact fixtures for:
 
-- exact `(storyId, storyVersion)` lookup;
-- immutable normalized manifests;
-- bounded assets and text;
-- unknown version enters recoverable lobby;
-- example assets use same-origin paths and safe media types.
+- RFC 8785 property order, escapes, Unicode, `-0`, exponent thresholds, and shortest numbers;
+- semantic state JCS bytes and SHA-256 digest;
+- each protocol-ID domain;
+- compact initial, switch, and start-after-ended transitions;
+- progressed and ended current-outcome dominance over one origin transition;
+- proof manifests and page digest chains;
+- migration record, shared round, advertisements, and transcript winner.
 
-## Tests
+Browser and Node tests consume the same fixture bytes and expected lowercase hexadecimal IDs.
 
-- parse and semantic validation;
-- every scene/entry/choice reference;
-- deterministic engine walk;
-- RFC 8785 bytes and digest snapshots;
-- transition and supersession chain verification;
-- no remote/script/raw-HTML content.
+## Size fixtures
+
+Provide near-limit fixtures for:
+
+- 64 KiB state snapshot;
+- maximum compact transition certificate;
+- proof page at page payload budget;
+- final proof page with current outcome/end evidence;
+- migration transcript at maximum advertisement count.
+
+Every fixture must remain below its declared payload/envelope limit after real serialization.

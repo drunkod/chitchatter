@@ -1,6 +1,6 @@
-# 08 — Sync gate, supersession, safety recovery, and conflict rebasing
+# 08 — Sync gate, proof assembly, safety recovery, and conflict rebasing
 
-> **Revision 12 changes:** replaces below-high-water drops with supersession replies, adds a pre-gate capacity-recovery path, defines floor-only conflict responses, and binds election advertisements to lineage.
+> **Revision 13 changes:** validates outcome dominance rather than transition equality, assembles paginated proofs before mutation, and applies cause-specific capacity recovery.
 
 ## Gate decisions
 
@@ -11,28 +11,84 @@ type GateDecision =
   | { kind: 'reack-end' }
   | { kind: 'reply-ended'; certificate: CompletedEndCertificate }
   | { kind: 'reply-disposed'; disposition: SessionDisposition }
-  | { kind: 'reply-superseded'; evidence: SupersessionEvidence }
+  | { kind: 'reply-superseded'; requestActionId: string }
   | { kind: 'reply-floor'; outcome: EpochOutcome; origin: SessionOriginEvidence | null }
-  | { kind: 'safety-recovery' }
+  | { kind: 'collect-proof-page' }
 ```
 
 ## Gate order
 
 After normalization and outer identity:
 
-1. exact resent original end matching a retained certificate → re-ACK;
-2. duplicate handling;
-3. `SAFETY_RECOVERY_GOSSIP` against a durable capacity lock → dedicated pre-gate verification;
-4. exact completed end/switched evidence replies;
-5. any authenticated subject epoch below high water → `reply-superseded` using retained transition chain/current evidence;
-6. active-epoch reconciled confusion may receive informational disposition while complete evidence proceeds;
+1. resent original end matching retained certificate → re-ACK;
+2. duplicate non-page action handling;
+3. proof pages matching an outstanding supersession/safety recovery → bounded assembly path;
+4. exact current ended/switched evidence replies;
+5. authenticated subject below high water → start paginated supersession response;
+6. active-epoch reconciled informational response while complete evidence proceeds;
 7. ended high-water install path → drop;
-8. remaining durable/runtime safety lock → reject install/request mutation;
+8. durable/runtime lock → reject ordinary install/request mutation;
 9. dispatch.
 
-Historical-disposition trimming never changes step 5 because transition certificates, outcome, origin/end evidence are separate durable records.
+Proof pages are duplicate-aware by `(proofId, pageIndex, pageDigest)`, not ordinary action-ID suppression.
 
-## Transaction/bootstrap API
+## Proof assembly
+
+A `ProofAssembly` is created only for an exact outstanding request and target. Collection:
+
+- validates each page independently;
+- enforces page count, page bytes, total assembly bytes, expiry, and source;
+- stores identical duplicate pages idempotently;
+- rejects unequal duplicate indexes;
+- never mutates metadata/state.
+
+On completion:
+
+1. concatenate and validate the full transition chain;
+2. validate current evidence identity and floor dominance;
+3. re-read latest metadata under the room lock;
+4. discard if local high water already dominates;
+5. supersession purpose: merge missing transitions/evidence, raise high water, enter ended or floor-only active state;
+6. safety purpose: apply the lock-code policy and fit preflight before clearing lock;
+7. commit duplicate/proof completion only after transaction success.
+
+## Supersession response generation
+
+Holder constructs compact pages beginning after the requested epoch. Current outcome evidence is included only in the final page. The proof never includes a full current state, so page serialization remains bounded independently of snapshot size.
+
+## Capacity recovery
+
+Only these lock codes may request remote recovery:
+
+- `evidence-limit`;
+- `lineage-limit`;
+- `operational-bytes`.
+
+Recovery requires a complete proof ending strictly above `lockedAtEpoch`. Inside one lock:
+
+- compact permitted historical dispositions/certificates first;
+- verify incoming transitions keep count within `maxEpochTransitions`;
+- verify final metadata fits `maxOperationalRoomMetaBytes`;
+- clear old lineage/conflicts/recoveries as the higher epoch supersedes them;
+- clear lock and adopt final outcome/origin atomically;
+- enter floor-only active recovery or ended state.
+
+`transition-limit` and `digest-collision` reject both safety request and gossip and require explicit reset according to policy.
+
+## Conflict rebase
+
+For `SESSION_RECONCILE`:
+
+- validate state/descriptor and require `originTransition` for a different-session incoming state;
+- compare inside transaction against latest complete baseline and floor;
+- exact other digest → exact path;
+- changed baseline → rebase;
+- incoming winner → fresh descriptor and atomic apply; a different-session winner replaces the active high-water transition slot and canonical predecessor switched evidence;
+- incoming loser with complete local winner → return winner/fresh descriptor;
+- incoming loser while floor-only → return floor gossip and recover canonical state;
+- equal digest → idempotent subject to collision checks.
+
+## Transaction API
 
 ```ts
 interface MetaStateTransaction {
@@ -51,42 +107,17 @@ interface MetaStateTransaction {
 
 All critical methods require the room Web Lock.
 
-## Conflict rebase
-
-For `SESSION_RECONCILE`:
-
-- validate incoming state/origin/descriptor and optional migration ID;
-- compare inside the transaction against latest complete state and floor;
-- exact other digest → exact path;
-- changed baseline → rebase;
-- incoming wins → fresh descriptor and atomic apply;
-- incoming loses with complete local winner → return winner plus fresh descriptor;
-- incoming loses while floor-only → return `STATE_FLOOR_GOSSIP`, initiate canonical-state recovery, and do not invent a complete winner;
-- equal digest → idempotent only after collision check where both bytes exist.
-
-## Safety recovery
-
-Only durable `capacity` lock accepts remote recovery:
-
-1. requester sends `SAFETY_RECOVERY_REQUEST` without enabling other outgoing state requests;
-2. holder sends `SAFETY_RECOVERY_GOSSIP` containing a transition chain whose final epoch is strictly greater than `lockedAtEpoch`;
-3. pre-gate validator checks chain, current outcome/origin/end evidence, known state, and byte limits;
-4. one room-lock transaction rechecks the lock, merges transitions/evidence, clears capacity lock, advances high water, and installs exact state or floor-only recovery;
-5. same/lower epoch never clears the lock.
-
-Digest-collision locks require reset/protocol upgrade. Lock-unavailable and storage-failure are local capability states and never clear from network input.
-
 ## Authorization summary
 
 | Action | Authority |
 | --- | --- |
-| start proposal/commit | coordinator, next epoch, valid transition/origin |
-| reconcile | valid exact/rebased descriptor; origin on session change |
-| snapshot | current controller or exact recovery target; floor/closed checks |
+| start proposal/commit | coordinator, exact new epoch, valid compact transition/origin |
+| reconcile | exact/rebased descriptor; full compact origin transition on session change |
+| snapshot | current controller or exact recovery target |
 | floor gossip | current outcome/floor evidence; noninstalling |
-| progression | current controller, exact revision/session, fresh generation |
-| session started | predecessor controller; exact next epoch; full transition certificate |
-| end/ACK/gossip | exact controller/action/certificate rules |
-| supersession | holder identity; contiguous retained transition chain |
-| safety recovery | capacity lock only; strictly higher verified chain |
-| election advertise/change | selected retained migration record and bound round fields |
+| progression | current controller, exact session/revision, fresh generation |
+| session started | predecessor controller; exact next epoch |
+| end/ACK/gossip | exact controller/action/certificate |
+| supersession page | holder identity; exact request and proof chain |
+| safety page | recoverable capacity code; exact request and higher proof |
+| election advertise/change | selected migration round and valid transcript |

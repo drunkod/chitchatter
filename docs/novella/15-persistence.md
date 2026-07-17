@@ -1,98 +1,111 @@
-# 15 — Locked persistence, transition chains, reserves, and checkpoint fencing
+# 15 — Locked persistence, compact transitions, proof policy, and immutable checkpoints
 
-> **Revision 12 changes:** retains one transition certificate per epoch, reserves durable lock headroom, fences latest checkpoint publication by generation, and defines emergency/bootstrap behavior.
+> **Revision 13 changes:** immutable checkpoint blobs close the stale-writer overwrite race, transition dependencies are self-contained, and capacity recovery is cause-specific.
 
 ## Keys
 
 ```text
 visual-novel:v1:<roomScope>:meta
 visual-novel:v1:<roomScope>:latest
-visual-novel:v1:<roomScope>:<sessionId>
+visual-novel:v1:<roomScope>:checkpoint:<sessionId>:<generation>:<floorDigest>
 visual-novel:v1:<roomScope>:emergency
 ```
 
-Room scope is a one-way digest of room identity. Store no room secrets, invite URLs, chat, media, or analytics.
+Store no room secret, invite URL, chat, media, analytics, or proof-page assembly in durable storage.
 
 ## Capability and emergency state
 
-All protocol writes and coherent reads require a room-scoped Web Lock. If unavailable, do not attach an installing receiver.
+All protocol writes and coherent reads require a room-scoped Web Lock. If unavailable, attach no installing receiver.
 
-`emergency` is a tiny fixed record for local storage-failure diagnostics only. Durable protocol locks remain in RoomMeta and are guaranteed by reserved metadata headroom. Bootstrap reads emergency state before enabling controls.
+`emergency` is a small local storage-failure diagnostic marker. Durable protocol locks remain in RoomMeta and fit reserved headroom.
 
 ## Operational reserve
 
-- normal metadata must be `<= maxOperationalRoomMetaBytes`;
-- the remaining reserve fits the maximum encoded `DurableSafetyLock`, generation increment, and envelope overhead;
-- when a normal mutation would exceed operational limit, write only the compact capacity lock using the reserve;
-- no normal mutation may consume reserve space;
-- total metadata must remain `<= maxRoomMetaBytes`.
-
-## Coherent bootstrap
-
-Preferred algorithm under room lock:
-
-```text
-read emergency marker
-read/validate RoomMeta
-read latest pointer
-read referenced checkpoint
-return one generation-tagged snapshot
-```
-
-After subscription initialization, re-read generation and retry if changed. An optimistic double-read fallback is allowed only if lock-held reads are impossible; unlocked writes remain forbidden.
+- normal metadata must remain `<= maxOperationalRoomMetaBytes`;
+- reserve fits maximum durable lock plus generation update;
+- mutation predicted to exceed operational limit writes only the compact lock;
+- no ordinary mutation consumes reserve;
+- total metadata remains `<= maxRoomMetaBytes`.
 
 ## Transaction contract
 
 Inside one room lock:
 
 1. read latest metadata and emergency state;
-2. recheck generation, authorization, closed epoch, lock, and capacity;
+2. recheck generation, authorization, closed epoch, lock code, and capacity;
 3. apply mutation;
 4. increment generation;
-5. validate transitions, RFC 8785 digests, bounds, and reserve policy;
+5. validate compact transitions, current outcome dominance, JCS digests, bounds, and reserve;
 6. write metadata;
 7. synchronously install prevalidated canonical-store value;
 8. publish generation;
 9. release lock.
 
-## Epoch transitions
+## Transition persistence
 
-Persist exactly one contiguous transition certificate per epoch. They are safety/provenance records and never trim before explicit reset. If `maxEpochTransitions` or operational bytes are reached, enter capacity lock. This retained chain allows stale-peer recovery even after dispositions/certificates compact.
+Persist one canonical compact transition slot per epoch. It contains no full successor state. A start-after-ended transition embeds its predecessor completed-end certificate. Historical slots remain sealed and never trim before explicit reset. Only the active high-water slot may be replaced by an authorized same-epoch different-session reconciliation winner; the same transaction canonicalizes predecessor switched evidence.
 
-## Evidence bounds
+At `maxEpochTransitions`, write `capacity/transition-limit`. This lock is reset-only; no higher proof is requested because another epoch cannot fit.
 
-- current-epoch dispositions/certificates/lineage never trim;
-- historical dispositions/certificates may trim deterministically while preserving retained pairs;
-- transition certificates never trim;
-- capacity overflow never discards existing evidence.
+## Historical evidence compaction
 
-## Checkpoint publication
+- current-high-water end evidence never trims;
+- historical standalone ended disposition/certificate pairs may trim together;
+- embedded end proof in a transition remains;
+- reconciled and switched informational records compact deterministically;
+- lineage clears on higher epoch;
+- compaction never changes transition IDs or proof history.
+
+## Proof pages
+
+Proof assemblies are bounded runtime records, not persisted. A crash during assembly simply retries the exact proof. No incomplete page set mutates RoomMeta.
+
+The sender computes pages from one coherent metadata generation. If current outcome changes before completion, receiver discards the stale proof and requests a new one.
+
+## Immutable checkpoint publication
 
 ```text
-write CheckpointRecord(session blob)
+recordKey =
+  visual-novel:v1:<roomScope>:checkpoint:
+  <sessionId>:<token.generation>:<token.floorDigest>
+
+write immutable CheckpointRecord at recordKey
 acquire room lock
-  read latest meta
+  read latest metadata
   require token.generation == meta.generation
-  require token.floorDigest == meta.epochOutcome.floor.stateDigest
-  require state session == current canonical session
-  replace latest pointer with token-tagged pointer
+  require token.floorDigest == current floor digest
+  require token session == current canonical session
+  require stored record bytes match token/state
+  publish LatestCheckpointPointer(recordKey, token)
 release lock
 ```
 
-If any condition fails, leave the blob unreferenced and optionally garbage-collect later. An old side effect cannot overwrite a newer latest pointer.
+Never overwrite an existing checkpoint key. Existing unequal bytes produce `storage-failure`. A stale side effect leaves only an unreferenced immutable record and cannot damage a newer pointer or record.
 
-## Safety recovery
+Garbage collection may delete unreferenced records only after a fresh lock-held pointer scan and age threshold.
 
-Capacity recovery transaction requires a validated transition chain ending strictly above `lockedAtEpoch`. It clears the lock only while installing the higher outcome/origin/evidence. Digest-collision lock never clears remotely. Runtime capability/storage states require local repair and a new coherent bootstrap.
+## Safety recovery preflight
+
+For recoverable capacity codes:
+
+1. validate complete higher proof in memory;
+2. lock and re-read metadata/lock;
+3. deterministically compact permitted historical arrays;
+4. require transition count within limit;
+5. require resulting metadata within operational bytes;
+6. merge transitions/current evidence;
+7. clear lock and publish generation;
+8. enter ended or floor-only active recovery.
+
+`transition-limit` and `digest-collision` reject network recovery. Explicit reset clears metadata, transitions, pointers, immutable checkpoint records, emergency marker, and runtime assemblies.
 
 ## Tests
 
-- operational byte limit leaves enough room for durable capacity lock;
-- A→B→C transition records survive reload;
-- stale peer recovers after historical disposition trim;
-- generation-10 checkpoint cannot replace generation-11 pointer;
-- mixed-generation bootstrap retries;
-- lock-unavailable does no writes;
-- storage failure reads emergency state before controls;
-- historical evidence trimming preserves end pairs;
-- reset clears transitions, evidence, checkpoints, and locks explicitly.
+- progressed/ended outcome does not rewrite transition;
+- embedded end proof survives historical compaction;
+- transition-limit is reset-only;
+- evidence/lineage/operational lock recovery succeeds only when fit preflight passes;
+- maximum proof is paginated and never persisted partially;
+- generation-10 record write after generation-11 publication cannot alter generation-11 record or pointer;
+- key collision with unequal bytes enters storage failure;
+- coherent bootstrap ignores unreferenced stale records.

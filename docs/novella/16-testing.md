@@ -1,80 +1,105 @@
-# 16 — Regression, property, and failure-injection matrices
+# 16 — Regression, property, pagination, and failure-injection matrices
 
-> **Revision 12 changes:** adds exact RFC 8785 fixtures, multi-hop transition recovery, safety-lock recovery policy, lineage-bound advertisements, stale-peer supersession after trimming, and checkpoint token fencing.
+> **Revision 13 changes:** adds mutable-outcome dominance, proof pagination at real byte limits, self-contained transition dependencies, reset-only transition capacity, shared election transcripts, exact ID fixtures, and immutable checkpoint races.
 
-## Canonicalization and validation
+## Canonicalization and IDs
 
-- RFC 8785 fixtures for property order, control escaping, non-ASCII, lone-surrogate rejection, `-0`, exponent boundaries, and shortest numbers;
-- browser and Node canonical bytes/digest equality;
-- full-state/floor order equivalence;
-- digest collision hook enters durable lock;
-- transition ID/action/state/predecessor mix-and-match rejects;
-- contiguous transition array required through high water.
+- RFC 8785 fixtures for property order, escapes, Unicode, lone surrogates, `-0`, exponent boundaries, and shortest numbers;
+- browser/Node equality for state digest;
+- browser/Node equality for every derived-ID domain;
+- changing any normalized certificate/transcript/page field changes its ID;
+- object insertion order and locale never change IDs.
 
-## Start, transition, reconciliation
+## Transition and outcome
 
-- initial and start-after-ended transition certificates;
-- A→B→C stale-A recovery;
-- A→B then B ended stale-A recovery;
-- delayed old successor evidence at peer already beyond it is idempotent/current-wins;
-- exact descriptor and rev10→rev11 rebase;
-- complete-state local winner and floor-only local winner responses;
-- repeated logical reconciliation consumes one disposition slot;
-- former loser later wins;
-- same-session changed story rejects.
+- initial, switch, and start-after-ended compact transitions;
+- successor progresses from revision 0 to revisions 1/10/maximum and current floor dominates origin;
+- successor ends after progress and still validates against origin transition;
+- transition byte bound enforced;
+- start-after-ended embeds exact predecessor end proof;
+- standalone historical end pair compacts without breaking transition;
+- contiguous transition array and switched evidence ID invariants.
 
-## Migration
+## Proof pagination
 
-- two and three lineage records retain earlier authority;
-- interleaved advertisements select exact migration IDs;
-- missing/wrong advertisement migration ID rejects;
-- departed controller rejoins before delayed earlier-lineage announcement;
-- stronger delayed state converges despite rejoin;
-- migration rebase with full and floor-only receiver;
-- lineage overflow persists capacity lock.
+- one maximum transition plus final evidence fits a page;
+- maximum legal transition count splits into bounded pages;
+- no proof page includes full current state;
+- reorder, identical duplicate, missing page, retry, and expiry;
+- unequal duplicate index, mixed sender, mixed manifest, bad previous digest, wrong final digest reject;
+- local high-water advance invalidates assembly;
+- current outcome progress during transfer requires a new proof;
+- complete proof atomically adopts floor, then separate snapshot recovery installs state;
+- accumulated bytes and assembly-count overflow fail safely.
+
+## Reconciliation
+
+- exact descriptor;
+- stale descriptor with incoming winner;
+- complete local winner response;
+- floor-only local winner floor response;
+- former loser later wins and replaces only the active transition slot;
+- repeated logical reconciliation consumes one slot;
+- same-session story mutation rejects.
+
+## Migration transcript
+
+- two/three retained migration records;
+- all advertisements for one record share one round ID;
+- advertisement IDs fixture;
+- canonical sorted transcript and deterministic winner;
+- duplicate sender, wrong summary, wrong winner, wrong winning state, wrong transcript ID reject;
+- receiver derives identical controller-changed state locally;
+- two partitions with different valid transcripts later converge by comparator;
+- departed controller rejoin does not revoke record;
+- one max state plus max transcript remains below envelope limit.
 
 ## Termination and supersession
 
-- dropped ACK/reload/resend re-ACK;
-- ended without certificate never terminal;
-- certificate binding/tampering;
-- every below-high-water message receives supersession evidence;
-- exact disposition trimmed plus missed lifecycle callback still converges;
-- active and ended current-outcome supersession responses;
-- transition-capacity and certificate-byte overflow enter durable lock.
+- dropped ACK/reload/resend;
+- ended disposition requires certificate;
+- end after progress preserves floor;
+- A→B→C paginated stale-A recovery;
+- A→B→B-ended paginated recovery;
+- exact old disposition/certificate compacted plus missed lifecycle callback still converges;
+- current evidence active/ended rules;
+- below-high-water request never silently drops.
 
 ## Safety-lock matrix
 
-- capacity lock accepts strictly higher verified transition chain and rejects same/lower epoch;
-- digest-collision lock rejects all remote recovery;
-- lock-unavailable clears only after successful reprobe/bootstrap;
+- `evidence-limit`, `lineage-limit`, and fitting `operational-bytes` accept strictly higher proof;
+- same/lower epoch rejects;
+- failed compaction/fit leaves lock unchanged;
+- `transition-limit` rejects safety request/gossip and exposes reset-only UI;
+- `digest-collision` rejects network recovery;
+- lock-unavailable clears only after reprobe/bootstrap;
 - storage-failure clears only after local repair/bootstrap;
-- generic gate blocks installs while locked, but pre-gate capacity recovery works;
-- safety recovery atomically clears lock and installs outcome/floor/state or floor-only mode;
 - chat/media/files remain usable.
 
-## Cross-tab and checkpoint
+## Cross-tab and checkpoints
 
-- metadata/checkpoint mixed-generation read retries;
+- coherent metadata/pointer/record read retries on generation change;
 - transaction holds lock through canonical-store install;
 - crash after write before notification repaired on focus/action;
-- generation-10 checkpoint side effect runs after generation 11 and cannot replace latest pointer;
-- stale token blob remains unreferenced;
-- operational metadata reserve always fits compact lock;
-- concurrent evidence merges preserve invariants or lock safely.
+- generation-10 immutable record writes after generation-11 pointer publication;
+- generation-11 record and pointer remain byte-identical;
+- stale record is unreferenced and later garbage-collected;
+- pointer to wrong key/generation/floor rejects;
+- existing-key unequal bytes triggers storage failure.
 
 ## Property/fuzz
 
-- RFC 8785 serializer agrees with fixtures and reference implementation;
 - comparator totality/transitivity;
-- transition-chain validation and concatenation;
-- arbitrary delivery order converges while active;
+- current outcome always dominates final canonical transition origin;
+- same-epoch different-session winner replaces only active slot, and the slot seals after higher epoch/end;
+- transition concatenation and noncircular proof page/final manifest hash chain;
+- arbitrary page delivery never partially changes metadata;
+- arbitrary message delivery converges while active;
 - no same-epoch install after end;
-- every exposed state equals floor digest;
-- disposition merge ACI properties;
-- stale below-high-water traffic always produces bounded current evidence;
-- arbitrary metadata interleavings preserve invariants or enter durable lock.
+- every exposed state equals current floor digest;
+- disposition merge associative/commutative/idempotent;
+- metadata interleavings preserve invariants or retain a valid lock.
 
-## Failure mesh and CI
+## CI
 
-Transport supports directional links, delay, reorder, duplicate, drop, suppressed lifecycle callbacks, partial delivery/crash, and lost generation publication. Implementation PRs must run unit, type, lint, build, and focused E2E checks. Documentation-only commits may have no workflow run.
+Implementation PRs must run unit, type, lint, build, focused E2E, browser JCS/ID fixtures, and maximum-byte transport tests. Documentation-only commits may have no workflow run.

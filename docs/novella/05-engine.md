@@ -1,42 +1,43 @@
-# 05 — Pure deterministic transport-safe engine
+# 05 — Pure transport-safe engine
 
-> **Revision 12 changes:** engine semantics remain pure; surrounding code now serializes validated output with RFC 8785 and generation-fences checkpoint publication.
+> **Revision 13 changes:** migration now transports one winning pre-change state and derives controller change locally, preserving the one-state envelope budget.
 
-The engine imports no React, storage, transport, DOM, global randomness, hashing API, or implicit clock. It receives a validated story and explicit dependencies and never mutates input.
+The engine imports no React, storage, transport, DOM, global clock, randomness, hashing, or serialization API. It receives validated inputs and explicit dependencies and never mutates input.
 
 ## Operations
 
-- `start(sessionId, controllerPeerId, epoch)` creates revision 0 at the manifest start entry;
-- `advance` follows explicit/implicit transitions and refuses unresolved required choices;
-- `choose` validates availability, applies immutable effects, and moves to target;
+- `start(sessionId, controllerPeerId, epoch)` creates revision 0;
+- `advance` follows explicit/implicit transitions and refuses unavailable required choices;
+- `choose` validates choice availability, applies immutable effects, and moves to target;
 - `restart` preserves session/controller/epoch and increments revision;
-- `changeController` preserves story/session/epoch and increments revision;
-- getters assert exact story compatibility and referenced content.
+- `changeController(state, newControllerPeerId)` preserves story content and increments revision exactly once;
+- getters assert exact story compatibility and referenced scene/entry existence.
 
-## Guard order
+## Transport and size safety
 
-Before exposing changed state, enforce variable count/bytes, finite numbers, safe integers, bounded strings/history, and valid story references. Failed guards throw before mutation.
+Before returning state, enforce variable/history/string/number/revision bounds. A failed guard throws before mutation. Snapshot conversion truncates history and final validators enforce aggregate byte budgets.
 
-## Distributed boundary
+`CONTROLLER_CHANGED` carries the winning pre-change state only. Every receiver validates it, runs `changeController` with the transcript winner, validates/JCS-digests the deterministic result, and compares that result against its current baseline.
+
+## Digest boundary
 
 ```text
 engine output
-→ fresh structural normalization
+→ structural normalization
 → semantic validation
-→ RFC 8785 canonical bytes
-→ domain-separated SHA-256 digest
-→ lock-scoped metadata/floor/store install
-→ generation-fenced checkpoint side effect
+→ RFC 8785 bytes
+→ SHA-256 state digest
+→ room-lock floor/state transaction
 ```
 
-`updatedAt` remains diagnostic and is absent from the semantic object.
+`updatedAt` is diagnostic and excluded from semantic bytes. Normal progression uses one shared envelope timestamp.
 
 ## Determinism tests
 
-- starts, endings, restart, controller change, explicit and implicit next;
-- gated/dead-end choices and effect failures;
+- starts, transitions, choices, restart, controller change;
+- gated/dead-end choices;
+- numeric/string/boolean effects and nonfinite rejection;
 - overflow leaves input unchanged;
-- random walks yield identical RFC 8785 bytes and digests;
-- browser and Node JCS fixtures match;
-- every accepted transition advances floor in its transaction;
-- old generation checkpoint publication is rejected.
+- browser/Node deterministic walks produce equal JCS bytes and digests;
+- every peer derives the same controller-change state from transcript winner;
+- one maximum legal state plus migration transcript remains within envelope budget.

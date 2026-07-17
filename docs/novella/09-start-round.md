@@ -1,61 +1,72 @@
-# 09 — Coordinated starts, reconciliation, and epoch transitions
+# 09 — Coordinated starts, reconciliation, and immutable epoch origins
 
-> **Revision 12 changes:** every new epoch persists a transition certificate, switch recovery uses a retained chain rather than only current origin, and floor-only losers receive floor evidence.
+> **Revision 13 changes:** transition certificates are compact immutable origin proofs; current outcomes advance independently; supersession pages carry no full state.
 
 ## Initial start
 
-Coordinator selects revision-0 proposal deterministically. One transaction:
+Coordinator selects a revision-0 proposal deterministically. One transaction:
 
-- requires `highWaterEpoch === 0`;
-- creates the epoch-1 `initial-start` transition;
+- requires high water 0;
+- validates complete state;
+- creates compact `StartDecisionCertificate`;
+- creates epoch-1 `initial-start` transition;
 - creates active outcome/floor;
-- stores active origin referencing the transition/start decision;
-- installs exact state;
-- clears obsolete runtime operations.
+- stores origin reference;
+- installs state.
 
-Broadcast follows success.
+The transition stores only the revision-0 floor and compact decision authorization. `activeOrigin` references that transition ID. The complete start state remains available through normal start gossip/snapshot continuity.
 
 ## Start after ended epoch
 
-A fresh start after an ended outcome creates exactly `highWater + 1` and an `EpochTransitionCertificate(kind: 'start-after-ended')` whose predecessor is the exact ended outcome. The transition and new state install atomically.
+A fresh start creates exactly `highWater + 1`. Its transition:
 
-## Reconciliation
+- records the exact ended predecessor outcome;
+- embeds the predecessor completed-end certificate;
+- carries a compact start-decision origin and revision-0 successor floor.
 
-Complete-state baselines include canonical store, coherent checkpoint, lineage states, active-origin state where available, and floor. All use the RFC 8785 SHA-256 comparator.
-
-- exact descriptor path applies normally;
-- stale descriptor path rebases;
-- different-session winner carries origin/transition evidence;
-- logical reconciled disposition upserts by `(epoch, losingSession, reconciled)`;
-- former loser remains eligible while epoch active;
-- floor-only local winner returns floor evidence and begins full-state recovery.
+The embedded end proof makes the transition independently valid even if the standalone historical certificate array is later compacted.
 
 ## Controller story switch
 
-`SESSION_STARTED` payload contains predecessor subject/revision and revision-0 successor state. The transaction:
+`SESSION_STARTED` carries predecessor subject/revision and one revision-0 successor state. The transaction:
 
-1. verifies sender controls the predecessor;
-2. creates one `switch` transition certificate;
-3. upserts switched disposition with `evidenceId = transitionId`;
-4. raises high water exactly one;
-5. stores successor outcome/floor and active origin;
-6. installs successor state;
+1. verifies sender controlled the predecessor;
+2. validates successor state;
+3. creates compact session-started origin certificate;
+4. appends one `switch` transition;
+5. upserts old switched disposition referencing the transition ID;
+6. raises high water and installs successor state/outcome/origin;
 7. clears predecessor lineage/conflicts/recovery.
 
-## Supersession chain
+## Progression after origin
 
-For stale session A after A→B→C, holder sends both retained transitions A→B and B→C plus current C outcome/origin/state. If C ended, current origin is null and C’s completed-end certificate is included. The A disposition’s evidence ID remains the A→B transition ID.
+Progression updates only current outcome floor and canonical state. The transition’s revision-0 origin floor remains unchanged. End changes current outcome status and preserves its latest floor; it also does not rewrite the transition.
 
-Every below-high-water subject receives a chain beginning after its epoch, even if its exact disposition was compacted.
+## Reconciliation
+
+Complete-state baselines include canonical store, coherent checkpoint, lineage last states, recoverable start state, and durable floor.
+
+- exact descriptor applies;
+- stale descriptor rebases;
+- different-session winner includes a full valid compact origin transition for the same active epoch;
+- if it wins, replace only the active high-water transition slot, active origin, outcome/floor, and predecessor switched evidence; historical slots remain sealed;
+- logical reconciled history upserts;
+- former loser remains eligible while epoch active;
+- floor-only local winner returns floor evidence and starts state recovery.
+
+## Supersession
+
+For stale A after A→B→C, holder pages compact A→B and B→C transitions. Final page carries current C outcome/floor and origin or end certificate. It never carries C’s full state. After proof completion, stale peer adopts C floor and exact-recovers C state if active.
+
+Validation compares C current outcome to C origin by subject identity and floor dominance, not byte equality.
 
 ## Tests
 
-- RFC 8785/full-floor winner equivalence;
-- initial and start-after-ended transitions;
-- A→B→C delayed A recovery;
-- A→B then B ended delayed A recovery;
-- stale descriptor exact/full-state/floor-only paths;
+- initial, switch, and start-after-ended compact transitions;
+- progression to revision 10 preserves revision-0 transition;
+- ending after progression validates against origin transition;
+- A→B→C and A→B→B-ended paginated recovery;
+- compacted standalone predecessor end certificate does not break transition;
+- exact/full/floor-only reconciliation paths;
 - former loser later wins;
-- repeated reconciliation uses one slot;
-- switch envelope action/state/predecessor mismatch rejects;
-- ended high-water rejects queued installs.
+- maximum transition and state never share one oversized envelope.

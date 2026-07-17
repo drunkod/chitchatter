@@ -1,71 +1,98 @@
-# 10 — Lineage-bound controller migration and rebasing
+# 10 — Transcript-bound controller migration and rebasing
 
-> **Revision 12 changes:** advertisements identify exact migration records, retained authority survives controller rejoin, and floor-only migration conflicts return floor evidence.
+> **Revision 13 changes:** one stable migration round is shared by all advertisements, controller change carries a canonical transcript and one winning pre-change state, and every election ID has exact derivation.
 
 ## Opening migration authority
 
-After `ensureLatestGeneration()`, current-controller absence may append:
+After generation refresh, current-controller absence may append:
 
 ```ts
-const record: MigrationRecord = {
-  migrationId: deriveRoundId(rawEpochSessionDepartedRevisionFields),
-  sessionEpoch: state.sessionEpoch,
-  sessionId: state.sessionId,
-  departedControllerPeerId: departedPeerId,
-  openedAtRevision: state.revision,
-  lastAppliedState: null,
-}
+const migrationId = deriveProtocolId('migration-record', {
+  sessionEpoch,
+  sessionId,
+  departedControllerPeerId,
+  openedAtRevision,
+})
+
+const migrationRoundId = deriveProtocolId('migration-round', {
+  migrationId,
+  sessionEpoch,
+  sessionId,
+  departedControllerPeerId,
+  openedAtRevision,
+})
 ```
 
-Absence is checked here. Once persisted, later peer rejoin does not revoke the record.
-
-## Lineage
-
-Sequential departures append records and never replace older unresolved authority. Records remain until terminal disposition, higher epoch, or reset. Lineage-capacity exhaustion writes the durable capacity lock using reserved headroom.
+Absence is checked only here. Later rejoin does not revoke the record.
 
 ## Advertisement
 
+Each participant sends:
+
 ```ts
 ELECTION_ADVERTISE {
-  roundId,
-  migrationId,
-  departedControllerPeerId,
-  openedAtRevision,
+  migrationRoundId,
+  advertisementId,
+  candidatePeerId: selfPeerId,
   state,
 }
 ```
 
-Validator selects the exact lineage record and recomputes round ID from migration ID, epoch/session, departed controller, opening revision, sender, and state digest. Interleaved advertisements for different lineage records cannot share one round.
+`advertisementId` derives from round ID, sender/candidate, and validated state priority. The outer sender equals candidate. All advertisements for one migration record share the same `migrationRoundId`.
 
-## Controller changed
+## Transcript construction
 
-`CONTROLLER_CHANGED` repeats migration ID and departed-controller identity, includes canonical electorate/controller, and carries complete state. Authorization requires the selected lineage record but does **not** require the departed peer to remain absent.
+After retry collection, a peer:
 
-Inside `transactAndInstall`:
+1. deduplicates advertisements by sender;
+2. converts each to `ElectionAdvertisementSummary`;
+3. sorts summaries by sender ID;
+4. selects the winner by greatest state priority, then lower candidate ID, then lower advertisement ID;
+5. derives `transcriptId`;
+6. sends `CONTROLLER_CHANGED` with the transcript and the complete winning pre-change state.
 
-- re-read latest outcome/floor/origin/lineage;
-- reselect record;
-- recheck closed/safety state;
-- compare against latest full state/floor;
-- update selected record’s last-applied state;
-- advance floor and install.
+The electorate is exactly the transcript’s sender set. There is no separately asserted electorate.
+
+## Controller change application
+
+Receiver validates:
+
+- round selects one retained migration record;
+- every summary and advertisement ID recomputes;
+- transcript is sorted/unique and within bounds;
+- winner is deterministic;
+- `winningState` matches winner priority/digest.
+
+Receiver then locally derives:
+
+```ts
+const changed = engine.changeController(
+  validatedWinningState,
+  winner.candidatePeerId,
+)
+```
+
+The result is semantically validated, JCS-digested, compared against current state/floor, and installed if authorized. This keeps the action below the envelope limit because only one full state is transported.
+
+## Competing transcripts
+
+Different partitions may collect different valid transcripts for the same round. Each produces a valid derived state. Delayed results compare through the ordinary state comparator and migration reconciliation. Transcript authority proves a valid local election observation, not Byzantine consensus.
+
+## Lineage
+
+Sequential departures append records and retain earlier authority until terminal disposition, higher epoch, or reset. `lineage-limit` writes a recoverable capacity lock; a verified higher epoch may clear it because old lineage is superseded.
 
 ## Migration rebase
 
-A weaker announcement receives a migration-kind reconcile descriptor. On stale delivery:
-
-- incoming winner applies with fresh descriptor;
-- complete local winner is returned with fresh descriptor;
-- floor-only local winner returns `STATE_FLOOR_GOSSIP` and starts recovery;
-- equal digest is idempotent subject to collision checks.
+A weaker derived controller-change state receives migration reconcile evidence. Full-state and floor-only stale paths follow the common rebase rules.
 
 ## Tests
 
-- two/three lineage records and interleaved advertisements;
-- advertisement missing/wrong migration ID rejects;
-- departed controller rejoins before delayed earlier-lineage announcement;
-- delayed earlier-lineage stronger state converges;
-- descriptor rev10→rev11 rebase with full and floor-only receiver;
-- lineage overflow persists capacity lock;
-- lock-unavailable browser opens no authority;
-- end/higher epoch clears lineage.
+- multiple advertisements share one round ID;
+- advertisement IDs and transcript ID match browser/Node fixtures;
+- transcript order, duplicate sender, wrong winner, wrong state reject;
+- two partitions produce different valid transcripts and later converge by state comparator;
+- controller rejoin does not revoke retained lineage;
+- one max state plus max transcript fits envelope;
+- lineage-limit accepts fitting higher-epoch safety recovery;
+- transition-limit does not.

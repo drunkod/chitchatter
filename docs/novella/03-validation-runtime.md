@@ -1,114 +1,144 @@
 # 03 — Runtime structural validation and normalization
 
-> **Revision 12 changes:** validates RFC 8785 inputs, contiguous transition certificates, supersession chains, safety-recovery exceptions, lineage-bound advertisements, and generation-fenced checkpoints.
+> **Revision 13 changes:** validates compact origin certificates, mutable-outcome dominance, paginated proof chains, exact derived IDs, election transcripts, cause-specific locks, and immutable checkpoint keys.
 
 ## Envelope pipeline
 
-1. reject encoded input above the envelope budget before deep traversal;
+1. reject encoded input above `maxEnvelopeBytes` before deep traversal;
 2. validate protocol/action/primitive fields;
-3. normalize the discriminated payload into fresh objects;
-4. cross-check outer subject scope and transport sender identity;
+3. normalize the selected payload into fresh bounded objects;
+4. cross-check outer subject and transport sender identity;
 5. drop unknown fields and MVP `proof`;
 6. run semantic story/state validation;
-7. serialize complete states with RFC 8785 and compute the exact SHA-256 digest.
+7. compute JCS bytes, state digest, and every required protocol-derived ID;
+8. authorize only after all identities and byte budgets are known.
 
-## RFC 8785 prerequisites
+## Exact derived IDs
 
-Reject complete states containing:
+For every transition, conflict, migration record, migration round, advertisement, transcript, decision, proof manifest, and proof page:
 
-- lone UTF-16 surrogates;
-- nonfinite numeric values;
-- unsafe integer fields;
-- unsupported value types;
-- unknown semantic-state properties after normalization.
+- reconstruct the exact domain input object;
+- omit the ID being derived;
+- serialize with RFC 8785;
+- apply `deriveProtocolId`;
+- reject non-lowercase-hex or mismatched values.
 
-Tests must include official-style JCS fixtures plus project fixtures for control escapes, non-ASCII strings, `-0`, exponent thresholds, and property order.
+No locale, insertion-order, FNV, UUID ordering, or host-dependent serializer participates in safety identity.
 
-## Transition certificates
+## Compact transition certificates
 
-Validate every `EpochTransitionCertificate`:
+Validate:
 
-- `initial-start` is epoch 1 with `predecessorOutcome: null`;
-- later transitions have predecessor epoch exactly `successor.epoch - 1`;
-- transition array is contiguous from epoch 1 through `highWaterEpoch`;
-- successor outcome is active and its floor revision is 0;
-- start-decision origin exactly matches successor floor/session/story;
-- session-started certificate contains the full normalized original envelope;
-- `SESSION_STARTED` outer sender equals the predecessor controller and payload predecessor subject/revision matches the prior outcome/state authorization;
-- transition ID recomputes from all normalized raw fields;
-- switch disposition evidence ID equals its transition ID.
+- initial start: null predecessor, successor epoch 1, start-decision origin;
+- later transition: predecessor epoch exactly successor epoch minus one;
+- switch: predecessor outcome active, no embedded end certificate, session-started origin;
+- start-after-ended: predecessor outcome ended and exact embedded completed-end certificate;
+- successor subject equals origin floor subject and revision is 0;
+- origin certificate IDs and state-floor digest fields recompute;
+- transition ID recomputes from every normalized field;
+- encoded transition certificate stays within its dedicated byte bound.
 
-## Supersession chains
+The metadata transition array is contiguous from epoch 1 through high water. Slots below high water are sealed. A transaction may replace only the active high-water slot when a same-epoch different-session reconciliation state wins and carries a valid competing origin transition with the same sealed predecessor.
 
-For `SESSION_SUPERSESSION_GOSSIP` and `SAFETY_RECOVERY_GOSSIP`:
+## Current outcome dominance
 
-- requested subject matches the stale envelope/request being answered;
-- transition list is nonempty, bounded, contiguous, and begins after the requested epoch;
-- every certificate validates independently;
-- final transition successor equals `currentOutcome`;
-- active current outcome has matching `currentOrigin` and no end certificate;
-- ended current outcome has null origin and exact end certificate;
-- current known state, when present, exactly matches floor priority and digest.
+Let `last` be the final retained transition:
 
-A chain may advance over several switches or a start-after-ended transition. It never rewrites historical transition IDs.
+- `epochOutcome.epoch`, canonical session, story, and version equal `last.successorSubject`;
+- `compareFloor(epochOutcome.floor, last.successorOriginFloor) >= 0`;
+- active outcome has `activeOrigin` pointing to the last transition;
+- ended outcome has null active origin and an exact current completed-end certificate;
+- progression/end never changes the stored winning transition certificate.
 
-## Conflict descriptor modes
+## Proof manifests and pages
 
-- descriptor IDs and digests are canonically ordered and recomputed;
-- incoming digest belongs to the descriptor;
-- migration kind selects a retained lineage record;
-- exact mode requires latest baseline digest to be the other digest;
-- stale mode accepts the descriptor only as correlation and rebases against latest state/floor;
-- floor-only stale mode may return `STATE_FLOOR_GOSSIP` instead of a complete winner.
+Validate every page independently:
 
-## Migration envelopes
+- purpose matches action type;
+- request action ID and requested subject match the outstanding recovery;
+- page count/index and epoch range are bounded;
+- source peer equals the recovery target and every page carries the same bounded positive `sourceGeneration`;
+- page payload and accumulated assembly bytes fit limits;
+- transitions are nonempty except an explicitly allowed final evidence-only page;
+- transition sequence within a page is contiguous;
+- page 0 has null previous digest; later pages name the prior page digest;
+- page digest recomputes from `manifestCore` that excludes `proofId` and `finalPageDigest`; proof ID recomputes from that core plus final page digest;
+- current evidence appears only on the final page and hashes to `currentEvidenceDigest`.
 
-`ELECTION_ADVERTISE` and `CONTROLLER_CHANGED` both require:
+After all pages arrive:
 
-- `migrationId`, departed controller, and opening revision matching one retained record;
-- round ID recomputed from migration ID, epoch/session, departed controller, opening revision, electorate where applicable, controller, and state digest;
-- same session/epoch/story as lineage and active outcome;
-- current peer presence does not invalidate an already-retained migration record.
+- order by page index;
+- verify page-digest chain ends at manifest `finalPageDigest`;
+- concatenate transitions and require exact epoch continuity from `fromEpochExclusive + 1` through `toEpochInclusive`;
+- verify final transition subject matches current outcome identity;
+- require current floor to dominate final transition origin floor;
+- validate active origin or ended certificate;
+- reject mixed senders, mixed manifests, duplicate index with unequal bytes, stale proof IDs, or over-budget assemblies.
 
-Transport absence is checked only when opening a new migration record.
+No page mutates RoomMeta or canonical state before complete-proof validation.
 
 ## Dispositions and end evidence
 
-- ended disposition enters RoomMeta only atomically with its exact completed certificate;
-- retirement gossip carrying ended is rejected;
-- switched disposition must match one retained transition certificate;
-- reconciled logical key is `(epoch, sessionId, reason)` and merges by bytewise-minimum conflict ID;
-- ended/switched conflicting evidence IDs are blocking contradictions.
+- ended disposition enters metadata only with exact completed-end certificate;
+- current ended certificate never trims;
+- historical standalone certificates may trim even when their content is embedded in a retained start-after-ended transition;
+- switched disposition references the canonical immediate successor transition;
+- while that successor epoch is active, replacement of its canonical transition also replaces the predecessor switched evidence ID; once the successor slot is historical or ended, a conflicting switched ID blocks;
+- reconciled records merge by deterministic logical key;
+- conflicting ended/switched evidence IDs block.
 
-## RoomMeta normalization
+## Migration records and elections
 
-Reject:
+For a migration record:
 
-- nonzero high water without exactly `highWaterEpoch` contiguous transition certificates;
-- transition predecessor/successor discontinuity;
-- outcome/floor/current-origin mismatch;
-- switched disposition with missing/mismatched transition;
-- ended disposition/certificate mismatch;
-- lineage inconsistent with active outcome;
-- migration advertisements referring to no lineage record;
-- any durable epoch above high water;
-- operational metadata above `maxOperationalRoomMetaBytes` without a durable safety lock;
-- total metadata above `maxRoomMetaBytes`;
-- malformed or impermissibly cleared durable safety lock;
-- duplicate/noncanonical evidence;
-- invalid generation or checkpoint token fields.
+- `migrationId` derives from epoch/session/departed controller/opening revision;
+- `migrationRoundId` derives only from `migrationId` and the same immutable record fields;
+- current peer presence is checked only when opening the record.
 
-Malformed RoomMeta blocks receiver attachment. Runtime capability/storage states are separate from RoomMeta validation.
+For advertisements:
+
+- round ID selects one retained record;
+- candidate equals sender;
+- advertised state matches active session/story/epoch;
+- advertisement ID derives from round, sender/candidate, and state priority.
+
+For controller change:
+
+- transcript advertisements are sorted and unique by sender;
+- every summary ID recomputes;
+- transcript round matches the selected record;
+- winner is deterministic under the documented ordering;
+- full `winningState` exactly matches the winner summary priority/digest;
+- derived controller-change state is produced locally by the pure engine;
+- transcript ID recomputes.
+
+## Safety locks
+
+- `transition-limit` and `digest-collision` never accept network recovery;
+- other capacity codes accept only `SAFETY_RECOVERY_GOSSIP`;
+- complete proof must end strictly above `lockedAtEpoch`;
+- recovery preflight compacts only permitted historical arrays and proves final metadata fits operational limits;
+- clearing lock and adopting higher outcome happen in one room-lock transaction;
+- same/lower epoch or a proof requiring transition count beyond the limit rejects.
+
+## Checkpoint records
+
+The storage key is derived locally as:
+
+```text
+visual-novel:v1:<roomScope>:checkpoint:<sessionId>:<generation>:<floorDigest>
+```
+
+Validate pointer and record key, session, generation, floor digest, and state digest. A key collision with unequal bytes is a storage failure. Pointer publication may reference only the exact immutable record named by its generation token.
 
 ## Required tests
 
-- RFC 8785 string/number/property fixtures in browser and Node;
-- A→B→C transition chain and A→B then B ended;
-- transition ID/action-state mix-and-match rejection;
-- interleaved advertisements for two migration IDs;
-- controller rejoin does not invalidate retained lineage;
-- stale below-high-water supersession chain validation;
-- capacity lock fits reserved metadata headroom;
-- checkpoint pointer generation/floor mismatch rejection;
-- exact, stale-full-state, and stale-floor-only conflict modes;
-- alias-free normalization for every action and record.
+- official/reference JCS fixtures and exact derived-ID fixtures across browser and Node;
+- progressed and ended current outcomes dominate immutable origin transition;
+- maximum-size proof page and maximum-size snapshot remain below envelope budget;
+- reordered/duplicated/lost proof pages and mixed-sender rejection;
+- start-after-ended transition survives standalone end-certificate compaction;
+- transition-limit lock rejects safety-recovery request/gossip;
+- shared migration round plus transcript winner;
+- stale checkpoint writer cannot overwrite immutable newer blob;
+- alias-free normalization for all 26 actions and durable/runtime records.

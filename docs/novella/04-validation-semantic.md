@@ -1,67 +1,94 @@
-# 04 — Semantic validation: stories, states, transitions, and checkpoints
+# 04 — Semantic validation: stories, states, transitions, outcomes, and checkpoints
 
-> **Revision 12 changes:** adopts exact JCS semantic bytes, validates transition predecessor/successor story semantics, and generation-fences checkpoint classification.
+> **Revision 13 changes:** validates transition origin separately from mutable current outcome, compact predecessor proofs, transcript-derived controller changes, and immutable checkpoint records.
 
 ## Session against story
 
-`validateSessionAgainstStory` resolves exact `(storyId, storyVersion)` and verifies current scene/entry, history references and increasing revisions, choices, variables/effects, controller/session/epoch/revision constraints, and immutable inputs.
+`validateSessionAgainstStory` resolves exact `(storyId, storyVersion)` and verifies current scene/entry, history references and strictly increasing revisions, choice/effect validity, variable types and limits, controller/session/epoch/revision constraints, and immutable inputs.
 
-## Mandatory complete-state entry points
+## Complete-state entry points
 
-Normalize, resolve story, validate, RFC-8785 serialize, and digest:
+Normalize, resolve story, validate, JCS-serialize, and digest:
 
-- start proposals, decisions, and decision gossip;
+- start proposals and committed/gossip start state;
 - reconciliation state;
-- snapshots and floor-recovery candidates;
-- `SESSION_STARTED`, restart, election advertisement, and controller-change state;
+- snapshots and recovery candidates;
+- `SESSION_STARTED`, restart, and election advertisement state;
+- winning migration state before deterministic controller change;
 - checkpoints;
-- transition successor origin state;
-- migration-lineage last-applied state;
-- supersession known state.
+- supersession-recovered snapshots;
+- lineage last-applied states.
 
-## Immutable identity
+Compact transition certificates carry floors/digests, not complete origin states. Their complete state is verified when the epoch is first committed or later recovered by digest. A same-epoch different-session reconciliation must carry the competing compact origin transition so a winning state can replace the active slot atomically.
 
-Two states sharing `(sessionId, sessionEpoch)` require exact story ID/version equality. A new story requires a new session and an authorized epoch transition.
+## Immutable session identity
+
+Two states sharing `(sessionId, sessionEpoch)` require exact story ID/version equality before comparison or engine use. A new story requires a new session and authorized new-epoch transition.
 
 ## Floor semantics
 
-State and floor compare the same `(epoch, revision, controller, session, digest)` tuple.
+State and floor compare the same priority tuple.
 
 - below floor: stale;
-- equal tuple: exact digest required;
-- above floor: only an authorized complete-state path may install;
-- same digest plus unequal complete JCS bytes: digest-collision lock;
-- floor-only receiver may reject a lower state and send `STATE_FLOOR_GOSSIP` while recovering the complete winner.
+- equal priority: exact digest;
+- above floor: install only through an authorized complete-state path;
+- equal digest plus unequal complete JCS bytes: durable collision lock;
+- floor-only receiver may reject a lower incoming state, send floor evidence, and request the complete canonical state.
 
-## Transition semantics
+## Transition origin semantics
 
-- successor state is revision 0 and resolves its exact story;
-- `switch` predecessor must be the then-active session and sender must be its controller;
-- `start-after-ended` predecessor outcome must be ended with matching completed certificate in local metadata;
-- transition chain may cross different stories and sessions but epochs are contiguous;
-- active origin refers to the final transition certificate or initial start decision;
-- an ended current outcome may have no active origin while historical transition evidence remains.
+- successor origin floor is revision 0 and resolves its exact story;
+- start-decision certificate binds coordinator/action ID to successor subject and digest;
+- session-started certificate binds predecessor subject/revision/controller/action ID to successor subject and digest;
+- switch predecessor was active at transition time;
+- start-after-ended predecessor was ended and embeds its exact completed-end certificate;
+- transition chain may cross stories/sessions but epochs are contiguous;
+- historical slots are sealed; only the active high-water slot may be replaced by a comparator-winning same-epoch different-session origin.
 
-## Coherent checkpoint classification
+## Current outcome semantics
 
-Classification receives metadata, latest pointer, and checkpoint from one `ConsistentBootstrapSnapshot`.
+Current outcome and final transition are related by identity and dominance:
 
-- active candidate: exact current outcome session/story and not below floor;
-- authoritative stale: older epoch, noncanonical session, terminally disposed session, or pointer token not current;
-- blocking contradiction: checkpoint above same-generation high water, immutable-story mismatch, or impossible floor relation;
-- post-transaction pointer publication uses the generation token and cannot make an older checkpoint current.
+```text
+same epoch/session/story
+current floor >= successor origin floor
+```
 
-## Unknown stories
+An active outcome has matching active origin. An ended outcome may have a later floor than revision 0, has null origin, and requires current exact end evidence. Neither progression nor end rewrites the transition.
 
-Unknown current outcome/transition/checkpoint story versions enter a recoverable blocking lobby with exact diagnostics. They never reach render-time engine calls.
+## Supersession/safety proof semantics
+
+After complete page assembly:
+
+- proof begins immediately after requested epoch;
+- proof ends at advertised current epoch;
+- final transition identifies the current subject;
+- current outcome dominates final origin floor;
+- active evidence contains matching origin and no end certificate;
+- ended evidence contains null origin and exact end certificate;
+- active receiver enters floor-only recovery until exact/higher authorized state arrives.
+
+A proof may be valid but stale if local high water already exceeds its final epoch; local current metadata wins and the proof is discarded idempotently.
+
+## Migration transcript semantics
+
+Each advertisement summary carries enough priority fields to compare without full state. The transcript winner is deterministic. `winningState` must exactly match the winning summary. Receiver derives the new controller state by calling the pure `changeController` engine operation with the winning candidate, then validates/digests the result before comparison and install.
+
+## Coherent checkpoint semantics
+
+Bootstrap receives emergency state, metadata, pointer, and immutable record from one coherent snapshot.
+
+- active candidate: exact current subject and not below floor;
+- authoritative stale: older generation/epoch, noncanonical session, terminal subject, or pointer token not current;
+- blocking contradiction: checkpoint above same-generation high water, immutable-story mismatch, impossible floor relation, or pointer-record identity mismatch;
+- stale immutable records remain harmless garbage until bounded collection.
 
 ## Tests
 
-- JCS fixtures and digest fixtures match across runtimes;
-- transition chain validates across multiple story switches;
-- start-after-ended requires ended predecessor evidence;
-- full-state and floor ordering agree;
-- same-session story mutation rejects;
-- floor-only lower incoming returns floor evidence;
-- generation-fenced stale checkpoint remains nonblocking;
+- progressed successor and ended successor validate against revision-0 transition;
+- start-after-ended remains valid after standalone historical certificate removal;
+- full/floor ordering equivalence;
+- floor-only lower incoming response;
+- transcript winner and locally derived controller-change state;
+- generation-specific pointer/record mismatch;
 - unknown story/version enters recoverable lobby.

@@ -1,6 +1,6 @@
-# 11 — Termination, end certificates, dispositions, and supersession
+# 11 — Termination, embedded predecessor proofs, dispositions, and supersession pages
 
-> **Revision 12 changes:** historical switch recovery uses retained transition chains, below-high-water traffic always gets current evidence, and capacity overflow remains durably fail-closed.
+> **Revision 13 changes:** start-after-ended transitions embed their end proof, current outcome may end after arbitrary progress, and stale-peer responses are paginated without full state.
 
 ## Original end and ACK
 
@@ -10,53 +10,59 @@ Controller creates one exact-next-revision `SESSION_ENDED { sessionEpoch }`, fre
 
 One transaction:
 
-- upserts ended disposition with `evidenceId = endActionId`;
+- upserts ended disposition with end action ID;
 - stores exact completed-end certificate;
-- marks matching canonical outcome ended while preserving floor;
+- marks matching current outcome ended while preserving latest floor;
 - clears active origin and migration lineage;
 - cancels same-epoch conflicts/recovery;
 - installs null.
 
-Then ACK, generation-fenced checkpoint cleanup, and duplicate commit.
+The winning epoch transition remains the revision-0 origin certificate and becomes sealed when the outcome ends.
 
 ## Re-ACK and holder gossip
 
-A resent original end matching a retained certificate re-ACKs before disposition checks. Holders send fresh end gossip containing the certificate; receiver merges ended disposition and certificate atomically. Retirement gossip with reason ended is rejected.
+A resent original end matching a retained current/historical certificate re-ACKs before disposition checks. Holder end gossip contains the exact completed certificate. Retirement gossip with reason ended rejects.
 
-## Dispositions
+## Start-after-ended dependency
 
-- ended: terminal only with exact certificate;
-- switched: historical evidence references one retained epoch transition;
-- reconciled: informational/nonterminal at active high water;
-- below-high-water subject: rejected locally but answered with current supersession evidence.
+When a later epoch starts after this ended epoch, its transition embeds a normalized copy of this completed-end certificate. The standalone historical certificate/disposition pair may later compact without invalidating the transition.
 
-Historical dispositions/certificates may compact under their bounds, but epoch transitions are retained. Therefore stale-peer convergence never depends on retaining the exact disposition.
+Compaction rules:
 
-## Supersession responses
+- never trim current-high-water end evidence;
+- never mutate embedded transition proof;
+- standalone historical pair trims only together;
+- a malformed mismatch blocks metadata.
 
-For any authenticated stale subject:
+## Supersession response
 
-- active current outcome → contiguous transition chain, current origin, and exact-floor state if available;
-- ended current outcome → chain plus current completed-end certificate;
-- floor-only holder → chain plus current outcome/origin and recovery targets;
-- no exact old disposition required.
+For any authenticated below-high-water subject, holder creates paginated compact transition proof:
+
+- chain begins immediately after requested epoch;
+- final current evidence names active origin/floor or ended certificate;
+- no full current state is embedded;
+- active receiver exact-recovers state after proof completion;
+- ended receiver installs null and closed outcome.
+
+A progressed/ended current outcome is validated as dominating the final transition’s revision-0 origin.
 
 ## Capacity failure
 
-Operational metadata always reserves space for the compact capacity lock. If an end certificate, transition, lineage record, or current evidence cannot fit:
+If end/current evidence cannot fit:
 
 1. abort the evidence mutation;
-2. atomically persist capacity lock in reserved headroom;
-3. disable all novella installs/controls;
-4. allow only higher-epoch safety recovery or explicit reset;
-5. retain chat/media/files.
+2. persist compact capacity lock using reserved headroom;
+3. disable novella installs/controls;
+4. permit higher proof only for a recoverable lock code whose preflight fits;
+5. require reset for transition-limit/digest-collision;
+6. preserve chat/media/files.
 
 ## Tests
 
-- dropped ACK + reload + resend;
+- dropped ACK/reload/resend;
 - ended without certificate never terminal;
-- certificate binding/tampering;
-- A→B→C and A→B→B-ended supersession;
-- stale peer after disposition trimming and missed lifecycle event;
-- current end/higher epoch dominance;
-- byte/certificate overflow still persists durable lock.
+- end after revision 20 validates against revision-0 transition;
+- embedded predecessor proof survives standalone certificate compaction;
+- active and ended paginated supersession;
+- proof page loss/reorder/duplicate;
+- end evidence overflow persists correct lock code and policy.
