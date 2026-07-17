@@ -1,0 +1,76 @@
+{
+  "id": "harbour-lights",
+  "version": "1.0.0",
+  "title": "Harbour Lights",
+  "description": "Two friends decide how to guide a fishing boat home.",
+  "startSceneId": "pier",
+  "scenes": {
+    "pier": {
+      "id": "pier",
+      "dialogue": [
+        {
+          "id": "pier-1",
+          "speaker": "Mara",
+          "text": "The harbour beacon is dark, and the fishing boat is still outside the breakwater."
+        },
+        {
+          "id": "pier-2",
+          "speaker": "Sol",
+          "text": "We have time for one signal. What should we do?",
+          "choices": [
+            {
+              "id": "light-beacon",
+              "label": "Light the old beacon",
+              "nextSceneId": "beacon-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "beacon" },
+                { "type": "set", "variable": "usedBeacon", "value": true },
+                { "type": "increment", "variable": "courage", "amount": 1 }
+              ]
+            },
+            {
+              "id": "wait-for-dawn",
+              "label": "Wait together for dawn",
+              "nextSceneId": "dawn-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "dawn" },
+                { "type": "set", "variable": "usedBeacon", "value": false },
+                { "type": "increment", "variable": "patience", "amount": 1 }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "beacon-ending": {
+      "id": "beacon-ending",
+      "dialogue": [
+        {
+          "id": "beacon-1",
+          "speaker": "Mara",
+          "text": "The lens catches, then floods the water with gold."
+        },
+        {
+          "id": "beacon-2",
+          "speaker": "Sol",
+          "text": "The boat answers with two flashes. They found the channel."
+        }
+      ]
+    },
+    "dawn-ending": {
+      "id": "dawn-ending",
+      "dialogue": [
+        {
+          "id": "dawn-1",
+          "speaker": "Sol",
+          "text": "The first light draws a silver road across the water."
+        },
+        {
+          "id": "dawn-2",
+          "speaker": "Mara",
+          "text": "Slowly, the boat follows it home."
+        }
+      ]
+    }
+  }
+}
