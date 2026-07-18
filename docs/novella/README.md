@@ -42,12 +42,13 @@ The archived Revision 13 documents describe a possible durability layer. They ar
 Use the narrowest playbook that matches the task:
 
 - [`demo-playbook.md`](./demo-playbook.md) — demonstrate the feature and run the complete human happy-path and recovery checklist.
+- [`macbook-human-test-playbook.md`](./macbook-human-test-playbook.md) — set up Node/Nix and local services on macOS, run the detailed multi-browser acceptance flow, collect evidence, execute Playwright, and diagnose Helium ICE restrictions.
 - [`release-playbook.md`](./release-playbook.md) — perform the release gate, enabled/disabled build checks, go/no-go decision, limited rollout, and rollback.
 - [`failure-injection-playbook.md`](./failure-injection-playbook.md) — exercise delays, simultaneous joins, timeouts, controller departure, refresh, and rapid navigation in disposable rooms.
 - [`incident-triage-playbook.md`](./incident-triage-playbook.md) — classify connectivity versus Novella failures, capture evidence, assign severity, reproduce, and close defects.
 - [`compatibility-accessibility-playbook.md`](./compatibility-accessibility-playbook.md) — test browser combinations, responsive layouts, keyboard navigation, screen-reader basics, zoom, permissions, and media regressions.
 
-The demo playbook is the release candidate's canonical human walkthrough. The other playbooks extend it without changing the MVP's intentionally ephemeral guarantees.
+The demo playbook is the release candidate's canonical human walkthrough. The MacBook playbook provides the local environment and browser-specific procedure. The other playbooks extend them without changing the MVP's intentionally ephemeral guarantees.
 
 ## Tests
 
@@ -67,7 +68,9 @@ Run only the two-browser novella suite:
 npm run test:e2e -- e2e/tests/visual-novel.test.ts
 ```
 
-The Playwright server enables `VITE_ENABLE_NOVELLA=true`, starts the local tracker, and uses real browser contexts. The suite covers:
+The Playwright server enables `VITE_ENABLE_NOVELLA=true`, starts the local tracker, and uses real browser contexts. It starts a deterministic test server by default; reuse of a manually started server is explicit through `PLAYWRIGHT_REUSE_EXISTING_SERVER=true`.
+
+The suite covers:
 
 - both Harbour Lights branches;
 - participant-to-controller action round trips;

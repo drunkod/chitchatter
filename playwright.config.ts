@@ -1,5 +1,9 @@
 import { defineConfig, devices } from '@playwright/test'
 
+const isCI = Boolean(process.env.CI)
+const reuseExistingServer =
+  !isCI && process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === 'true'
+
 /**
  * Read environment variables from file.
  * https://github.com/motdotla/dotenv
@@ -16,13 +20,13 @@ export default defineConfig({
   /* Run tests in files in parallel */
   fullyParallel: false,
   /* Fail the build on CI if you accidentally left test.only in the source code. */
-  forbidOnly: !!process.env.CI,
+  forbidOnly: isCI,
   /* Retry on CI only */
-  retries: 2,
+  retries: isCI ? 2 : 0,
   /* Opt out of parallel tests on CI. */
-  workers: process.env.CI ? 1 : undefined,
+  workers: isCI ? 1 : undefined,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: process.env.CI
+  reporter: isCI
     ? [['github'], ['html', { outputFolder: 'playwright-report' }]]
     : 'list',
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
@@ -41,8 +45,7 @@ export default defineConfig({
      * Options: 'off' | 'only-on-failure' | 'on' */
     screenshot: 'only-on-failure',
 
-    /* Video recording settings
-     * Options:
+    /* Video recording settings:
      * - 'off': No videos
      * - 'on': Record videos for all tests (large file sizes)
      * - 'retain-on-failure': Record videos but only keep them for failed tests (current setting)
@@ -109,11 +112,13 @@ export default defineConfig({
     // },
   ],
 
-  /* Run your local dev server before starting the tests */
+  /* Run a deterministic local stack before tests. Reusing a manually started
+     server is opt-in because Playwright cannot verify that it has the Novella
+     feature flag and matching tracker configuration. */
   webServer: {
     command: 'npm run start:e2e',
     url: 'http://localhost:3000',
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer,
     timeout: 120 * 1000,
     env: {
       IS_E2E_TEST: 'true',

@@ -5,6 +5,13 @@ export interface JoinedRoom {
   userId: string
 }
 
+const roomMessageInput = (page: Page) =>
+  page.getByPlaceholder('Your message').first()
+
+export const waitForRoomReady = async (page: Page): Promise<void> => {
+  await expect(roomMessageInput(page)).toBeVisible({ timeout: 25_000 })
+}
+
 export const getCurrentUserId = async (page: Page): Promise<string> => {
   const username = page.getByText(/Your username:/)
 
@@ -21,7 +28,6 @@ export const getCurrentUserId = async (page: Page): Promise<string> => {
 
 export const joinPublicRoom = async (page: Page): Promise<JoinedRoom> => {
   await page.goto('/')
-  await page.waitForLoadState('networkidle')
 
   const userId = await getCurrentUserId(page)
 
@@ -31,7 +37,7 @@ export const joinPublicRoom = async (page: Page): Promise<JoinedRoom> => {
     })
     .click()
   await page.waitForURL(/\/public\/.+/)
-  await expect(page.getByPlaceholder('Your message').first()).toBeVisible()
+  await waitForRoomReady(page)
 
   return {
     roomUrl: page.url(),
@@ -44,13 +50,11 @@ export const joinExistingRoom = async (
   roomUrl: string
 ): Promise<string> => {
   await page.goto('/')
-  await page.waitForLoadState('networkidle')
 
   const userId = await getCurrentUserId(page)
 
   await page.goto(roomUrl)
-  await page.waitForLoadState('networkidle')
-  await expect(page.getByPlaceholder('Your message').first()).toBeVisible()
+  await waitForRoomReady(page)
 
   return userId
 }
@@ -62,7 +66,7 @@ export const sendMessage = async (
   page: Page,
   message: string
 ): Promise<void> => {
-  const chatInput = page.getByPlaceholder('Your message').first()
+  const chatInput = roomMessageInput(page)
 
   await chatInput.fill(message)
   await chatInput.press('Enter')
@@ -76,6 +80,7 @@ export const waitForPeerConnected = async (
   const peerName = page.getByText(peerUserId, { exact: true }).first()
   const closePeerListButton = page.getByRole('button', {
     name: 'Close peer list',
+    exact: true,
   })
 
   if (!(await closePeerListButton.isVisible())) {

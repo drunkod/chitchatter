@@ -5,6 +5,7 @@ import {
   joinPublicRoom,
   waitForPeerConnected,
   waitForPeerMessage,
+  waitForRoomReady,
 } from '../helpers/test-helpers'
 
 const novella = (page: Page) =>
@@ -127,15 +128,11 @@ test.describe('Novella MVP', () => {
       })
       await expect(novella(controller)).toBeVisible()
 
+      await waitForPeerConnected(controller, participantUserId)
       const participantName = controller
         .getByText(participantUserId, { exact: true })
         .first()
 
-      if (!(await participantName.isVisible())) {
-        await controller.getByRole('button', { name: 'Peer list' }).click()
-      }
-
-      await expect(participantName).toBeVisible({ timeout: 25_000 })
       await participantName.click()
 
       const directMessageDialog = controller.getByRole('dialog')
@@ -191,7 +188,7 @@ test.describe('Novella MVP', () => {
       )
 
       await participant.reload()
-      await participant.waitForLoadState('networkidle')
+      await waitForRoomReady(participant)
       await waitForPeerConnected(participant, controllerUserId)
       await expectDialogue(
         participant,
