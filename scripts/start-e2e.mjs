@@ -10,7 +10,15 @@ const packageJson = JSON.parse(
   await readFile(resolve(repositoryRoot, 'package.json'), 'utf8')
 )
 
-const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+const isWindows = process.platform === 'win32'
+const npmCommand = isWindows ? 'npm.cmd' : 'npm'
+const localExecutable = name =>
+  resolve(
+    repositoryRoot,
+    'node_modules',
+    '.bin',
+    isWindows ? `${name}.cmd` : name
+  )
 const children = new Map()
 
 let shuttingDown = false
@@ -24,9 +32,9 @@ const launch = (name, command, args, extraEnvironment = {}) => {
       ...extraEnvironment,
     },
 
-    // Create a process group on macOS/Linux so shutdown can terminate npm and
-    // the executable that npm launched.
-    detached: process.platform !== 'win32',
+    // Keep every service in Playwright's process tree. Detached children can
+    // survive an interrupted test run and leave the E2E ports occupied.
+    detached: false,
   })
 
   children.set(name, child)
@@ -56,13 +64,9 @@ const signalProcessTree = (child, signal) => {
   }
 
   try {
-    if (process.platform === 'win32') {
-      child.kill(signal)
-    } else {
-      process.kill(-child.pid, signal)
-    }
-  } catch {
     child.kill(signal)
+  } catch {
+    // The process may have exited between the guard and the signal.
   }
 }
 
@@ -120,14 +124,19 @@ const commonEnvironment = {
 
 launch('RTC API', process.execPath, ['simple-api-server.js'], commonEnvironment)
 
-launch('WebTorrent tracker', npmCommand, ['run', 'start:tracker'], {
-  ...commonEnvironment,
-})
+launch(
+  'WebTorrent tracker',
+  isWindows ? npmCommand : localExecutable('bittorrent-tracker'),
+  isWindows ? ['run', 'start:tracker'] : [],
+  commonEnvironment
+)
 
 launch(
   'Vite',
-  npmCommand,
-  ['exec', '--', 'vite', '--port', '3000', '--logLevel', 'error'],
+  isWindows ? npmCommand : localExecutable('vite'),
+  isWindows
+    ? ['exec', '--', 'vite', '--port', '3000', '--logLevel', 'error']
+    : ['--port', '3000', '--logLevel', 'error'],
   {
     ...commonEnvironment,
     VITE_IS_E2E_TEST: 'true',
