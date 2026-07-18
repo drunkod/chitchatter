@@ -157,7 +157,9 @@ test.describe('Novella MVP', () => {
     let participantContext: BrowserContext | undefined
 
     try {
-      controllerContext = await browser.newContext()
+      controllerContext = await browser.newContext({
+        permissions: ['camera', 'microphone'],
+      })
       const controller = await controllerContext.newPage()
       const { roomUrl, userId: controllerUserId } =
         await joinPublicRoom(controller)
@@ -187,6 +189,7 @@ test.describe('Novella MVP', () => {
         'The lens catches, then floods the water with gold.'
       )
 
+      await participant.waitForTimeout(3000)
       await participant.reload()
       await waitForRoomReady(participant)
       await waitForPeerConnected(participant, controllerUserId)

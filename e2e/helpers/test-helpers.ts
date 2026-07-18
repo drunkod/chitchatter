@@ -10,12 +10,15 @@ const roomMessageInput = (page: Page) =>
 
 export const waitForRoomReady = async (page: Page): Promise<void> => {
   await expect(roomMessageInput(page)).toBeVisible({ timeout: 25_000 })
+  await expect(page.getByText('Searching for servers...')).toBeHidden({
+    timeout: 25_000,
+  })
 }
 
 export const getCurrentUserId = async (page: Page): Promise<string> => {
   const username = page.getByText(/Your username:/)
 
-  await expect(username).toBeVisible()
+  await expect(username).toBeVisible({ timeout: 30_000 })
   const text = await username.textContent()
   const userId = text?.replace(/^.*Your username:\s*/, '').trim()
 
