@@ -60,6 +60,14 @@ export class PeerRoom {
 
   private roomConfig: RoomConfig
 
+  private hasLeftRoom = false
+
+  private handlePageHide = (event: Event) => {
+    const { persisted = false } = event as PageTransitionEvent
+
+    if (!persisted) this.leaveRoom()
+  }
+
   private peerJoinHandlers: Map<
     PeerHookType,
     Exclude<Room['onPeerJoin'], null>
@@ -97,6 +105,10 @@ export class PeerRoom {
     this.roomConfig = config
     this.room = joinRoom(this.roomConfig, roomId)
 
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pagehide', this.handlePageHide)
+    }
+
     this.room.onPeerJoin = (...args) => {
       for (const [, peerJoinHandler] of this.peerJoinHandlers) {
         peerJoinHandler(...args)
@@ -123,8 +135,19 @@ export class PeerRoom {
   }
 
   leaveRoom = () => {
-    this.room.leave()
-    this.flush()
+    if (this.hasLeftRoom) return
+
+    this.hasLeftRoom = true
+
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('pagehide', this.handlePageHide)
+    }
+
+    try {
+      this.room.leave()
+    } finally {
+      this.flush()
+    }
   }
 
   getSelfId = () => selfId
