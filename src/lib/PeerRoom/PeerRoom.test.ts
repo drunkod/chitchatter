@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { PeerAction } from 'models/network'
 
@@ -36,14 +36,30 @@ vi.mock('trystero', () => ({
   joinRoom: vi.fn(),
 }))
 
+const peerRooms: PeerRoom[] = []
+
+const createPeerRoom = () => {
+  const peerRoom = new PeerRoom({ appId: 'test-app' }, 'room-id')
+
+  peerRooms.push(peerRoom)
+
+  return peerRoom
+}
+
 describe('PeerRoom', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.action.onMessage = null
   })
 
+  afterEach(() => {
+    for (const peerRoom of peerRooms.splice(0)) {
+      peerRoom.leaveRoom()
+    }
+  })
+
   test('disconnects only the receiver associated with an unsubscribe callback', () => {
-    const peerRoom = new PeerRoom({ appId: 'test-app' }, 'room-id')
+    const peerRoom = createPeerRoom()
     const [, connectReceiver] = peerRoom.makeAction<{ value: string }>(
       PeerAction.MESSAGE,
       ActionNamespace.DIRECT_MESSAGE
@@ -64,5 +80,28 @@ describe('PeerRoom', () => {
 
     expect(firstReceiver).toHaveBeenCalledTimes(1)
     expect(secondReceiver).toHaveBeenCalledTimes(2)
+  })
+
+  test('leaves the room exactly once when the page is unloaded', () => {
+    const peerRoom = createPeerRoom()
+
+    window.dispatchEvent(new Event('pagehide'))
+    peerRoom.leaveRoom()
+
+    expect(mocks.room.leave).toHaveBeenCalledTimes(1)
+  })
+
+  test('keeps the room connected when the page enters the back-forward cache', () => {
+    createPeerRoom()
+
+    const pageHideEvent = new Event('pagehide')
+
+    Object.defineProperty(pageHideEvent, 'persisted', {
+      value: true,
+    })
+
+    window.dispatchEvent(pageHideEvent)
+
+    expect(mocks.room.leave).not.toHaveBeenCalled()
   })
 })
