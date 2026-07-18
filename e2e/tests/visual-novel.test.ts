@@ -1,10 +1,11 @@
 import { BrowserContext, Page, expect, test } from '@playwright/test'
 
 import {
+  getCurrentRoomUserId,
   joinExistingRoom,
   joinPublicRoom,
+  waitForBidirectionalPeerTraffic,
   waitForPeerConnected,
-  waitForPeerMessage,
   waitForRoomReady,
 } from '../helpers/test-helpers'
 
@@ -40,16 +41,22 @@ test.describe('Novella MVP', () => {
 
       await waitForPeerConnected(controller, participantUserId)
       await waitForPeerConnected(participant, controllerUserId)
-      await waitForPeerMessage(
+      await waitForBidirectionalPeerTraffic(
         controller,
         participant,
-        `novella-ready-${Date.now()}`
+        'novella-ready'
       )
 
       await expect(novella(controller)).toBeVisible()
       await expect(novella(participant)).toBeVisible()
 
-      await controller.getByRole('button', { name: 'Start story' }).click()
+      await controller
+        .getByRole('button', {
+          name: 'Start story',
+          exact: true,
+        })
+        .click()
+
       await expectDialogue(
         controller,
         'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
@@ -59,9 +66,14 @@ test.describe('Novella MVP', () => {
         'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
       )
 
+      // Beacon branch
       await participant
-        .getByRole('button', { name: 'Continue', exact: true })
+        .getByRole('button', {
+          name: 'Continue',
+          exact: true,
+        })
         .click()
+
       await expectDialogue(
         controller,
         'We have time for one signal. What should we do?'
@@ -72,8 +84,12 @@ test.describe('Novella MVP', () => {
       )
 
       await participant
-        .getByRole('button', { name: 'Light the old beacon' })
+        .getByRole('button', {
+          name: 'Light the old beacon',
+          exact: true,
+        })
         .click()
+
       await expectDialogue(
         controller,
         'The lens catches, then floods the water with gold.'
@@ -84,8 +100,12 @@ test.describe('Novella MVP', () => {
       )
 
       await participant
-        .getByRole('button', { name: 'Continue', exact: true })
+        .getByRole('button', {
+          name: 'Continue',
+          exact: true,
+        })
         .click()
+
       await expectDialogue(
         controller,
         'The boat answers with two flashes. They found the channel.'
@@ -95,18 +115,46 @@ test.describe('Novella MVP', () => {
         'The boat answers with two flashes. They found the channel.'
       )
 
-      await controller.getByRole('button', { name: 'Read again' }).click()
+      // Restart and test dawn branch
+      await controller
+        .getByRole('button', {
+          name: 'Read again',
+          exact: true,
+        })
+        .click()
+
+      await expectDialogue(
+        controller,
+        'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
+      )
       await expectDialogue(
         participant,
         'The harbour beacon is dark, and the fishing boat is still outside the breakwater.'
       )
 
       await participant
-        .getByRole('button', { name: 'Continue', exact: true })
+        .getByRole('button', {
+          name: 'Continue',
+          exact: true,
+        })
         .click()
+
+      await expectDialogue(
+        controller,
+        'We have time for one signal. What should we do?'
+      )
+      await expectDialogue(
+        participant,
+        'We have time for one signal. What should we do?'
+      )
+
       await participant
-        .getByRole('button', { name: 'Wait together for dawn' })
+        .getByRole('button', {
+          name: 'Wait together for dawn',
+          exact: true,
+        })
         .click()
+
       await expectDialogue(
         controller,
         'The first light draws a silver road across the water.'
@@ -117,8 +165,12 @@ test.describe('Novella MVP', () => {
       )
 
       await participant
-        .getByRole('button', { name: 'Continue', exact: true })
+        .getByRole('button', {
+          name: 'Continue',
+          exact: true,
+        })
         .click()
+
       await expectDialogue(controller, 'Slowly, the boat follows it home.')
       await expectDialogue(participant, 'Slowly, the boat follows it home.')
 
@@ -128,12 +180,16 @@ test.describe('Novella MVP', () => {
       })
       await expect(novella(controller)).toBeVisible()
 
-      await waitForPeerConnected(controller, participantUserId)
-      const participantName = controller
-        .getByText(participantUserId, { exact: true })
-        .first()
+      await waitForPeerConnected(controller, participantUserId, {
+        keepPeerListOpen: true,
+      })
+      const participantListItem = controller.getByRole('listitem').filter({
+        has: controller.getByText(participantUserId, { exact: true }),
+      })
 
-      await participantName.click()
+      await participantListItem
+        .getByText(participantUserId, { exact: true })
+        .click()
 
       const directMessageDialog = controller.getByRole('dialog')
 
@@ -157,21 +213,35 @@ test.describe('Novella MVP', () => {
     let participantContext: BrowserContext | undefined
 
     try {
-      controllerContext = await browser.newContext({
-        permissions: ['camera', 'microphone'],
-      })
+      controllerContext = await browser.newContext()
       const controller = await controllerContext.newPage()
+
       const { roomUrl, userId: controllerUserId } =
         await joinPublicRoom(controller)
 
       await expect(novella(controller)).toBeVisible()
-      await controller.getByRole('button', { name: 'Start story' }).click()
+
       await controller
-        .getByRole('button', { name: 'Continue', exact: true })
+        .getByRole('button', {
+          name: 'Start story',
+          exact: true,
+        })
         .click()
+
       await controller
-        .getByRole('button', { name: 'Light the old beacon' })
+        .getByRole('button', {
+          name: 'Continue',
+          exact: true,
+        })
         .click()
+
+      await controller
+        .getByRole('button', {
+          name: 'Light the old beacon',
+          exact: true,
+        })
+        .click()
+
       await expectDialogue(
         controller,
         'The lens catches, then floods the water with gold.'
@@ -184,24 +254,58 @@ test.describe('Novella MVP', () => {
 
       await waitForPeerConnected(controller, participantUserId)
       await waitForPeerConnected(participant, controllerUserId)
-      await expectDialogue(
-        participant,
-        'The lens catches, then floods the water with gold.'
-      )
 
-      await participant.waitForTimeout(3000)
-      await participant.reload()
-      await waitForRoomReady(participant)
-      await waitForPeerConnected(participant, controllerUserId)
-      await expectDialogue(
-        participant,
-        'The lens catches, then floods the water with gold.'
-      )
-
-      await waitForPeerMessage(
+      await waitForBidirectionalPeerTraffic(
         controller,
         participant,
-        `novella-refresh-ready-${Date.now()}`
+        'late-join-ready'
+      )
+
+      await expectDialogue(
+        participant,
+        'The lens catches, then floods the water with gold.'
+      )
+
+      await waitForPeerConnected(controller, participantUserId, {
+        keepPeerListOpen: true,
+      })
+
+      const oldParticipantListItem = controller.getByRole('listitem').filter({
+        has: controller.getByText(participantUserId, {
+          exact: true,
+        }),
+      })
+
+      await expect(oldParticipantListItem).toBeVisible()
+
+      await participant.reload({
+        waitUntil: 'domcontentloaded',
+      })
+
+      await waitForRoomReady(participant)
+
+      // Refresh creates a new Chitchatter peer identity.
+      const refreshedParticipantUserId = await getCurrentRoomUserId(participant)
+
+      expect(refreshedParticipantUserId).not.toBe(participantUserId)
+
+      // The controller should eventually discard the disconnected identity.
+      await expect(oldParticipantListItem).toBeHidden({
+        timeout: 45_000,
+      })
+
+      await waitForPeerConnected(controller, refreshedParticipantUserId)
+      await waitForPeerConnected(participant, controllerUserId)
+
+      await waitForBidirectionalPeerTraffic(
+        participant,
+        controller,
+        'refresh-recovery-ready'
+      )
+
+      await expectDialogue(
+        participant,
+        'The lens catches, then floods the water with gold.'
       )
 
       await controllerContext.close()
@@ -211,17 +315,30 @@ test.describe('Novella MVP', () => {
         novella(participant).getByText(
           'The storyteller left. The story is paused.'
         )
-      ).toBeVisible({ timeout: 25_000 })
+      ).toBeVisible({
+        timeout: 25_000,
+      })
+
       await participant
-        .getByRole('button', { name: 'Continue the story' })
+        .getByRole('button', {
+          name: 'Continue the story',
+          exact: true,
+        })
         .click()
 
       await expect(
-        novella(participant).getByText('Storyteller', { exact: true })
+        novella(participant).getByText('Storyteller', {
+          exact: true,
+        })
       ).toBeVisible()
+
       await participant
-        .getByRole('button', { name: 'Continue', exact: true })
+        .getByRole('button', {
+          name: 'Continue',
+          exact: true,
+        })
         .click()
+
       await expectDialogue(
         participant,
         'The boat answers with two flashes. They found the channel.'

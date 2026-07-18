@@ -5,25 +5,88 @@ export interface JoinedRoom {
   userId: string
 }
 
+export interface WaitForPeerConnectedOptions {
+  keepPeerListOpen?: boolean
+}
+
 const roomMessageInput = (page: Page) =>
   page.getByPlaceholder('Your message').first()
 
+const peerListOpenButton = (page: Page) =>
+  page.getByRole('button', {
+    name: 'Peer list',
+    exact: true,
+  })
+
+const peerListCloseButton = (page: Page) =>
+  page.getByRole('button', {
+    name: 'Close peer list',
+    exact: true,
+  })
+
+const messageLocator = (page: Page, message: string) =>
+  page.getByText(message, { exact: true }).first()
+
+/**
+ * Wait only for the room's interactive shell.
+ *
+ * Tracker and WebRTC readiness must be proven separately through actual peer
+ * visibility and message delivery. UI loading copy is not a reliable network
+ * readiness signal.
+ */
 export const waitForRoomReady = async (page: Page): Promise<void> => {
-  await expect(roomMessageInput(page)).toBeVisible({ timeout: 25_000 })
-  await expect(page.getByText('Searching for servers...')).toBeHidden({
-    timeout: 25_000,
+  await expect(roomMessageInput(page)).toBeVisible({
+    timeout: 30_000,
   })
 }
 
 export const getCurrentUserId = async (page: Page): Promise<string> => {
-  const username = page.getByText(/Your username:/)
+  const username = page.getByText(/Your username:/).first()
 
-  await expect(username).toBeVisible({ timeout: 30_000 })
+  await expect(username).toBeVisible({
+    timeout: 30_000,
+  })
+
   const text = await username.textContent()
   const userId = text?.replace(/^.*Your username:\s*/, '').trim()
 
   if (!userId) {
     throw new Error('Could not read the generated Chitchatter username')
+  }
+
+  return userId
+}
+
+export const getCurrentRoomUserId = async (page: Page): Promise<string> => {
+  const closeButton = peerListCloseButton(page)
+  const wasAlreadyOpen = await closeButton.isVisible()
+
+  if (!wasAlreadyOpen) {
+    await peerListOpenButton(page).click()
+    await expect(closeButton).toBeVisible()
+  }
+
+  const currentUserListItem = page.getByRole('listitem').filter({
+    has: page.getByText('Your username', {
+      exact: true,
+    }),
+  })
+
+  const usernameInput = currentUserListItem.getByRole('textbox')
+
+  await expect(usernameInput).toBeVisible({
+    timeout: 15_000,
+  })
+
+  const userId = (await usernameInput.inputValue()).trim()
+
+  if (!userId) {
+    throw new Error('Could not read the current room username')
+  }
+
+  if (!wasAlreadyOpen) {
+    await closeButton.click()
+    await expect(closeButton).toBeHidden()
   }
 
   return userId
@@ -39,6 +102,7 @@ export const joinPublicRoom = async (page: Page): Promise<JoinedRoom> => {
       name: /join public room/i,
     })
     .click()
+
   await page.waitForURL(/\/public\/.+/)
   await waitForRoomReady(page)
 
@@ -62,9 +126,6 @@ export const joinExistingRoom = async (
   return userId
 }
 
-/**
- * Helper function to send a message in a room
- */
 export const sendMessage = async (
   page: Page,
   message: string
@@ -73,33 +134,80 @@ export const sendMessage = async (
 
   await chatInput.fill(message)
   await chatInput.press('Enter')
-  await expect(page.getByText(message).first()).toBeVisible()
+
+  await expect(messageLocator(page, message)).toBeVisible({
+    timeout: 10_000,
+  })
 }
 
+/**
+ * Wait until a specific peer appears in the peer list.
+ *
+ * By default this restores the peer list to its original closed state so that
+ * the helper does not affect later story controls.
+ */
 export const waitForPeerConnected = async (
   page: Page,
-  peerUserId: string
+  peerUserId: string,
+  options: WaitForPeerConnectedOptions = {}
 ): Promise<void> => {
-  const peerName = page.getByText(peerUserId, { exact: true }).first()
-  const closePeerListButton = page.getByRole('button', {
-    name: 'Close peer list',
+  const { keepPeerListOpen = false } = options
+  const closeButton = peerListCloseButton(page)
+  const wasAlreadyOpen = await closeButton.isVisible()
+
+  if (!wasAlreadyOpen) {
+    await peerListOpenButton(page).click()
+    await expect(closeButton).toBeVisible()
+  }
+
+  const peerName = page.getByText(peerUserId, {
     exact: true,
   })
 
-  if (!(await closePeerListButton.isVisible())) {
-    await page.getByRole('button', { name: 'Peer list', exact: true }).click()
-  }
+  await expect(peerName.first()).toBeVisible({
+    timeout: 45_000,
+  })
 
-  await expect(peerName).toBeVisible({ timeout: 45_000 })
+  if (!wasAlreadyOpen && !keepPeerListOpen) {
+    await closeButton.click()
+    await expect(closeButton).toBeHidden()
+  }
 }
 
+/**
+ * Prove one-way application traffic, not merely tracker WebSocket creation.
+ */
 export const waitForPeerMessage = async (
   sender: Page,
   receiver: Page,
   message: string
 ): Promise<void> => {
   await sendMessage(sender, message)
-  await expect(receiver.getByText(message).first()).toBeVisible({
+
+  await expect(messageLocator(receiver, message)).toBeVisible({
     timeout: 25_000,
   })
+}
+
+/**
+ * Prove that both peers have a functioning bidirectional data-channel path.
+ */
+export const waitForBidirectionalPeerTraffic = async (
+  firstPeer: Page,
+  secondPeer: Page,
+  label: string
+): Promise<void> => {
+  const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+  await waitForPeerMessage(
+    firstPeer,
+    secondPeer,
+    `${label}-first-to-second-${nonce}`
+  )
+
+  await waitForPeerMessage(
+    secondPeer,
+    firstPeer,
+    `${label}-second-to-first-${nonce}`
+  )
 }

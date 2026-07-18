@@ -116,7 +116,7 @@ export default defineConfig({
      server is opt-in because Playwright cannot verify that it has the Novella
      feature flag and matching tracker configuration. */
   webServer: {
-    command: 'npm run start:e2e',
+    command: 'node scripts/start-e2e.mjs',
     url: 'http://localhost:3000',
     reuseExistingServer,
     timeout: 120 * 1000,
