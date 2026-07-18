@@ -79,7 +79,7 @@ export const waitForPeerConnected = async (
   })
 
   if (!(await closePeerListButton.isVisible())) {
-    await page.getByRole('button', { name: 'Peer list' }).click()
+    await page.getByRole('button', { name: 'Peer list', exact: true }).click()
   }
 
   await expect(peerName).toBeVisible({ timeout: 45_000 })
