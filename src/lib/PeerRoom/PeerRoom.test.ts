@@ -82,6 +82,41 @@ describe('PeerRoom', () => {
     expect(secondReceiver).toHaveBeenCalledTimes(2)
   })
 
+  test('delivers action messages received before the first receiver connects', () => {
+    const peerRoom = createPeerRoom()
+    const [, connectReceiver] = peerRoom.makeAction<{ value: string }>(
+      PeerAction.PEER_METADATA,
+      ActionNamespace.GROUP
+    )
+    const receiver = vi.fn()
+
+    mocks.action.onMessage?.({ value: 'early' }, { peerId: 'peer-id' })
+    connectReceiver(receiver)
+
+    expect(receiver).toHaveBeenCalledWith(
+      { value: 'early' },
+      { peerId: 'peer-id' }
+    )
+  })
+
+  test('does not replay messages received after initialized receivers disconnect', () => {
+    const peerRoom = createPeerRoom()
+    const [, connectReceiver] = peerRoom.makeAction<{ value: string }>(
+      PeerAction.MESSAGE,
+      ActionNamespace.GROUP
+    )
+    const firstReceiver = vi.fn()
+    const secondReceiver = vi.fn()
+    const disconnectFirstReceiver = connectReceiver(firstReceiver)
+
+    disconnectFirstReceiver()
+    mocks.action.onMessage?.({ value: 'dropped' }, { peerId: 'peer-id' })
+    connectReceiver(secondReceiver)
+
+    expect(firstReceiver).not.toHaveBeenCalled()
+    expect(secondReceiver).not.toHaveBeenCalled()
+  })
+
   test('leaves the room exactly once when the page is unloaded', () => {
     const peerRoom = createPeerRoom()
 
