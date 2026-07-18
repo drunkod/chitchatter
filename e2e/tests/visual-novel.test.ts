@@ -1,7 +1,6 @@
 import { BrowserContext, Page, expect, test } from '@playwright/test'
 
 import {
-  getCurrentRoomUserId,
   joinExistingRoom,
   joinPublicRoom,
   waitForBidirectionalPeerTraffic,
@@ -266,46 +265,29 @@ test.describe('Novella MVP', () => {
         'The lens catches, then floods the water with gold.'
       )
 
-      await waitForPeerConnected(controller, participantUserId, {
-        keepPeerListOpen: true,
-      })
+      await test.step(
+        'participant reloads and establishes a new working peer connection',
+        async () => {
+          await participant.reload({
+            waitUntil: 'domcontentloaded',
+          })
 
-      const oldParticipantListItem = controller.getByRole('listitem').filter({
-        has: controller.getByText(participantUserId, {
-          exact: true,
-        }),
-      })
+          await waitForRoomReady(participant)
+          await waitForPeerConnected(participant, controllerUserId)
 
-      await expect(oldParticipantListItem).toBeVisible()
+          // The user-facing identity persists across refresh. Unique messages in
+          // both directions prove that the refreshed page has a live transport.
+          await waitForBidirectionalPeerTraffic(
+            participant,
+            controller,
+            'refresh-recovery-ready'
+          )
 
-      await participant.reload({
-        waitUntil: 'domcontentloaded',
-      })
-
-      await waitForRoomReady(participant)
-
-      // Refresh creates a new Chitchatter peer identity.
-      const refreshedParticipantUserId = await getCurrentRoomUserId(participant)
-
-      expect(refreshedParticipantUserId).not.toBe(participantUserId)
-
-      // The controller should eventually discard the disconnected identity.
-      await expect(oldParticipantListItem).toBeHidden({
-        timeout: 45_000,
-      })
-
-      await waitForPeerConnected(controller, refreshedParticipantUserId)
-      await waitForPeerConnected(participant, controllerUserId)
-
-      await waitForBidirectionalPeerTraffic(
-        participant,
-        controller,
-        'refresh-recovery-ready'
-      )
-
-      await expectDialogue(
-        participant,
-        'The lens catches, then floods the water with gold.'
+          await expectDialogue(
+            participant,
+            'The lens catches, then floods the water with gold.'
+          )
+        }
       )
 
       await controllerContext.close()
