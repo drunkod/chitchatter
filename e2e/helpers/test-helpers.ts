@@ -57,41 +57,6 @@ export const getCurrentUserId = async (page: Page): Promise<string> => {
   return userId
 }
 
-export const getCurrentRoomUserId = async (page: Page): Promise<string> => {
-  const closeButton = peerListCloseButton(page)
-  const wasAlreadyOpen = await closeButton.isVisible()
-
-  if (!wasAlreadyOpen) {
-    await peerListOpenButton(page).click()
-    await expect(closeButton).toBeVisible()
-  }
-
-  const currentUserListItem = page.getByRole('listitem').filter({
-    has: page.getByText('Your username', {
-      exact: true,
-    }),
-  })
-
-  const usernameInput = currentUserListItem.getByRole('textbox')
-
-  await expect(usernameInput).toBeVisible({
-    timeout: 15_000,
-  })
-
-  const userId = (await usernameInput.inputValue()).trim()
-
-  if (!userId) {
-    throw new Error('Could not read the current room username')
-  }
-
-  if (!wasAlreadyOpen) {
-    await closeButton.click()
-    await expect(closeButton).toBeHidden()
-  }
-
-  return userId
-}
-
 export const joinPublicRoom = async (page: Page): Promise<JoinedRoom> => {
   await page.goto('/')
 
