@@ -38,6 +38,7 @@ export enum ActionNamespace {
 }
 
 const streamQueueAddDelay = 1000
+const initialActionBufferLimit = 32
 
 export type ActionSender<T extends DataPayload> = MessageAction<T>['send']
 
@@ -258,6 +259,17 @@ export class PeerRoom {
 
     type ActionParameters = [T, MessageContext]
 
+    const pendingMessages: ActionParameters[] = []
+    let hasConnectedReceiver = false
+
+    const dispatchMessage = (receiverArguments: ActionParameters) => {
+      const customEvent = new CustomEvent(eventName, {
+        detail: receiverArguments,
+      })
+
+      eventTarget.dispatchEvent(customEvent)
+    }
+
     const connectReceiver: ActionReceiver<T> = callback => {
       const handler = (event: CustomEventInit<ActionParameters>) => {
         const { detail: receiverArguments } = event
@@ -271,17 +283,33 @@ export class PeerRoom {
 
       eventTarget.addEventListener(eventName, handler)
 
+      if (!hasConnectedReceiver) {
+        hasConnectedReceiver = true
+
+        for (const receiverArguments of pendingMessages.splice(0)) {
+          dispatchMessage(receiverArguments)
+        }
+      }
+
       return () => {
         eventTarget.removeEventListener(eventName, handler)
       }
     }
 
     actionObj.onMessage = (data, context) => {
-      const customEvent = new CustomEvent(eventName, {
-        detail: [data, context],
-      })
+      const receiverArguments: ActionParameters = [data, context]
 
-      eventTarget.dispatchEvent(customEvent)
+      if (!hasConnectedReceiver) {
+        pendingMessages.push(receiverArguments)
+
+        if (pendingMessages.length > initialActionBufferLimit) {
+          pendingMessages.shift()
+        }
+
+        return
+      }
+
+      dispatchMessage(receiverArguments)
     }
 
     const action: PeerRoomAction<T> = [sender, connectReceiver, progress]
