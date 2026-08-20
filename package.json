@@ -71,6 +71,7 @@
     "check:types": "tsc && echo \"No type errors.\"",
     "generate-rtc-config": "node scripts/generate-rtc-config.cjs",
     "test:e2e": "playwright test --reporter=list",
+    "test:e2e:duet": "playwright test --config=playwright.duet.config.ts",
     "test:e2e:report": "playwright show-report",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:debug": "playwright test --debug",
