@@ -1,0 +1,167 @@
+// Target: src/components/Room/Room.tsx
+//
+// Minimal room: audio/video/screen-share/file-upload controls, video display,
+// and the typing status bar are removed. What remains: the novella,
+// the chat transcript, and the message input.
+
+import Box from '@mui/material/Box'
+import Divider from '@mui/material/Divider'
+import { useContext, useMemo } from 'react'
+import { v4 as uuid } from 'uuid'
+
+import { ChatTranscript } from 'components/ChatTranscript'
+import { WholePageLoading } from 'components/Loading'
+import { MessageForm } from 'components/MessageForm'
+import { VisualNovelRoom } from 'components/VisualNovelRoom'
+import { isVisualNovelEnabled } from 'config/visualNovelFeature'
+import { trackerUrls } from 'config/trackerUrls'
+import { RoomContext } from 'contexts/RoomContext'
+import { SettingsContext } from 'contexts/SettingsContext'
+import { useTurnConfig } from 'hooks/useTurnConfig'
+import { time } from 'lib/Time'
+import { encryption } from 'services/Encryption'
+
+import { useRoom } from './useRoom'
+
+export interface RoomProps {
+  appId?: string
+  getUuid?: typeof uuid
+  password?: string
+  roomId: string
+  userId: string
+  encryptionService?: typeof encryption
+  timeService?: typeof time
+  targetPeerId?: string
+}
+
+interface RoomInnerProps extends RoomProps {
+  turnConfig: RTCConfiguration
+}
+
+const RoomCore = ({
+  appId = `${encodeURI(window.location.origin)}_${process.env.VITE_NAME}`,
+  getUuid = uuid,
+  encryptionService = encryption,
+  timeService = time,
+  roomId,
+  password,
+  userId,
+  targetPeerId,
+  turnConfig,
+}: RoomInnerProps) => {
+  const settingsContext = useContext(SettingsContext)
+  const { publicKey } = settingsContext.getUserSettings()
+
+  const relayConfig = useMemo(
+    () => ({
+      urls: trackerUrls,
+      redundancy: 4,
+    }),
+    []
+  )
+
+  const {
+    isDirectMessageRoom,
+    handleMessageChange,
+    isMessageSending,
+    messageLog,
+    peerRoom,
+    roomContextValue,
+    sendMessage,
+  } = useRoom(
+    {
+      appId,
+      relayConfig,
+      password,
+      rtcConfig: turnConfig.iceServers
+        ? { iceServers: turnConfig.iceServers }
+        : undefined,
+      ...(import.meta.env.VITE_IS_E2E_TEST && {
+        rtcConfig: {
+          iceServers: [],
+        },
+      }),
+    },
+    {
+      roomId,
+      userId,
+      getUuid,
+      publicKey,
+      encryptionService,
+      timeService,
+      targetPeerId,
+    }
+  )
+
+  const handleMessageSubmit = async (message: string) => {
+    await sendMessage(message)
+  }
+
+  return (
+    <RoomContext.Provider value={roomContextValue}>
+      <Box
+        className="Room"
+        sx={{
+          height: '100%',
+          display: 'flex',
+          flexGrow: '1',
+          overflow: 'auto',
+        }}
+      >
+        <Box
+          sx={{
+            display: 'flex',
+            flexDirection: 'column',
+            flexGrow: '1',
+            overflow: 'auto',
+          }}
+        >
+          {/* Media/upload/screen-share controls removed for minimal mode */}
+          {!isDirectMessageRoom && isVisualNovelEnabled && (
+            <VisualNovelRoom peerRoom={peerRoom} />
+          )}
+          <Box
+            sx={{
+              display: 'flex',
+              flexDirection: 'column',
+              flexGrow: '1',
+              height: '100%',
+              width: '100%',
+              overflow: 'auto',
+            }}
+          >
+            <ChatTranscript
+              messageLog={messageLog}
+              userId={userId}
+              sx={{ ...(isDirectMessageRoom && { pt: 1 }) }}
+            />
+            <Divider />
+            <Box>
+              <MessageForm
+                onMessageSubmit={handleMessageSubmit}
+                isMessageSending={isMessageSending}
+                onMessageChange={handleMessageChange}
+              />
+              {/* TypingStatusBar removed for minimal mode */}
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+    </RoomContext.Provider>
+  )
+}
+
+export const Room = (props: RoomProps) => {
+  const { isEnhancedConnectivityEnabled } =
+    useContext(SettingsContext).getUserSettings()
+
+  const { turnConfig, isLoading: isConfigLoading } = useTurnConfig(
+    isEnhancedConnectivityEnabled
+  )
+
+  if (isConfigLoading) {
+    return <WholePageLoading />
+  }
+
+  return <RoomCore {...props} turnConfig={turnConfig} />
+}

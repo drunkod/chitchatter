@@ -15,6 +15,7 @@ const reuseExistingServer =
  */
 export default defineConfig({
   testDir: './e2e',
+  testIgnore: '**/duet/**',
   /* Global timeout for each test */
   timeout: 30 * 1000,
   /* Run tests in files in parallel */

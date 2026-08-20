@@ -9,7 +9,10 @@ import { v4 as uuid } from 'uuid'
 import { ChatTranscript } from 'components/ChatTranscript'
 import { WholePageLoading } from 'components/Loading'
 import { MessageForm } from 'components/MessageForm'
+import { DuetNovelRoom } from 'components/VisualNovelRoom/DuetNovelRoom'
 import { VisualNovelRoom } from 'components/VisualNovelRoom'
+import { isDuetMode } from 'config/duets'
+import { minimalUi } from 'config/minimalMode'
 import { isVisualNovelEnabled } from 'config/visualNovelFeature'
 import { trackerUrls } from 'config/trackerUrls'
 import { RoomContext } from 'contexts/RoomContext'
@@ -42,6 +45,21 @@ export interface RoomProps {
 interface RoomInnerProps extends RoomProps {
   turnConfig: RTCConfiguration
 }
+
+const getE2ERtcConfig = (): RTCConfiguration | undefined => {
+  const urls = import.meta.env.VITE_E2E_TURN_URL
+  const username = import.meta.env.VITE_E2E_TURN_USERNAME
+  const credential = import.meta.env.VITE_E2E_TURN_CREDENTIAL
+
+  if (!urls || !username || !credential) return undefined
+
+  return {
+    iceServers: [{ urls, username, credential }],
+    iceTransportPolicy: 'relay',
+  }
+}
+
+const e2eRtcConfig = getE2ERtcConfig()
 
 const RoomCore = ({
   appId = `${encodeURI(window.location.origin)}_${process.env.VITE_NAME}`,
@@ -85,10 +103,8 @@ const RoomCore = ({
       rtcConfig: turnConfig.iceServers
         ? { iceServers: turnConfig.iceServers }
         : undefined,
-      // NOTE: Avoid using STUN severs in the E2E tests in order to make them
-      // run faster
       ...(import.meta.env.VITE_IS_E2E_TEST && {
-        rtcConfig: {
+        rtcConfig: e2eRtcConfig ?? {
           iceServers: [],
         },
       }),
@@ -114,9 +130,6 @@ const RoomCore = ({
 
   const showMessages = roomContextValue.isShowingMessages
 
-  // NOTE: If rtcConfig fails to load, the useRtcConfig hook provides a
-  // fallback so the room will continue to work with default settings
-
   return (
     <RoomContext.Provider value={roomContextValue}>
       <Box
@@ -125,7 +138,7 @@ const RoomCore = ({
           height: '100%',
           display: 'flex',
           flexGrow: '1',
-          overflow: 'auto',
+          overflow: 'hidden',
         }}
       >
         <Box
@@ -133,10 +146,10 @@ const RoomCore = ({
             display: 'flex',
             flexDirection: 'column',
             flexGrow: '1',
-            overflow: 'auto',
+            overflow: 'hidden',
           }}
         >
-          {!isDirectMessageRoom && (
+          {!isDirectMessageRoom && !minimalUi.hideMediaControls && (
             <Zoom in={showRoomControls}>
               <Box
                 sx={{
@@ -164,19 +177,24 @@ const RoomCore = ({
               </Box>
             </Zoom>
           )}
-          {!isDirectMessageRoom && isVisualNovelEnabled && (
-            <VisualNovelRoom peerRoom={peerRoom} />
-          )}
+          {!isDirectMessageRoom &&
+            isVisualNovelEnabled &&
+            (isDuetMode ? (
+              <DuetNovelRoom peerRoom={peerRoom} />
+            ) : (
+              <VisualNovelRoom peerRoom={peerRoom} />
+            ))}
           <Box
             sx={{
               display: 'flex',
               flexDirection: landscape ? 'row' : 'column',
-              height: '100%',
+              flexGrow: '1',
+              minHeight: 0,
               width: '100%',
-              overflow: 'auto',
+              overflow: 'hidden',
             }}
           >
-            {showVideoDisplay && (
+            {showVideoDisplay && !minimalUi.hideMediaControls && (
               <RoomVideoDisplay
                 userId={userId}
                 width="100%"
@@ -189,8 +207,19 @@ const RoomCore = ({
                   display: 'flex',
                   flexDirection: 'column',
                   flexGrow: '1',
-                  width: showVideoDisplay && landscape ? '400px' : '100%',
-                  height: landscape ? '100%' : '40%',
+                  width:
+                    showVideoDisplay &&
+                    !minimalUi.hideMediaControls &&
+                    landscape
+                      ? '400px'
+                      : '100%',
+                  height:
+                    showVideoDisplay &&
+                    !minimalUi.hideMediaControls &&
+                    landscape
+                      ? '100%'
+                      : 'auto',
+                  minHeight: 0,
                 }}
               >
                 <ChatTranscript
@@ -205,7 +234,7 @@ const RoomCore = ({
                     isMessageSending={isMessageSending}
                     onMessageChange={handleMessageChange}
                   />
-                  {showActiveTypingStatus ? (
+                  {showActiveTypingStatus && !minimalUi.hideTypingStatus ? (
                     <TypingStatusBar
                       isDirectMessageRoom={isDirectMessageRoom}
                     />
@@ -224,7 +253,6 @@ export const Room = (props: RoomProps) => {
   const { isEnhancedConnectivityEnabled } =
     useContext(SettingsContext).getUserSettings()
 
-  // Fetch rtcConfig from server
   const { turnConfig, isLoading: isConfigLoading } = useTurnConfig(
     isEnhancedConnectivityEnabled
   )

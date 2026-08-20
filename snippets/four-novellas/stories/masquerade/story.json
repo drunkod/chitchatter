@@ -1,0 +1,74 @@
+{
+  "id": "the-unmasking-hour",
+  "version": "1.0.0",
+  "title": "The Unmasking Hour",
+  "description": "Two masked strangers decide what midnight means.",
+  "startSceneId": "ballroom",
+  "scenes": {
+    "ballroom": {
+      "id": "ballroom",
+      "dialogue": [
+        {
+          "id": "ballroom-1",
+          "speaker": "The Host",
+          "text": "The candles are down to their last inch, and the orchestra is playing the song that means midnight is close."
+        },
+        {
+          "id": "ballroom-2",
+          "speaker": "The Host",
+          "text": "At the unmasking hour, every guest must choose. What will you two do?",
+          "choices": [
+            {
+              "id": "unmask",
+              "label": "Remove the masks together",
+              "nextSceneId": "unmasked-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "unmasked" },
+                { "type": "increment", "variable": "honesty", "amount": 1 }
+              ]
+            },
+            {
+              "id": "vanish",
+              "label": "Slip out before midnight",
+              "nextSceneId": "vanished-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "vanished" },
+                { "type": "increment", "variable": "mystery", "amount": 1 }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "unmasked-ending": {
+      "id": "unmasked-ending",
+      "dialogue": [
+        {
+          "id": "unmasked-1",
+          "speaker": "The Host",
+          "text": "Two masks come away at once, and the room holds its breath."
+        },
+        {
+          "id": "unmasked-2",
+          "speaker": "The Host",
+          "text": "Strangers a moment ago; now the only honest faces at the ball."
+        }
+      ]
+    },
+    "vanished-ending": {
+      "id": "vanished-ending",
+      "dialogue": [
+        {
+          "id": "vanished-1",
+          "speaker": "The Host",
+          "text": "Two shadows cross the terrace as the clock begins to strike."
+        },
+        {
+          "id": "vanished-2",
+          "speaker": "The Host",
+          "text": "The ball never learns who they were. Neither do they. Perfect."
+        }
+      ]
+    }
+  }
+}

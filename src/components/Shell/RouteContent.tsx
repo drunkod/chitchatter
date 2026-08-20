@@ -3,6 +3,8 @@ import Box from '@mui/material/Box'
 import Collapse from '@mui/material/Collapse'
 import { styled } from '@mui/material/styles'
 
+import { minimalUi } from 'config/minimalMode'
+
 import { drawerWidth } from './Drawer'
 import { peerListWidth } from './PeerList'
 
@@ -15,13 +17,14 @@ const StyledMain = styled('main', {
 }>(({ theme, isDrawerOpen, isPeerListOpen }) => ({
   display: 'flex',
   flexDirection: 'column',
+  height: '100vh',
   width: '100%',
   transition: theme.transitions.create('margin', {
     easing: theme.transitions.easing.sharp,
     duration: theme.transitions.duration.leavingScreen,
   }),
-  marginLeft: `-${drawerWidth}px`,
-  marginRight: `-${peerListWidth}px`,
+  marginLeft: minimalUi.hideDrawer ? 0 : `-${drawerWidth}px`,
+  marginRight: minimalUi.hidePeerList ? 0 : `-${peerListWidth}px`,
   ...(isDrawerOpen && {
     transition: theme.transitions.create('margin', {
       easing: theme.transitions.easing.easeOut,
