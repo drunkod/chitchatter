@@ -265,30 +265,27 @@ test.describe('Novella MVP', () => {
         'The lens catches, then floods the water with gold.'
       )
 
-      await test.step(
-        'participant reloads and establishes a new working peer connection',
-        async () => {
-          await participant.reload({
-            waitUntil: 'domcontentloaded',
-          })
+      await test.step('participant reloads and establishes a new working peer connection', async () => {
+        await participant.reload({
+          waitUntil: 'domcontentloaded',
+        })
 
-          await waitForRoomReady(participant)
-          await waitForPeerConnected(participant, controllerUserId)
+        await waitForRoomReady(participant)
+        await waitForPeerConnected(participant, controllerUserId)
 
-          // The user-facing identity persists across refresh. Unique messages in
-          // both directions prove that the refreshed page has a live transport.
-          await waitForBidirectionalPeerTraffic(
-            participant,
-            controller,
-            'refresh-recovery-ready'
-          )
+        // The user-facing identity persists across refresh. Unique messages in
+        // both directions prove that the refreshed page has a live transport.
+        await waitForBidirectionalPeerTraffic(
+          participant,
+          controller,
+          'refresh-recovery-ready'
+        )
 
-          await expectDialogue(
-            participant,
-            'The lens catches, then floods the water with gold.'
-          )
-        }
-      )
+        await expectDialogue(
+          participant,
+          'The lens catches, then floods the water with gold.'
+        )
+      })
 
       await controllerContext.close()
       controllerContext = undefined

@@ -123,6 +123,12 @@ const commonEnvironment = {
 }
 
 launch('RTC API', process.execPath, ['simple-api-server.js'], commonEnvironment)
+launch(
+  'TURN relay',
+  process.execPath,
+  ['scripts/start-e2e-turn.mjs'],
+  commonEnvironment
+)
 
 launch(
   'WebTorrent tracker',
@@ -131,21 +137,45 @@ launch(
   commonEnvironment
 )
 
+const viteEnv = {
+  ...commonEnvironment,
+  VITE_IS_E2E_TEST: 'true',
+  VITE_RTC_CONFIG_ENDPOINT: '/api/get-config',
+  VITE_E2E_TURN_URL: 'turn:127.0.0.1:3478?transport=udp',
+  VITE_E2E_TURN_USERNAME: 'chitchatter-e2e',
+  VITE_E2E_TURN_CREDENTIAL: 'local-test-only',
+
+  // Avoid a localhost IPv4/IPv6 resolution difference in local WebRTC tests.
+  VITE_TRACKER_URL: process.env.VITE_TRACKER_URL ?? 'ws://127.0.0.1:8000',
+
+  // Preserve the value previously produced by `npm pkg get homepage`.
+  VITE_HOMEPAGE: process.env.VITE_HOMEPAGE ?? packageJson.homepage,
+
+  // Pass through Playwright config env vars for feature flags (set by playwright.duet.config.ts).
+  ...(process.env.VITE_ENABLE_NOVELLA && {
+    VITE_ENABLE_NOVELLA: process.env.VITE_ENABLE_NOVELLA,
+  }),
+  ...(process.env.VITE_DUET_MODE && {
+    VITE_DUET_MODE: process.env.VITE_DUET_MODE,
+  }),
+}
+
+// Debug: log which feature flags are active
+const flags = {
+  VITE_ENABLE_NOVELLA: process.env.VITE_ENABLE_NOVELLA ?? 'unset',
+  VITE_DUET_MODE: process.env.VITE_DUET_MODE ?? 'unset',
+}
+console.log('[start-e2e] Feature flags from parent process:', flags)
+console.log('[start-e2e] Flags passed to Vite:', {
+  VITE_ENABLE_NOVELLA: viteEnv.VITE_ENABLE_NOVELLA ?? 'not passed',
+  VITE_DUET_MODE: viteEnv.VITE_DUET_MODE ?? 'not passed',
+})
+
 launch(
   'Vite',
   isWindows ? npmCommand : localExecutable('vite'),
   isWindows
     ? ['exec', '--', 'vite', '--port', '3000', '--logLevel', 'error']
     : ['--port', '3000', '--logLevel', 'error'],
-  {
-    ...commonEnvironment,
-    VITE_IS_E2E_TEST: 'true',
-    VITE_RTC_CONFIG_ENDPOINT: '/api/get-config',
-
-    // Avoid a localhost IPv4/IPv6 resolution difference in local WebRTC tests.
-    VITE_TRACKER_URL: process.env.VITE_TRACKER_URL ?? 'ws://127.0.0.1:8000',
-
-    // Preserve the value previously produced by `npm pkg get homepage`.
-    VITE_HOMEPAGE: process.env.VITE_HOMEPAGE ?? packageJson.homepage,
-  }
+  viteEnv
 )

@@ -26,8 +26,10 @@ import { UserSettings } from 'models/settings'
 import { QueryParamKeys } from 'models/shell'
 import { PersistedStorageKeys } from 'models/storage'
 import { About } from 'pages/About'
+import { NovellaGateway } from 'pages/NovellaGateway/NovellaGateway'
 import { Disclaimer } from 'pages/Disclaimer'
 import { Home } from 'pages/Home'
+import { isDuetMode } from 'config/duets'
 import { PrivateRoom } from 'pages/PrivateRoom'
 import { PublicRoom } from 'pages/PublicRoom'
 import { Settings } from 'pages/Settings'
@@ -255,7 +257,13 @@ const Bootstrap = ({
                     <Route
                       key={path}
                       path={path}
-                      element={<Home userId={userId} />}
+                      element={
+                        isDuetMode ? (
+                          <NovellaGateway />
+                        ) : (
+                          <Home userId={userId} />
+                        )
+                      }
                     />
                   ))}
                   <Route path={routes.ABOUT} element={<About />} />

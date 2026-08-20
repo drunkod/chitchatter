@@ -97,7 +97,7 @@ const config = () => {
       globals: true,
       environment: 'jsdom',
       setupFiles: './src/setupTests.ts',
-      exclude: ['**/e2e/**', '**/node_modules/**'],
+      exclude: ['**/e2e/**', '**/snippets/**', '**/node_modules/**'],
       coverage: {
         reporter: ['text', 'html'],
         exclude: ['node_modules/', 'src/setupTests.ts'],

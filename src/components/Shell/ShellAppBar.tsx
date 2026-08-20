@@ -1,3 +1,9 @@
+// Target: src/components/Shell/ShellAppBar.tsx (replace)
+//
+// FIX for issue 4: the original app-bar JSX is restored for the non-minimal
+// path (needed by E2E tests and when VITE_MINIMAL_MODE is off). Minimal mode
+// still renders nothing.
+
 import { styled, useTheme } from '@mui/material/styles'
 
 import IconButton from '@mui/material/IconButton'
@@ -22,6 +28,7 @@ import RoomPreferences from '@mui/icons-material/RoomPreferences'
 import { useContext } from 'react'
 
 import { ShellContext } from 'contexts/ShellContext'
+import { minimalUi } from 'config/minimalMode'
 
 import { drawerWidth } from './Drawer'
 import { peerListWidth } from './PeerList'
@@ -90,6 +97,11 @@ export const ShellAppBar = ({
   const { peerList, isEmbedded, showRoomControls } = useContext(ShellContext)
   const handleQRCodeClick = () => setIsQRCodeDialogOpen(true)
   const onClickFullscreen = () => setIsFullscreen(!isFullscreen)
+
+  // Minimal mode: no app bar, no floating room-controls fab.
+  if (minimalUi.hideAppBar) {
+    return null
+  }
 
   return (
     <>

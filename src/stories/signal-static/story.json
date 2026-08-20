@@ -1,0 +1,74 @@
+{
+  "id": "frequency-4-16",
+  "version": "1.0.0",
+  "title": "Frequency 4.16",
+  "description": "Two night operators share a dead frequency and one decision.",
+  "startSceneId": "static",
+  "scenes": {
+    "static": {
+      "id": "static",
+      "dialogue": [
+        {
+          "id": "static-1",
+          "speaker": "Static",
+          "text": "Three in the morning. The band has been empty for hours — then, under the static, a third signal. Faint. Repeating."
+        },
+        {
+          "id": "static-2",
+          "speaker": "Static",
+          "text": "It is not addressed to anyone. It is just asking if anyone is there. Key your answer.",
+          "choices": [
+            {
+              "id": "answer",
+              "label": "Answer the signal",
+              "nextSceneId": "answered-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "answered" },
+                { "type": "increment", "variable": "reach", "amount": 1 }
+              ]
+            },
+            {
+              "id": "listen",
+              "label": "Hold silence and listen",
+              "nextSceneId": "listened-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "listened" },
+                { "type": "increment", "variable": "patience", "amount": 1 }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "answered-ending": {
+      "id": "answered-ending",
+      "dialogue": [
+        {
+          "id": "answered-1",
+          "speaker": "Static",
+          "text": "Two stations key at once — a chord where there should be a note."
+        },
+        {
+          "id": "answered-2",
+          "speaker": "Static",
+          "text": "The faint signal stops repeating. Then, slowly, it sends: THANK YOU. NOT ALONE. NEITHER ARE YOU."
+        }
+      ]
+    },
+    "listened-ending": {
+      "id": "listened-ending",
+      "dialogue": [
+        {
+          "id": "listened-1",
+          "speaker": "Static",
+          "text": "You both hold the key open and silent, two people listening to the same ghost."
+        },
+        {
+          "id": "listened-2",
+          "speaker": "Static",
+          "text": "At dawn the signal fades on its own. The frequency keeps your secret."
+        }
+      ]
+    }
+  }
+}

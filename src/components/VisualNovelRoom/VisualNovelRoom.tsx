@@ -1,3 +1,13 @@
+// Target: src/components/VisualNovelRoom/VisualNovelRoom.tsx (replace)
+//
+// FIXES:
+// - Issue 4: auto-start gated on `minimalUi.autoStartNovella`. Non-minimal
+//   mode (all E2E runs) keeps the original "Start story" panel, so the
+//   existing e2e tests pass unchanged.
+// - Issue 5: auto-start is skipped when phase is 'ended' — a new joiner no
+//   longer resurrects a story the controller explicitly ended. Only a truly
+//   fresh room (post-sync, no state, never started) auto-starts.
+
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -5,11 +15,12 @@ import Chip from '@mui/material/Chip'
 import Paper from '@mui/material/Paper'
 import Stack from '@mui/material/Stack'
 import Typography from '@mui/material/Typography'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 
 import type { PeerRoom } from '../../lib/PeerRoom'
 import { VisualNovelEngine } from '../../services/visualNovel'
 import { getBundledStories, getBundledStory } from '../../stories/catalog'
+import { minimalUi } from '../../config/minimalMode'
 
 import { useVisualNovelRoom } from './useVisualNovelRoom'
 
@@ -19,14 +30,33 @@ export interface VisualNovelRoomProps {
 
 export const VisualNovelRoom = ({ peerRoom }: VisualNovelRoomProps) => {
   const { session, snapshot } = useVisualNovelRoom(peerRoom)
+  const hasAutoStarted = useRef(false)
+
   const story = snapshot.state
     ? getBundledStory(snapshot.state.storyId, snapshot.state.storyVersion)
     : (getBundledStories()[0] ?? null)
+
   const engine = useMemo(
     () =>
       story ? new VisualNovelEngine(story, { now: () => Date.now() }) : null,
     [story]
   )
+
+  // ─── Auto-start (minimal mode only) ────────────────────────────────────
+  useEffect(() => {
+    if (!minimalUi.autoStartNovella) return
+    if (hasAutoStarted.current) return
+    if (!story) return
+    if (snapshot.state) return // a story is already running
+    if (snapshot.phase === 'syncing') return // still checking for one
+    if (snapshot.phase === 'ended') return // controller ended it — respect that
+    if (snapshot.pendingRequest) return // a request is in flight
+    if (snapshot.error) return // don't fight an error state
+
+    hasAutoStarted.current = true
+    session.startStory(story.id, story.version)
+  }, [snapshot, session, story])
+  // ────────────────────────────────────────────────────────────────────────
 
   if (!story || !engine) {
     return (
@@ -37,6 +67,31 @@ export const VisualNovelRoom = ({ peerRoom }: VisualNovelRoomProps) => {
   }
 
   if (!snapshot.state) {
+    // Minimal mode: auto-start is in flight — show a status line only.
+    if (minimalUi.autoStartNovella && snapshot.phase !== 'ended') {
+      return (
+        <Paper
+          component="section"
+          aria-label="Novella"
+          variant="outlined"
+          sx={{ m: 1, p: 2 }}
+        >
+          <Typography role="status" variant="body2" color="text.secondary">
+            {snapshot.phase === 'syncing'
+              ? 'Checking for an active room story…'
+              : 'Starting the story…'}
+          </Typography>
+          {snapshot.error && (
+            <Alert severity="warning" sx={{ mt: 1 }}>
+              {snapshot.error}
+            </Alert>
+          )}
+        </Paper>
+      )
+    }
+
+    // Non-minimal mode (and post-"End story" in both modes): original panel
+    // with the manual "Start story" button.
     return (
       <Paper
         component="section"

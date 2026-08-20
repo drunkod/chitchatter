@@ -1,0 +1,74 @@
+{
+  "id": "the-unfinished-page",
+  "version": "1.0.0",
+  "title": "The Unfinished Page",
+  "description": "Two hands at one typewriter: one acts, one answers.",
+  "startSceneId": "page",
+  "scenes": {
+    "page": {
+      "id": "page",
+      "dialogue": [
+        {
+          "id": "page-1",
+          "speaker": "The Page",
+          "text": "A sheet of paper, half-filled, ends mid-sentence: 'She opened the door and—'"
+        },
+        {
+          "id": "page-2",
+          "speaker": "The Page",
+          "text": "Ink decides what happens. Echo decides what it means. The carriage waits.",
+          "choices": [
+            {
+              "id": "storm",
+              "label": "Write the storm in",
+              "nextSceneId": "storm-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "storm" },
+                { "type": "increment", "variable": "drama", "amount": 1 }
+              ]
+            },
+            {
+              "id": "lamplight",
+              "label": "Write the lamplight in",
+              "nextSceneId": "lamplight-ending",
+              "effects": [
+                { "type": "set", "variable": "route", "value": "lamplight" },
+                { "type": "increment", "variable": "warmth", "amount": 1 }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "storm-ending": {
+      "id": "storm-ending",
+      "dialogue": [
+        {
+          "id": "storm-1",
+          "speaker": "The Page",
+          "text": "—the rain came in sideways, and the candles went out all at once."
+        },
+        {
+          "id": "storm-2",
+          "speaker": "The Page",
+          "text": "In the dark, the typing does not stop. Neither hand is willing to leave the sentence unfinished."
+        }
+      ]
+    },
+    "lamplight-ending": {
+      "id": "lamplight-ending",
+      "dialogue": [
+        {
+          "id": "lamplight-1",
+          "speaker": "The Page",
+          "text": "—the lamplight reached the hallway first, and nothing in it was frightening after all."
+        },
+        {
+          "id": "lamplight-2",
+          "speaker": "The Page",
+          "text": "The page ends full. Two hands, one sentence, no signature."
+        }
+      ]
+    }
+  }
+}

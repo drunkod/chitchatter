@@ -1,4 +1,10 @@
-import { useContext } from 'react'
+// Target: src/pages/Home/Home.tsx (replace)
+//
+// FIX for issue 4: auto-join is now gated on the flag. With minimal mode off
+// (including all E2E runs), the original home page renders unchanged, so
+// EmbedCodeDialog / CommunityRoomSelector are no longer dead code.
+
+import { useContext, useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
 
 import Box from '@mui/material/Box'
@@ -19,10 +25,12 @@ import Divider from '@mui/material/Divider'
 import Logo from 'img/logo.svg?react'
 
 import { Form, Main } from 'components/Elements'
+import { WholePageLoading } from 'components/Loading'
 import { PeerNameDisplay } from 'components/PeerNameDisplay'
 import { EnhancedConnectivityControl } from 'components/EnhancedConnectivityControl'
 import { SettingsContext } from 'contexts/SettingsContext'
 import { routes } from 'config/routes'
+import { minimalUi } from 'config/minimalMode'
 import { RoomNameType } from 'lib/RoomNameGenerator'
 
 import { isEnhancedConnectivityAvailable } from '../../config/enhancedConnectivity'
@@ -55,6 +63,22 @@ export function Home({ userId }: HomeProps) {
     handleEmbedCodeWindowClose,
     isRoomNameValid,
   } = useHome()
+
+  // ─── Minimal mode: auto-join an anonymous public room ─────────────────
+  const hasNavigated = useRef(false)
+
+  useEffect(() => {
+    if (!minimalUi.autoJoinPublicRoom) return
+    if (hasNavigated.current || !isRoomNameValid) return
+
+    hasNavigated.current = true
+    handleJoinPublicRoomClick() // navigate(`/public/${roomName}`)
+  }, [handleJoinPublicRoomClick, isRoomNameValid])
+
+  if (minimalUi.autoJoinPublicRoom) {
+    return <WholePageLoading />
+  }
+  // ───────────────────────────────────────────────────────────────────────
 
   const handleIsEnhancedConnectivityEnabledChange = (
     _event: React.ChangeEvent<{}>,

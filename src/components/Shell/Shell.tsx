@@ -36,6 +36,7 @@ import {
   VideoState,
 } from 'models/chat'
 import { AlertOptions, QueryParamKeys } from 'models/shell'
+import { isMinimalMode, minimalUi } from 'config/minimalMode'
 
 import { allowAdvancedRoomLinkSharing } from './constants'
 import { Drawer } from './Drawer'
@@ -68,7 +69,8 @@ export const Shell = ({ appNeedsUpdate, children, userPeerId }: ShellProps) => {
   const theme = useShellTheme()
 
   const [windowWidth] = useWindowSize()
-  const defaultSidebarsOpen = windowWidth >= theme.breakpoints.values.lg
+  const defaultSidebarsOpen =
+    !isMinimalMode && windowWidth >= theme.breakpoints.values.lg
 
   const peerRoomRef = useRef<PeerRoom>(null)
   const [isAlertShowing, setIsAlertShowing] = useState(false)
@@ -385,6 +387,8 @@ export const Shell = ({ appNeedsUpdate, children, userPeerId }: ShellProps) => {
     setIsRoomShareDialogOpen(false)
   }
 
+  const effectiveShowAppBar = showAppBar && !minimalUi.hideAppBar
+
   return (
     <ShellContext.Provider value={shellContextValue}>
       <ThemeProvider theme={theme}>
@@ -417,11 +421,11 @@ export const Shell = ({ appNeedsUpdate, children, userPeerId }: ShellProps) => {
                   setShowRoomControls(!showRoomControls)
                 }
                 setIsQRCodeDialogOpen={setIsQRCodeDialogOpen}
-                showAppBar={showAppBar}
+                showAppBar={effectiveShowAppBar}
                 isFullscreen={isFullscreen}
                 setIsFullscreen={setIsFullscreen}
               />
-              {isEmbedded ? null : (
+              {isEmbedded || minimalUi.hideDrawer ? null : (
                 <Drawer
                   isDrawerOpen={isDrawerOpen}
                   onDrawerClose={handleDrawerClose}
@@ -430,55 +434,57 @@ export const Shell = ({ appNeedsUpdate, children, userPeerId }: ShellProps) => {
               <RouteContent
                 isDrawerOpen={isEmbedded ? true : isDrawerOpen}
                 isPeerListOpen={isPeerListOpen}
-                showAppBar={showAppBar}
+                showAppBar={effectiveShowAppBar}
               >
                 <ErrorBoundary>{children}</ErrorBoundary>
               </RouteContent>
-              <MuiDrawer
-                sx={{
-                  flexShrink: { xs: 1, sm: 0 },
-                  pointerEvents: 'none',
-                  width: peerListWidth,
-                  '& .MuiDrawer-paper': {
+              {minimalUi.hidePeerList ? null : (
+                <MuiDrawer
+                  sx={{
+                    flexShrink: { xs: 1, sm: 0 },
+                    pointerEvents: 'none',
                     width: peerListWidth,
-                    boxSizing: 'border-box',
-                  },
-                  ...(isPeerListOpen && {
-                    pointerEvents: 'auto',
-                  }),
-                }}
-                variant="persistent"
-                anchor="right"
-                open={isPeerListOpen}
-              >
-                <PeerList
-                  userId={userPeerId}
-                  roomId={roomId}
-                  onPeerListClose={handlePeerListClick}
-                  peerList={peerList}
-                  peerConnectionTypes={peerConnectionTypes}
-                  peerAudioChannelState={audioChannelState}
-                  peerAudioChannels={peerAudioChannels}
-                  connectionTestResults={connectionTestResults}
-                />
-                {isEmbedded ? (
-                  <Typography
-                    variant="caption"
-                    sx={{
-                      padding: '1em 1em 1.75em 1em',
-                      textAlign: 'center',
-                    }}
-                  >
-                    This conversation is powered by{' '}
-                    <Link
-                      href="https://github.com/jeremyckahn/chitchatter"
-                      target="_blank"
+                    '& .MuiDrawer-paper': {
+                      width: peerListWidth,
+                      boxSizing: 'border-box',
+                    },
+                    ...(isPeerListOpen && {
+                      pointerEvents: 'auto',
+                    }),
+                  }}
+                  variant="persistent"
+                  anchor="right"
+                  open={isPeerListOpen}
+                >
+                  <PeerList
+                    userId={userPeerId}
+                    roomId={roomId}
+                    onPeerListClose={handlePeerListClick}
+                    peerList={peerList}
+                    peerConnectionTypes={peerConnectionTypes}
+                    peerAudioChannelState={audioChannelState}
+                    peerAudioChannels={peerAudioChannels}
+                    connectionTestResults={connectionTestResults}
+                  />
+                  {isEmbedded ? (
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        padding: '1em 1em 1.75em 1em',
+                        textAlign: 'center',
+                      }}
                     >
-                      Chitchatter
-                    </Link>
-                  </Typography>
-                ) : null}
-              </MuiDrawer>
+                      This conversation is powered by{' '}
+                      <Link
+                        href="https://github.com/jeremyckahn/chitchatter"
+                        target="_blank"
+                      >
+                        Chitchatter
+                      </Link>
+                    </Typography>
+                  ) : null}
+                </MuiDrawer>
+              )}
               <QRCodeDialog
                 isOpen={isQRCodeDialogOpen}
                 handleClose={handleQRCodeDialogClose}
